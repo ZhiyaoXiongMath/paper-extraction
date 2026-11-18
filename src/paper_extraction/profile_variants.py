@@ -1,4 +1,4 @@
-"""Keep the historical format reproducible and derive the current reader rules."""
+"""Resolve a saved draft to its immutable release and matching compiler resources."""
 
 import hashlib
 import shutil
@@ -7,11 +7,53 @@ from pathlib import Path
 from filelock import FileLock
 
 from .profile_assets.tools import v13_check
+from .profiles.core_20261118.tools import v13_check as current_check
+from .profiles.current.tools import v13_check as previous_check
 
 
 STANDARD_CURRENT_MAX = 4
 UNLIMITED_CURRENT = v13_check.UNLIMITED_CURRENT_RELEASE
 READER_PROFILE = "reader"
+CURRENT_PROFILE = current_check.RELEASE
+CURRENT_ASSETS = Path(__file__).with_name("profiles") / "core_20261118"
+PREVIOUS_PROFILE = previous_check.RELEASE
+# Older editable installations still read this literal path while they serve a
+# batch. Keep its original bytes, and install subsequent profiles side by side.
+PREVIOUS_ASSETS = CURRENT_ASSETS.with_name("current")
+_INSTALLED = {CURRENT_PROFILE: (CURRENT_ASSETS, current_check),
+              PREVIOUS_PROFILE: (PREVIOUS_ASSETS, previous_check)}
+
+
+def is_versioned_release(release: str | None) -> bool:
+    return release in _INSTALLED
+
+
+def profile_assets_for(release: str) -> Path:
+    if release not in _INSTALLED:
+        raise ValueError(f"Unknown extraction profile {release!r}")
+    return _INSTALLED[release][0]
+
+
+def checker_for_release(release: str):
+    return _INSTALLED[release][1] if release in _INSTALLED else v13_check
+
+
+def current_profile_fingerprint(release: str | None = None) -> str:
+    """Bind both model inputs, both TeX inputs and the exact checker used to build."""
+    assets = profile_assets_for(release or CURRENT_PROFILE)
+    checker = checker_for_bundle(assets)
+    checker.verify(assets)
+    return checker.digest(assets / "SHA256SUMS.txt")
+
+
+def checker_for_bundle(bundle: Path):
+    """Legacy source bindings include the old checker's own SHA-256."""
+    for directory, checker in _INSTALLED.values():
+        if bundle == directory:
+            return checker
+    return v13_check
+
+
 COUNT_OVERRIDE = (
     "User-authorized change to the v13 scope: choose the number of current theorems from the "
     "paper's admitted contributions. The original four-current-theorem limit is waived. Preserve "
@@ -58,6 +100,8 @@ _CHANGES = {
 
 
 def release_for_draft(draft: dict) -> str:
+    if is_versioned_release(draft.get("editorial_profile")):
+        return draft["editorial_profile"]
     if draft.get("editorial_profile") == READER_PROFILE:
         return v13_check.EXPANDED_RELEASE
     return UNLIMITED_CURRENT if len(draft.get("groups", [])) > STANDARD_CURRENT_MAX else v13_check.RELEASE
@@ -90,6 +134,8 @@ def _expanded_changes(name: str):
 
 
 def companion_text(base: Path, name: str, release: str) -> str:
+    if is_versioned_release(release):
+        return (profile_assets_for(release) / name).read_text(encoding="utf-8")
     text = (base / name).read_text(encoding="utf-8")
     if release == v13_check.RELEASE:
         return text
@@ -109,6 +155,8 @@ def companion_text(base: Path, name: str, release: str) -> str:
 
 
 def profile_bundle(base: Path, work: Path, release: str) -> Path:
+    if is_versioned_release(release):
+        return profile_assets_for(release)
     if release == v13_check.RELEASE:
         return base
     work.mkdir(parents=True, exist_ok=True)

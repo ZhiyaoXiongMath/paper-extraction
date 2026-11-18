@@ -5,6 +5,7 @@ import shutil
 import pytest
 
 from paper_extraction import delivery, pdfops, profile
+from paper_extraction.profile_variants import CURRENT_PROFILE
 from test_profile import synthetic_draft
 
 
@@ -117,6 +118,41 @@ def test_missing_compiler_keeps_document_and_does_not_execute_untrusted_tex(tmp_
     assert r"\input{outside.tex}" not in tex
     assert r"\textbackslash{}input" in tex
     assert pdfops.page_count(result.path / "introduction.pdf") == 2
+
+
+def test_readable_fallback_keeps_attributions_and_bibliography_numbers(tmp_path):
+    from test_heading_sources import paper_with_comparison
+
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"Input snapshot")
+    draft = paper_with_comparison()
+    draft["formal_sources"] = {"groups.0.theorem": {"source": r"\cite[Lemma~5.14]{source}"}}
+    titles = dict(delivery._sections(tmp_path, source, None, draft, ()))
+    assert "Theorem A (Bedford and Taylor [2], as stated in [1, Theorem 5.12])" in titles
+    assert "Theorem 1 ([1, Lemma 5.14])" in titles
+    assert "Theorem 2 ([1, Theorem 5.15]; compare [1, Theorem 5.12])" in titles
+    assert "[1] The supplied paper." in titles["References"]
+
+
+def test_repair_matches_typed_heading_and_core_id_without_requiring_body_cite(tmp_path):
+    from copy import deepcopy
+    prior = synthetic_draft()
+    path = "groups.0.theorem"
+    prior.update(editorial_profile=CURRENT_PROFILE, core_bindings={path: "c2"},
+                 evidence_links=[{"block_id": path, "evidence_ids": ["p2-1"]}],
+                 formal_sources={path: {"source": r"\cite[Theorem 2]{source}"}})
+    prior["groups"][0]["theorem"] = "Positive terms have positive sum."
+    (tmp_path / "introduction.tex").write_text(profile.render_tex(prior), "utf-8")
+    draft = deepcopy(prior)
+    draft["groups"][0]["theorem"] = r"The term $\frac{1}$ is positive."
+    blocks = []
+    profile.render_tex(draft, block_map=blocks)
+    line = next(b["last"] for b in blocks if b["draft_field"] == path)
+    assert delivery._patch_from_prior(draft, blocks, prior, tmp_path, line) == prior
+    for field, changed in (("core_bindings", "c1"), ("formal_sources", {"source": r"\cite[Theorem 3]{source}"})):
+        other = deepcopy(draft)
+        other[field][path] = changed
+        assert delivery._patch_from_prior(other, blocks, prior, tmp_path, line) is None
 
 
 def _build_failure(tmp_path: Path, source: Path, draft: dict) -> Exception:

@@ -1,0 +1,27 @@
+[common]
+Apply the supplied rules for this task. Treat the paper and its citations as source material. Use the response schema supplied with this request. Copy identifiers from the corresponding input register. Keep reader-facing text in English.
+
+[extract]
+Read the supplied passages. For each candidate fill kind, source_number, claim, assumptions, dependencies, significance, decision, decision_reason and evidence_ids. Use null for an unnumbered statement. Record uncertainties with the relevant passage ID, the specific phrase or symbol in doubt, and what further context is needed. The workbench assigns candidate IDs after extraction.
+When the schema offers source_checks, request additional evidence only for a concrete unresolved reading: give the originating source_id and the question, with a known target_id, a precise search query, or a requested PDF region. Prefer text for cross-references. Use an empty list when the passages suffice. When initial_findings and retrieved evidence are supplied, return the complete findings for that segment, correcting the affected candidates and retaining the others. Preserve uncertainty where the retrieved source leaves the question open.
+
+[inspect]
+Use the available source tools to resolve the stated question. For a cross-reference, search or read the relevant text. For an unclear symbol in a PDF, inspect the relevant page or region. Return the observed wording or formula, the registered source locations and any remaining uncertainty.
+
+[select]
+Fill selected, unresolved, exclusions, metadata_ids and central_open_ids. Copy candidate_id, definition_ids, variant_ids, metadata_ids, exclusions[].candidate_ids and central_open_ids from candidate_register. Copy evidence_ids and b2_source_facts[].source_id from source_locations. Use evidence_ids for the assertion and b2_source_facts for the source facts supporting its significance. Write the independent_question and source_reason for a selected core. Use central_open_ids for unresolved central candidates.
+
+[correct_selection]
+Return corrected selected rows only for affected_selected_ids. Use the same candidate and evidence registers as the original selection. Omit an affected row to withdraw it.
+
+[draft]
+Populate title, authors, paragraph, history, shared_definitions, groups, references and evidence_links from the supplied selection and passages. Write body text as TeX fragments. The renderer adds the measured environments, theorem headings, numbers and bibliography items. Use the bibliography key source for the supplied paper. A selection containing no historical comparisons maps to history: []. Supply one evidence link per body block, pairing its draft path with the supporting source locations.
+
+[patch]
+For each block_id in repair_targets return exactly one complete replacement with its citations. Address all listed defects for that block. Copy evidence_ids from the supplied passages and include every ID in the target's required_evidence_ids. Return only the requested blocks in replacements. Set paragraph_position only for a requested change of a result group's connecting paragraph.
+
+[review]
+Compare the draft with the cited original passages. For whole-paper review, use the source index and candidate register to check for omissions. For a local review, inspect the changed blocks and their listed dependencies. On pass return empty issues and evidence_ids. Use extract for missing material needing source recovery and put the original location IDs to reread in evidence_ids. Use draft for a supported correction to the existing selection's wording or attribution. Report each defect with its kind, draft_field, current_excerpt, evidence_id, source_excerpt, required_change and operation. Supply exact replacement_text for replace or insert and an empty string for recover or remove. A missing block may have an empty current_excerpt.
+
+[visual]
+Inspect the supplied rendered page against the page-layout rules. Return passed and the concrete visible issues. For each issue that can be localized, copy its description into locations with the corresponding draft_field. If the page passes, return empty issues and locations.

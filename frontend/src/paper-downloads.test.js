@@ -63,6 +63,17 @@ test("both final and reviewed deliveries enable the same published downloads", (
   }
 });
 
+test("a screening note exposes only its Markdown download, including after an older formal draft", () => {
+  const paper = { status: "completed", draft_artifacts: [record], delivery: {
+    status: "delivered", kind: "summary", draft_round: 0, note: "未选出可单列的定理。",
+  } };
+  const view = paperDownloads(paper, prefix);
+  assert.equal(view.markdown, prefix + "/artifacts/summary.md");
+  assert.equal(view.tex, undefined);
+  assert.equal(view.pdf, undefined);
+  assert.equal(view.missingPdf, undefined);
+});
+
 test("checker counts and overfull widths are displayed at original precision and deduplicated", () => {
   const issue = "Engineering checks failed: no_blocking_diagnostics, v13_reader_format_contract | " +
     String.raw`introparagraph_1_word_limit:57>45 | Overfull \hbox (8.25000pt too wide) in paragraph at lines 13--13`;

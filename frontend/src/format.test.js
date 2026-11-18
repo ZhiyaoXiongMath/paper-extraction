@@ -67,6 +67,14 @@ test("delivered papers open the reader regardless of a previous review failure",
   assert.equal(paperOutcome({ ...task, delivery: { status: "delivered" } }).initialTab, "reader");
   assert.equal(paperOutcome({ ...task, delivery: { status: "reviewed" } }).title, "已交付 · 已通过检查");
 });
+test("a Markdown-only result opens the screening note", () => {
+  const paper = {status: "completed", delivery: {
+    kind: "summary", outcome: "insufficient_evidence", note: "证据不足。"
+  }};
+  const outcome = paperOutcome(paper);
+  assert.equal(outcome.initialTab, "summary");
+  assert.equal(outcome.summary, "证据不足。");
+});
 test("reader block ids preserve the source evidence links", () => {
   const blocks = readBlocks({
     history: ["previous"],

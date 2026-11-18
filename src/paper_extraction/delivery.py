@@ -13,9 +13,11 @@ import textwrap
 
 from PIL import Image, ImageDraw, ImageFont
 
+from .citation_layout import reading_blocks
 from .pdfops import page_count, render_page
 from .profile import ASSETS, BuildFailure, profile_bundle, release_for_draft, render_tex
 from .profile_assets.tools import v13_check
+from .profile_variants import checker_for_bundle
 from .sources import SourceIndex
 from .writer_patch import _address
 
@@ -159,8 +161,19 @@ def _patch_from_prior(draft, blocks, previous_draft, prior, compiler_line):
     found = old_blocks[fields.index(field)]
 
     def origin(payload, row):
+        path = row["draft_field"]
         keys = set(next((link["evidence_ids"] for link in payload.get("evidence_links", [])
-                         if link["block_id"] == row["draft_field"]), ()))
+                         if link["block_id"] == path), ()))
+        if "formal_sources" in payload:
+            attribution = payload["formal_sources"].get(path)
+            if not attribution:
+                return keys, None
+            owners = payload.get("core_bindings", {})
+            group = re.match(r"(groups\.\d+)\.definitions\.\d+$", path)
+            owner = owners.get(group[1] + ".theorem" if group else path)
+            # A core ID, its evidence and its heading attribution travel together
+            # when local TeX repair restores the earlier approved wording.
+            return keys, (owner, attribution) if attribution.get("source") else None
         return keys, _LOCATORS.findall(row["current_text"])
 
     identity = origin(draft, target)
@@ -185,7 +198,8 @@ def _write_formal(case: Path, tex: str) -> None:
 def _receipt(case: Path, bundle: Path, kind: str, returncodes: list[int], diagnostic: str,
              *, draft: dict | None = None) -> DeliveryCase:
     pages = _readable(case)
-    binding = v13_check.check_binding(v13_check.verify(bundle), case)
+    checker = checker_for_bundle(bundle)
+    binding = checker.check_binding(checker.verify(bundle), case)
     v13_check.atomic_json(case / "delivery.json", {
         "kind": kind,
         "diagnostic": diagnostic,
@@ -198,10 +212,17 @@ def _receipt(case: Path, bundle: Path, kind: str, returncodes: list[int], diagno
     return DeliveryCase(case, kind, diagnostic, compiler_verified=returncodes == [0, 0], draft=draft)
 
 
-def _literal(value: str) -> str:
+def _literal(value: str, reference_numbers: dict | None = None) -> str:
     # Keep uncertain symbols identifiable instead of replacing a mathematical expression.
+    def citation(match):
+        keys = match[2]
+        if reference_numbers is not None:
+            keys = ", ".join(reference_numbers.get(key.strip(), key.strip()) for key in keys.split(","))
+        locator = (match[1] or "").replace("~", " ") if reference_numbers is not None else match[1]
+        return "[" + ", ".join(part for part in (keys, locator) if part) + "]"
+
     value = re.sub(r"\\cite\s*(?:\[([^\]]*)\])?\{([A-Za-z0-9:.,_ -]+)\}",
-                   lambda m: "[" + ", ".join(part for part in (m[2], m[1]) if part) + "]", value)
+                   citation, value)
     return "".join(
         char if char.isascii() and (char.isprintable() or char.isspace()) else f"[U+{ord(char):04X}]"
         for char in value.translate(_UNICODE)
@@ -211,14 +232,25 @@ def _literal(value: str) -> str:
 def _sections(work: Path, source: Path, source_root: Path | None, draft: dict,
               candidates: list[dict] | tuple) -> list[tuple[str, str]]:
     excerpt = draft.get("source_excerpt")
-    blocks = [] if excerpt else [("Introduction", draft.get("paragraph"))]
-    blocks.extend((f"Historical result {chr(65 + i)}", row) for i, row in enumerate(draft.get("history") or []))
-    blocks.extend(("Definition", row) for row in draft.get("shared_definitions") or [])
-    for i, group in enumerate(draft.get("groups") or [], 1):
-        if isinstance(group, dict):
-            blocks.extend(("Definition", row) for row in group.get("definitions") or [])
-            blocks.append((f"Theorem {i}", group.get("theorem")))
-            blocks.append(("Context", group.get("paragraph")))
+    numbered = draft.get("formal_sources")
+    reference_numbers = None
+    if numbered:
+        reference_numbers = {row["key"]: str(i) for i, row in enumerate(draft["references"], 1)}
+        blocks = []
+        for block in reading_blocks(draft):
+            heading = block["heading"] or "Context"
+            if block["caption"]:
+                heading += " (" + block["caption"] + ")"
+            blocks.append((heading, block["text"]))
+    else:
+        blocks = [] if excerpt else [("Introduction", draft.get("paragraph"))]
+        blocks.extend((f"Historical result {chr(65 + i)}", row) for i, row in enumerate(draft.get("history") or []))
+        blocks.extend(("Definition", row) for row in draft.get("shared_definitions") or [])
+        for i, group in enumerate(draft.get("groups") or [], 1):
+            if isinstance(group, dict):
+                blocks.extend(("Definition", row) for row in group.get("definitions") or [])
+                blocks.append((f"Theorem {i}", group.get("theorem")))
+                blocks.append(("Context", group.get("paragraph")))
     blocks = [(title, value) for title, value in blocks if isinstance(value, str) and value.strip()]
     if not blocks:
         for candidate in candidates:
@@ -241,13 +273,13 @@ def _sections(work: Path, source: Path, source_root: Path | None, draft: dict,
                 blocks.append((f"Source excerpt ({item['label']})", abstract[1].strip() if abstract else item["text"]))
         except (OSError, ValueError, RuntimeError):
             pass
-    references = [f"[{row['key']}] {row['text']}" for row in draft.get("references") or []
+    references = [f"[{(reference_numbers or {}).get(row['key'], row['key'])}] {row['text']}" for row in draft.get("references") or []
                   if isinstance(row, dict) and isinstance(row.get("key"), str) and isinstance(row.get("text"), str)]
     if not references:
         references.append(f"Supplied source: {source.name}.")
     references.append(f"Source file SHA-256: {v13_check.digest(source)}.")
     blocks.append(("References", "\n".join(references)))
-    return [(_literal(heading), _literal(body)) for heading, body in blocks]
+    return [(_literal(heading, reference_numbers), _literal(body, reference_numbers)) for heading, body in blocks]
 
 
 def _escape(value: str) -> str:
@@ -309,11 +341,24 @@ def deliver_case(work: Path, source: Path, source_root: Path | None, draft: dict
     try:
         snapshot = v13_check.source_snapshot(source, source_root)
         bundle = profile_bundle(ASSETS, work, release_for_draft(draft))
+        checker = checker_for_bundle(bundle)
         mapped_blocks = []
         failed_line = None
         try:
             tex = render_tex(draft, block_map=mapped_blocks, allow_empty_history=True)
-            case = v13_check.allocate(bundle, source, work, "delivery", source_root)
+            if previous_case and previous_draft == draft:
+                prior = _prior(work, previous_case, source, snapshot["sha256"])
+                if prior == Path(previous_case):
+                    status = json.loads((prior / "build-status.json").read_text("utf-8"))
+                    pinned = checker.verify(bundle)
+                    if (status.get("engineering_accepted") and status.get("release") == pinned["release"]
+                            and status.get("checker_sha256") == pinned["checker_sha256"]
+                            and status.get("rules_sha256") == pinned["sha256"]
+                            and (prior / "introduction.tex").read_text("utf-8") == tex):
+                        # The exact current manuscript already passed the engineering
+                        # checks. Preserve its verified artifact bytes for delivery.
+                        return DeliveryCase(prior, "final")
+            case = checker.allocate(bundle, source, work, "delivery", source_root)
             _write_formal(case, tex)
             return _receipt(case, bundle, "final", _compile(case), "")
         except _DELIVERY_ERRORS as exc:
@@ -325,13 +370,13 @@ def deliver_case(work: Path, source: Path, source_root: Path | None, draft: dict
                     patched = _patch_from_prior(draft, mapped_blocks, previous_draft, prior, failed_line)
                     if patched:
                         tex = render_tex(patched, allow_empty_history=True)
-                        case = v13_check.allocate(bundle, source, work, "delivery-repaired", source_root)
+                        case = checker.allocate(bundle, source, work, "delivery-repaired", source_root)
                         _write_formal(case, tex)
                         return _receipt(case, bundle, "repaired", _compile(case), diagnostic, draft=patched)
                 except _DELIVERY_ERRORS:
                     pass
             return DeliveryCase(prior, "prior", diagnostic)
-        case = v13_check.allocate(bundle, source, work, "delivery-readable", source_root)
+        case = checker.allocate(bundle, source, work, "delivery-readable", source_root)
         title = _literal(draft.get("title") or source.stem)
         authors = _literal(", ".join(draft.get("authors") or []))
         sections = _sections(work, source, source_root, draft, candidates)

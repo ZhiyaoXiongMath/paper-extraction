@@ -1,0 +1,63 @@
+% Release: core-20261118
+% Fill from an ORIGINAL source. Never change this profile to make a sample pass.
+\def\IntroExpectedRelease{core-20261118}
+\input{preamble-v13.tex}
+\ifdefined\IntroRelease
+  \edef\IntroActualRelease{\IntroRelease}
+  \ifx\IntroActualRelease\IntroExpectedRelease
+    \typeout{INTRO-RELEASE-CHECK: MATCH}
+  \else
+    \PackageError{intro-v13}{Release mismatch}{Use the matching release.}
+  \fi
+\else
+  \PackageError{intro-v13}{Missing profile release identity}{Use the matching release.}
+\fi
+% Source-specific math aliases only. No environment, counter or layout overrides.
+\begin{document}
+\paperheader{Exact title of the original paper}{All original authors in source order}
+\section{Introduction}
+% All prose is measured. See the active reader targets for prose.
+\begin{introparagraph}
+Replace this scaffold with the source-supported setting and mathematical question.
+\end{introparagraph}
+% Up to two genuinely shared Definitions, within the definition budget.
+% \begin{definition}[{\cite[Definition ...]{source}}]
+% One actual concept, its domain and its complete criterion.
+% \end{definition}
+% Optional: up to three source-supported historical statements, within the historical budget.
+% Omit this environment when the source provides no qualifying comparison.
+\begin{historical}[{\cite[Section ...]{source}}]
+Replace this historical statement with actual prior hypotheses and conclusion.
+\end{historical}
+% One core contribution per resultgroup. At most TWO dedicated Definitions.
+% Use the active group and theorem budgets.
+\begin{resultgroup}
+% \begin{definition}[{\cite[Definition ...]{source}}]
+% The source-supported concept needed only by this result.
+% \end{definition}
+\begin{theorem}[{\cite[Theorem ...]{source}}]
+Replace this current statement with minimal objects, necessary assumptions and core conclusion.
+\end{theorem}
+\end{resultgroup}
+% Additional admitted contributions: another resultgroup for each admitted core.
+% Independent hypotheses, not a calculation:
+% \begin{conditions}
+% & a(x)\le A,\\
+% & b(x)\le B,\\
+% & c(x)\ge c_0>0.
+% \end{conditions}
+% State any common index range BEFORE the display; no detached right column.
+% Actual relation chain:
+% \begin{relations}
+% Q(u)&=\int_X |u|^2,\\
+%     &\le C\|u\|^2.
+% \end{relations}
+% A supported selected consequence need not copy proof witnesses or every Remark.
+% Preserve necessary assumptions when fitting the theorem to the page.
+\clearpage
+\begin{thebibliography}{9}
+\bibitem{source}
+All source authors, \emph{Exact source title}, supplied version and date.
+% State once that historical attributions follow this manuscript, unless independently read.
+\end{thebibliography}
+\end{document}

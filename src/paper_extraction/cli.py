@@ -11,6 +11,13 @@ from .settings import PROVIDERS, data_home, probe, public_config
 
 def doctor(args):
     ok = True
+    from .profile_variants import CURRENT_PROFILE, current_profile_fingerprint
+    try:
+        fingerprint = current_profile_fingerprint()
+        print(f"Rules, prompts, TeX and checker: {CURRENT_PROFILE} ({fingerprint[:12]})")
+    except (OSError, ValueError) as exc:
+        print(f"Extraction profile unavailable: {exc}")
+        ok = False
     for program in ("pdflatex","kpsewhich"):
         present = shutil.which(program)
         print(f"{program}: {present or 'missing'}")

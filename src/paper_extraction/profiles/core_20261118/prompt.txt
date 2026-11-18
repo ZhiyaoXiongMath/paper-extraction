@@ -1,0 +1,33 @@
+[common]
+Apply the supplied rules. Treat the paper and its citations as evidence. Match the supplied response schema. Copy identifiers from their input registers. English is the manuscript language; use Chinese for a Markdown-only screening note.
+
+[direct]
+Read the entire supplied paper before choosing its principal advances. In one response return the admission decision and, for the theorem outcome, the first complete manuscript with exactly the corresponding core_bindings and heading formal_sources. Link each core to its original passages and state the specific source-supported gain over the closest known or competing assertion. Give a compact Chinese question, finding and source locations for the summary outcome. No theorem manuscript accompanies a summary. For a historical comparison or a source-labelled lemma proposed for its independent role, supply independent_role with source_id, role (principal_result, independent_application, or explicit_comparison), and a short exact quote from that passage demonstrating how the paper frames or applies this specific result. Its own statement and a proof citation alone are insufficient. If the source supplies no such anchor, treat it as supporting material.
+
+[extract_delta]
+Answer only the identified source questions using the supplied additional evidence. Return amendments referring to the original candidate positions as specified in the schema and any newly verified result. Leave unrelated findings intact. Preserve an unresolved reading if the evidence is insufficient.
+
+[extract]
+Read the supplied passages. For each candidate fill kind, source_number, claim, assumptions, dependencies, significance, decision, decision_reason and evidence_ids. Use null for an unnumbered statement. Record uncertainties with the relevant passage ID, the specific phrase or symbol in doubt, and what further context is needed. The workbench assigns candidate IDs after extraction.
+When the schema offers source_checks, request additional evidence for a concrete unresolved reading of a potentially important claim or its necessary conditions. Give the originating source_id and the question, with a known target_id, a precise search query or a PDF region. Prefer text for cross-references. Use an empty list when the passages suffice.
+
+[inspect]
+Use the available source tools to resolve the stated question. For a cross-reference, search or read the relevant text. For an unclear symbol in a PDF, inspect the relevant page or region. Return the observed wording or formula, the registered source locations and any remaining uncertainty.
+
+[select]
+Fill selected, unresolved, exclusions, metadata_ids and central_open_ids. Copy candidate_id, definition_ids, variant_ids, metadata_ids, exclusions[].candidate_ids and central_open_ids from candidate_register. Copy evidence_ids and b2_source_facts[].source_id from source_locations. Use evidence_ids for the assertion and b2_source_facts for the source facts supporting its significance. Write the independent_question and source_reason for a selected core. Use central_open_ids for unresolved central candidates. For a historical comparison or a source-labelled lemma proposed for its independent role, supply independent_role with source_id, role (principal_result, independent_application, or explicit_comparison), and a short exact quote from that passage demonstrating how the paper frames or applies this specific result. Its own statement and a proof citation alone are insufficient. If the source supplies no such anchor, treat it as supporting material.
+
+[correct_selection]
+Return corrected selected rows only for affected_selected_ids. Use the same candidate and evidence registers as the original selection. Omit an affected row to withdraw it.
+
+[draft]
+Write the approved results and only the definitions they require. Copy the approved core IDs into core_bindings for every current and historical statement. Fill formal_sources for each theorem, historical statement and definition, using the bibliography key source for this paper. Keep formal body text free of heading citations. For an indirect attribution preserve the prior author/work and reporting locator. Record comparison citations on the owner theorem and put its explanation after that theorem. Supply one evidence link for each body block. Use history: [] when no historical comparison qualifies.
+
+[patch]
+Return exactly one replacement for each named repair target. Preserve unaffected blocks and their source assignments. Return empty text for an explicit deletion, and use formal_source for a changed heading attribution. Copy evidence IDs from the passages and include the required IDs. Return only the requested blocks.
+
+[review]
+Check only material mathematical and attribution defects against the supplied evidence. Pass when the claims are supported. Do not request another draft for wording preferences, unused proof lemmas or optional enrichment. Use extract and the exact evidence IDs to nominate a newly discovered, independently substantial missing core for selection; never insert one directly in the manuscript. For a local review inspect the changed blocks and their dependencies. Use draft for a source-grounded correction within the existing selection. Identify each actionable issue with the current text, original evidence, operation and specific change. When the schema supports reading requests, ask a concrete question only if the supplied evidence cannot settle it. An uncertain glyph is a reason to inspect its original page.
+
+[visual]
+Inspect the supplied rendered page against the page-layout rules. Return passed and the concrete visible issues. For each issue that can be localized, copy its description into locations with the corresponding draft_field. If the page passes, return empty issues and locations. Pass a readable page with ordinary prose line wraps, including a term separated from its inline variable or a single word on the last line. Report an actionable issue only when visible content is clipped, obscured, misassigned, detached from its mathematical conditions, or fails an actual page requirement.

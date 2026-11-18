@@ -7,6 +7,7 @@ from filelock import FileLock
 
 from .settings import provider_settings
 from .store import Store
+from .usage import usage_session
 
 
 def process(home, pid):
@@ -52,11 +53,12 @@ def process(home, pid):
                 start.update(previous_failure=failure,
                              message=f"读取论文快照，复核第 {failure['attempt']} 次任务记录的 {failure['issue_count']} 项问题")
             notify("start", start)
-            result = run_paper(store.work(paper), Path(paper["source"]),
-                               Path(paper["root"]) if paper["root"] else None,
-                               settings, notify, retry_legacy_review=paper["result"].get("retry_legacy_review", False),
-                               read_api_key=read_api_key, save_draft=save_draft,
-                               previous_failure=failure, pause_requested=pause_requested, count_draft_starts=count_draft_starts)
+            work = store.work(paper)
+            with usage_session(work, pid, paper["attempt"], settings):
+                result = run_paper(work, Path(paper["source"]), Path(paper["root"]) if paper["root"] else None,
+                                   settings, notify, retry_legacy_review=paper["result"].get("retry_legacy_review", False),
+                                   read_api_key=read_api_key, save_draft=save_draft, previous_failure=failure,
+                                   pause_requested=pause_requested, count_draft_starts=count_draft_starts)
             store.finish(paper, result)
         except Exception as exc:
             reason = str(exc).replace(settings["api_key"], "[redacted]") if settings["api_key"] else str(exc)

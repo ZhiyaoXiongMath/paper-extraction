@@ -98,6 +98,21 @@ def test_missing_openai_key_leaves_original_attempt_untouched(tmp_path, monkeypa
         assert db.execute("SELECT count(*) FROM paper_configs").fetchone()[0] == 0
 
 
+def test_new_profile_is_pinned_through_provider_switch(tmp_path, monkeypatch):
+    from paper_extraction.profile_inputs import new_batch_profile
+
+    monkeypatch.setenv("OPENAI_API_KEY", "offline-key")
+    store = Store(tmp_path)
+    snapshot = new_batch_profile()
+    store.create("batch", {"provider": "deepseek", **snapshot},
+                 [dict(id="paper", name="example", kind="tex", source="example.tex", root=None)])
+    store.finish(store.paper("paper"), {"status": "failed", "reason": "fixture"})
+    store.retry("paper", provider="openai")
+    effective = store.paper_settings(store.paper("paper"))
+    assert effective["provider"] == "openai"
+    assert all(effective[name] == value for name, value in snapshot.items())
+
+
 @pytest.mark.parametrize("requested,expected", [(None, "deepseek"), ({"provider": "openai"}, "openai")])
 def test_http_retry_with_or_without_provider(tmp_path, monkeypatch, requested, expected):
     monkeypatch.setenv("PAPER_EXTRACTION_ENV_FILE", str(tmp_path / "unused.env"))

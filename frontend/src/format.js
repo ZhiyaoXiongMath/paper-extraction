@@ -70,6 +70,9 @@ export function paperOutcome(paper) {
   };
   if (paper.status === "cancelled") return { ...base, title: "已终止" };
   if (paper.status === "completed" && paper.delivery) {
+    if (paper.delivery.kind === "summary") {
+      return { ...base, title: "已交付 · 筛选说明", initialTab: "summary", summary: paper.delivery.note };
+    }
     const reviewed = paper.delivery.status === "reviewed";
     return { ...base, title: reviewed ? "已交付 · 已通过检查" : "已交付" };
   }

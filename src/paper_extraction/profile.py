@@ -14,9 +14,13 @@ from urllib.parse import quote
 
 from filelock import FileLock
 
+from .citation_layout import reader_draft_view, reading_blocks
 from .pdfops import page_count, render_page
 from .profile_assets.tools import v13_check
-from .profile_variants import companion_text, profile_bundle, release_for_draft
+from .profile_variants import (
+    CURRENT_PROFILE, checker_for_bundle, checker_for_release, companion_text, current_check,
+    is_versioned_release, previous_check, profile_bundle, release_for_draft,
+)
 
 ASSETS = Path(__file__).with_name("profile_assets")
 PROFILE_FILES = v13_check.FILES
@@ -178,6 +182,14 @@ def bind_formal_citations(draft: dict, records: dict[str, dict]) -> dict:
     def bind(block, text, environment):
         ids = links.get(block, [])
         locator = _bound_locator(ids, records, environment)
+        attribution = (result.get("formal_sources") or {}).get(block)
+        if attribution:
+            # Only the locator metadata is normalized. The writer's mathematical
+            # text and its evidence links remain separately available for repair.
+            for key in ("source", "prior", "comparison"):
+                if attribution.get(key):
+                    attribution[key] = _rewrite_working_locators(attribution[key], locator, ids, records)
+            return text
         if not text or re.search(r"\\cite\b", text):
             return _rewrite_working_locators(text, locator, ids, records) if text else text
         if not locator or environment == "introparagraph":
@@ -390,12 +402,26 @@ def render_tex(draft: dict, *, block_map: list | None = None, _legacy_citations:
     title = _fragment(draft.get("title"), "title", keys, allow_blocks=False)
     authors = [_fragment(a, "authors", keys, allow_blocks=False)
                for a in _list(draft.get("authors"), "authors", 1)]
-    header = companion_text(ASSETS, "template-v13.tex", release_for_draft(draft)).split(r"\begin{document}", 1)[0]
+    release = release_for_draft(draft)
+    canonical = release == CURRENT_PROFILE
+    projected = {row["id"]: row for row in reading_blocks(draft, strict=True)} if canonical else {}
+    header = companion_text(ASSETS, "template-v13.tex", release).split(r"\begin{document}", 1)[0]
     parts = [header, r"\begin{document}", rf"\paperheader{{{title}}}{{{', '.join(authors)}}}",
              r"\section{Introduction}"]
 
     def block(env, val, field, draft_field):
         original = val
+        if canonical:
+            row = projected[draft_field]
+            body = _fragment(row["text"], field, keys)
+            opening = rf"\begin{{{env}}}"
+            if env != "introparagraph":
+                caption = _fragment(row["caption"], field + " source", keys, formal=True, allow_blocks=False)
+                if re.search(r"\\cite\b", body):
+                    raise ValueError(f"{draft_field}: move the formal source into its heading attribution.")
+                opening += "[{" + caption + "}]"
+            append_block(opening, body, env, draft_field, original)
+            return
         caption = ""
         # A provider sometimes returns the exact public environment shown in the
         # template. Unwrap only the single outer environment for this field. Its
@@ -438,6 +464,9 @@ def render_tex(draft: dict, *, block_map: list | None = None, _legacy_citations:
                 caption = caption[:citation_match.start()].rstrip(" ,;~")
         if caption:
             opening += "[{" + caption + "}]"
+        append_block(opening, body, env, draft_field, original)
+
+    def append_block(opening, body, env, draft_field, original):
         if block_map is not None:
             first = 1 + sum(part.count("\n") + 1 for part in parts)
             block_map.append({"environment": env, "draft_field": draft_field, "current_text": original,
@@ -449,7 +478,8 @@ def render_tex(draft: dict, *, block_map: list | None = None, _legacy_citations:
     count = len(definitions)
     for i, value in enumerate(definitions):
         block("definition", value, "shared_definitions", f"shared_definitions.{i}")
-    for i, value in enumerate(_list(draft.get("history", []), "history", 0 if allow_empty_history else 1, 3)):
+    minimum_history = 0 if is_versioned_release(release) or allow_empty_history else 1
+    for i, value in enumerate(_list(draft.get("history", []), "history", minimum_history, 3)):
         block("historical", value, "history", f"history.{i}")
     for number, group in enumerate(_list(draft.get("groups"), "groups", 1), 1):
         if not isinstance(group, dict):
@@ -457,7 +487,11 @@ def render_tex(draft: dict, *, block_map: list | None = None, _legacy_citations:
         parts.append(r"\begin{resultgroup}")
         group_id = f"groups.{number-1}"
         paragraph = group.get("paragraph")
-        before = group.get("paragraph_position") == "before"
+        if canonical:
+            group_order = [key for key in projected if key.startswith(group_id + ".")]
+            before = bool(group_order) and group_order[0] == group_id + ".paragraph"
+        else:
+            before = group.get("paragraph_position") == "before"
         if paragraph and before:
             block("introparagraph", paragraph, f"group {number} paragraph", f"{group_id}.paragraph")
         for j, value in enumerate(_list(group.get("definitions", []), "group definitions", 0, 2)):
@@ -486,9 +520,15 @@ class BuildFailure(ValueError):
 
 
 def _build_targets(blocks, issues, log="", *, release=v13_check.RELEASE):
-    expanded = release == v13_check.EXPANDED_RELEASE
-    limits = v13_check.EXPANDED_BLOCK_LIMITS if expanded else v13_check.BLOCK_LIMITS
-    group_limit = v13_check.EXPANDED_GROUP_HEIGHT if expanded else 22
+    if is_versioned_release(release):
+        checker = checker_for_release(release)
+        limits, group_limit = checker.BLOCK_LIMITS, checker.GROUP_HEIGHT
+        prose_limit, shared_limit = checker.PROSE_HEIGHT, checker.SHARED_HEIGHT
+    elif release == v13_check.EXPANDED_RELEASE:
+        limits, group_limit = v13_check.EXPANDED_BLOCK_LIMITS, v13_check.EXPANDED_GROUP_HEIGHT
+        prose_limit, shared_limit = v13_check.EXPANDED_PROSE_HEIGHT, v13_check.EXPANDED_SHARED_HEIGHT
+    else:
+        limits, group_limit, prose_limit, shared_limit = v13_check.BLOCK_LIMITS, 22, 16, 14
     targets = {}
     for detail in (part.strip() for issue in issues for part in issue.split(" | ")):
         if detail.startswith("Engineering checks failed:"):
@@ -541,8 +581,7 @@ def _build_targets(blocks, issues, log="", *, release=v13_check.RELEASE):
             heights = [int(height) for kind, height, group in measured_blocks
                        if (kind == "P" if prose else kind == "D" and group == "0")]
             if unit and heights:
-                limit = (int(aggregate[2]) if aggregate else
-                         v13_check.EXPANDED_PROSE_HEIGHT if prose else v13_check.EXPANDED_SHARED_HEIGHT)
+                limit = int(aggregate[2]) if aggregate else (prose_limit if prose else shared_limit)
                 detail += f" (rendered height {sum(heights) / int(unit[1]):.3f}U, limit {limit}U)"
         elif (detail in {"rendered_block_height_exceeded", "resultgroup_measurement_failed"}
               or re.search(r"Package intro-v13 Error: Result group exceeds \d+U", detail)):
@@ -624,7 +663,7 @@ def build_case(work: Path, source: Path, source_root: Path | None, draft: dict) 
     try:
         release = release_for_draft(draft)
         bundle = profile_bundle(ASSETS, Path(work), release)
-        case = v13_check.allocate(bundle, Path(source), Path(work), source_root=source_root)
+        case = checker_for_bundle(bundle).allocate(bundle, Path(source), Path(work), source_root=source_root)
         (case / "introduction.tex").write_text(tex, encoding="utf-8")
         returncode, status = _compile_case(case, bundle)
         if returncode or not status.get("engineering_accepted"):
@@ -639,7 +678,8 @@ def build_case(work: Path, source: Path, source_root: Path | None, draft: dict) 
             raise BuildFailure(message, _build_targets(blocks, [message], log, release=release),
                                case_dir=case, technical=technical)
         return case
-    except (OSError, subprocess.TimeoutExpired, v13_check.ValidationError) as exc:
+    except (OSError, subprocess.TimeoutExpired, v13_check.ValidationError, previous_check.ValidationError,
+            current_check.ValidationError) as exc:
         raise BuildFailure(f"v13 build unavailable: {exc}", [], case_dir=case, technical=True) from exc
 
 
@@ -735,7 +775,7 @@ def recover_draft_case(work: Path, source: Path, source_root: Path | None, draft
                 continue
             if has_pdf(record.parent, json.loads(status_path.read_text("utf8"))):
                 return record.parent
-        case = v13_check.allocate(bundle, source, target, source_root=source_root)
+        case = checker_for_bundle(bundle).allocate(bundle, source, target, source_root=source_root)
         for name in ("introduction.tex", "preamble-v13.tex"):
             shutil.copyfile(original / name, case / name)
         new_binding = json.loads((case / "input-manifest.json").read_text("utf8"))

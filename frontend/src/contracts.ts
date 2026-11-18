@@ -36,6 +36,7 @@ export interface BatchSummary {
   created_at: string;
   provider: string;
   counts: Record<string, number>;
+  summary_count?: number;
   batch_pause?: { pausing?: number; paused?: number };
   total: number;
 }
@@ -107,6 +108,7 @@ export interface Draft {
   groups: DraftGroup[];
   references: { key: string; text: string }[];
   evidence_links?: EvidenceLink[];
+  reader_blocks?: ReadBlock[];
 }
 export interface DraftArtifact {
   attempt: number;
@@ -131,6 +133,9 @@ export interface Paper {
   reason?: string;
   delivery?: {
     status: "reviewed" | "delivered";
+    kind?: string;
+    outcome?: "no_qualifying_result" | "insufficient_evidence";
+    summary?: { question: string; reason: string; evidence: { id: string; label: string }[] };
     note?: string;
     draft_round?: number;
   };
@@ -161,4 +166,5 @@ export interface ReadBlock {
   id: string;
   heading: string;
   text: string;
+  caption?: string;
 }

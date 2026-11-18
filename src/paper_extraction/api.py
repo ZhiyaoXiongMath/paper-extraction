@@ -21,10 +21,12 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .exporting import batch_archive_filename, extraction_basename
 from .importing import prepare_sources, stage
+from .profile_inputs import new_batch_profile
 from .settings import (PROVIDERS, apply_reasoning_preferences, data_home, probe, provider_settings, public_config,
                        reasoning_choices, reasoning_config, workbench_limits)
 from .sources import SourceIndex
 from .store import BatchStillActive, Store
+from .summary_delivery import SUMMARY_NAME
 
 
 class PaperChoice(BaseModel):
@@ -254,7 +256,8 @@ def create_app(home=None, runner=launch_worker):
     @app.get("/api/config")
     def config():
         efforts = {provider: store.reasoning_efforts(provider) for provider in PROVIDERS}
-        return {**public_config(efforts), **limits, "concurrency": app.state.dispatch.concurrency}
+        return {**public_config(efforts), **limits, "concurrency": app.state.dispatch.concurrency,
+                **new_batch_profile()}
 
     @app.post("/api/config/{provider}/reasoning")
     def change_reasoning(provider: Literal["openai", "deepseek", "zhipu"], body: ReasoningChange):
@@ -291,6 +294,7 @@ def create_app(home=None, runner=launch_worker):
         if not settings.pop("api_key"):
             raise ValueError("缺少 " + PROVIDERS[body.provider][1] + "，请先配置模型")
         apply_reasoning_preferences(settings, store.reasoning_efforts(body.provider))
+        settings.update(new_batch_profile())
         bid = uuid4().hex
         papers = prepare_sources(store.home,body.import_id,body.papers,bid)
         store.create(bid,settings,papers,name=body.name)
@@ -356,6 +360,11 @@ def create_app(home=None, runner=launch_worker):
         p = store.paper(pid)
         return SourceIndex(Path(p["source"]),Path(p["root"]) if p["root"] else None,store.work(p)).read(location)
 
+    @app.get("/api/papers/{pid}/usage")
+    def paper_usage(pid: str):
+        from .usage import usage_summary
+        return usage_summary(store.work(store.paper(pid)).parent)
+
     @app.get("/api/papers/{pid}/source")
     def source(pid: str):
         p = store.paper(pid)
@@ -385,6 +394,8 @@ def create_app(home=None, runner=launch_worker):
             return Response(store.export_tex(paper), media_type="text/plain",
                             headers=_file_disposition(basename + ".tex", "inline"))
         path = store.artifact(paper, name)
+        if name == SUMMARY_NAME:
+            return FileResponse(path, media_type="text/markdown; charset=utf-8", filename=basename + ".md")
         if name == "introduction.pdf":
             return FileResponse(path, media_type="application/pdf", filename=basename + ".pdf",
                                 content_disposition_type="inline")

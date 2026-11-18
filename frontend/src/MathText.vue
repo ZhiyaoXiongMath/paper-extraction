@@ -3,9 +3,12 @@ import { computed } from "vue";
 import "katex/dist/katex.min.css";
 import { renderMarkdown } from "./rich-text.js";
 
-const props = defineProps<{ text?: string; candidateIds?: ReadonlySet<string> }>();
+const props = defineProps<{ text?: string; candidateIds?: ReadonlySet<string>; inline?: boolean }>();
 const emit = defineEmits<{ candidate: [id: string] }>();
-const content = computed(() => renderMarkdown(props.text || "", props.candidateIds));
+const content = computed(() => {
+  const html = renderMarkdown(props.text || "", props.candidateIds);
+  return props.inline ? html.trim().replace(/^<p>(.*)<\/p>$/s, "$1") : html;
+});
 function navigate(event: MouseEvent) {
   const target = event.target;
   if (!(target instanceof Element)) return;
@@ -14,7 +17,7 @@ function navigate(event: MouseEvent) {
 }
 </script>
 
-<template><div class="math-text" v-html="content" @click="navigate"></div></template>
+<template><component :is="inline ? 'span' : 'div'" class="math-text" v-html="content" @click="navigate" /></template>
 
 <style scoped>
 .math-text { white-space: normal; overflow-wrap: anywhere; min-width: 0; }

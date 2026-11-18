@@ -2,7 +2,9 @@
 
 [中文](README.md) · [Releases](https://github.com/ZhiyaoXiongMath/paper-extraction/releases)
 
-A local workbench for mathematical papers. Import PDFs or TeX projects and get a selective English Introduction per paper, with source-grounded historical theorems, current contributions and definitions. The Chinese-language web interface links each generated statement to its source page or TeX lines.
+**Paper Extraction is a local tool for extracting key content from mathematical research papers in batches.** Import PDFs or TeX projects to extract each paper’s research question, essential definitions, relevant prior theorems, and new results and applications. Use it to screen a group of papers, identify what each contributes, and return to the original for a closer read.
+
+For a paper with a qualifying result of its own, the workbench produces an English mathematical introduction as a PDF and self-contained TeX source. Papers containing only background, classical special cases or proof steps receive a Chinese Markdown note explaining the screening decision. Both outputs point back to the source pages or TeX lines and can be downloaded individually or in a batch ZIP.
 
 ## Install and run
 
@@ -45,67 +47,56 @@ Prefix these commands with `uv run` in a source checkout. Open **http://127.0.0.
 5. Once every paper in a batch is paused or finished, you can delete that batch from the workbench or its detail view. Use “Clear finished batches” to remove batches where every paper has finished. Download any files you want to keep before confirming. Deletion removes the batch history, drafts and deliverables from the workbench.
 6. Use the paper detail view to pause or resume a paper. Queued papers pause immediately. Running papers save a checkpoint when the current step finishes and resume from the following step.
 
-**Example.** Import the [examples/compactness](examples/compactness) folder. One main file includes a separate chapter, illustrating how generated statements link to original source lines. This teaching manuscript presents the classical Arzelà–Ascoli theorem. The selected statements and their wording depend on the model run. A completed batch yields:
+**Example.** Import the `examples/compactness` folder and select `main.tex` as its entry point. It includes a separate chapter presenting the classical Arzelà–Ascoli theorem. When the model finds only previously known results in this teaching manuscript, the batch ZIP contains the files below. [Example source](examples/compactness)
 
 ```text
 001-compactness/
-  main-extraction.tex
-  main-extraction.pdf
+  main-extraction.md
 manifest.json
 ```
+
+If you import your own `geometry.tex` and the workbench identifies a qualifying contribution, the same download control provides `geometry-extraction.tex` and `geometry-extraction.pdf`. The TeX includes its preamble.
 
 ## Workflow and acceptance
 
 FastAPI handles imports and schedules work. Each paper runs in its own LangGraph graph with SQLite checkpoints. Extraction, writing and review call models through LangChain.
 
+New batches choose between a whole-paper read and segmented extraction using the complete request size and the model's capacity. The run log records the routing decision. In segmented extraction, each source question identifies a candidate, the condition to check and its location. The selector can retrieve full passages by ID. Per-request usage includes extraction and source checks before the first draft. Existing batches resume with their saved workflow revision.
+
+Papers without a verified qualifying current result produce only a Chinese `input-name-extraction.md` screening note with source locations.
+
 ```mermaid
 flowchart TB
-    U["Import PDF or TeX files"] --> A["Stage files and show the preview"]
-    A -->|Confirm| B["Create the batch and save source snapshots"]
-    B --> I["Index the source for each paper"]
-    I --> X["Extract candidates and evidence in sections"]
-    X -->|A category is missing| P["Look for more evidence"]
-    X -->|Scan complete| S["Select contributions from the full paper"]
-    P --> S
-    S -->|More evidence needed| P
-    S -->|Ready to write| D["Write or revise the draft"]
-    S -->|Selection failed and no draft exists| N["Record the failure reason"]
-    S -->|Selection failed and a draft exists| F["Compile locally and recover a deliverable version if needed"]
-    D -->|First two drafts| R["Review the mathematical content"]
-    D -->|Third draft| F
-    R -->|Pass| C["Compile TeX and check layout"]
-    C -->|Pass| V["Inspect each PDF page"]
-    V -->|All checks passed| O["Register the result for viewing and download"]
-    R -->|Issue found| Q{"Choose the next step based on the issue"}
-    C -->|Issue found| Q
-    V -->|Issue found| Q
-    Q -->|Check relevant source passages| X
-    Q -->|Revise the affected content| D
-    Q -->|Stop revising| F
-    F -->|Readable result available| O
+    I["Snapshot → complete text with source locations"] --> G{"Readable and fits in context?"}
+    G -->|Yes| D["Read in one context → approved cores and first draft, or screening note"]
+    G -->|No| X["Extract passages → candidates with evidence"]
+    X --> S["Select across the paper → approved cores"]
+    S -->|A current result qualifies| W["Approved cores → bound draft"]
+    S -->|No verified qualifying result| M["Download the Chinese Markdown screening note"]
+    D -->|Screening outcome| M
+    D -->|First draft| R["Independent review → pass, evidence request or specific defect"]
+    W -->|First two drafts| R
+    R -->|Nominate a missing core| S
+    R -->|Statement or citation defect| P["Affected block + issue + evidence → revision"]
+    R -->|Pass| C["Compile locally and review PDF pages"]
+    C -->|Pass| O["Register the standalone TeX and PDF"]
+    C -->|Located layout defect| P
+    P -->|Review round remains| R
+    W -->|Last draft| F["Compile locally and register the actual readable version"]
+    P -->|Last draft or stalled| F
+    F --> O
 ```
 
 <details>
-<summary>How evidence tools run</summary>
+<summary>How source checks work</summary>
 
-Extraction, some supplemental evidence searches and content reviews can invoke the evidence graph. Each invocation allows up to four model decisions, and each decision can request multiple read-only tools. Inspecting a PDF page image can call the vision model.
-
-```mermaid
-flowchart TB
-    I["Prepare the rules and source passages"] --> D["Call the model with tools bound through LangChain"]
-    D --> Q{"Did the model request tools?"}
-    Q -->|No| O["Return observations and source locations"]
-    Q -->|Yes| T["ToolNode searches, reads passages or inspects PDF page images"]
-    T --> L{"Have four model decisions completed?"}
-    L -->|No| D
-    L -->|Yes| O
-```
+New batches review the admitted claims with their bound evidence. When the passages suffice, the reviewer returns a verdict or a specific correction directly. For an unresolved reading it identifies the question and location. The workbench retrieves the relevant text or sends the question with a PDF crop to the vision model and returns the extra evidence for that review. Pages without readable text can still be transcribed. Archived batches use the workflow and rules pinned at creation.
 
 </details>
 
 Each start or explicit retry can generate up to three drafts, including the first. The third draft goes straight to a two-pass compile and PDF readability check. For a TeX error, the workflow can restore a block tied to the same source evidence or deliver an earlier verified version. When neither is available, it compiles the existing content in a simplified layout. If the compiler is unavailable, it generates a readable PDF locally and labels it accordingly. Finalization uses no additional model calls. The workbench offers the PDF and the final TeX with its preamble embedded, and records whether the result passed all checks.
 
-Each introduction includes a separate bibliography. The model selects current theorems, historical comparisons and necessary definitions from the source, and adds context where it helps explain the problem or the scope of the results. Aim for three body pages or fewer, with up to five when the material needs more space. Word counts guide the writing. The compiled checks enforce the measured block, formula and page budgets. The workbench reports missing source evidence and layout problems for each paper. [Original rules](src/paper_extraction/profile_assets/intro-rules-v13.txt)
+Each new batch pins its rules, node instructions and matching typesetting resources. The model retains up to three relevant, verifiable historical comparisons. If none qualifies, the introduction proceeds directly to current results. The number of current theorems follows the mathematical contributions. Aim for three body pages or fewer, with up to five when needed and a separate bibliography. Word counts guide writing. Compiled checks enforce block, formula and page limits. [Extraction rules](src/paper_extraction/profiles/core_20261118/rules.txt) · [Node instructions](src/paper_extraction/profiles/core_20261118/prompt.txt)
 
 ## Configuration and development
 

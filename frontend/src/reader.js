@@ -36,7 +36,7 @@ function sourcePath(path, isUri) {
   return name;
 }
 
-function readableLocator(text) {
+function readableLocator(text, english) {
   const files = [];
   const filePattern = /(URI path )?\\texttt\s*\{/g;
   let rest = "", from = 0;
@@ -44,24 +44,42 @@ function readableLocator(text) {
     const group = groupAt(text, filePattern.lastIndex - 1);
     if (!group) continue;
     const line = text.slice(group.end).match(/^\s+L[~\s]*(\d+(?:--?\d+)?(?:,\s*\d+(?:--?\d+)?)*)/);
-    const label = sourcePath(group.value, Boolean(match[1])) +
-      (line ? " 第 " + line[1].replace(/--/g, "–") + " 行" : "");
+    let label = sourcePath(group.value, Boolean(match[1]));
+    if (line) {
+      const range = line[1].replace(/--/g, "–");
+      label += english
+        ? (/[-–,]/.test(range) ? ", lines " : ", line ") + range
+        : " 第 " + range + " 行";
+    }
     rest += text.slice(from, match.index) + "\u0000" + files.length + "\u0000";
     files.push(label);
     filePattern.lastIndex = from = group.end + (line?.[0].length || 0);
   }
-  return (rest + text.slice(from)).replace(/~/g, " ").replace(/--/g, "–")
-    .replace(/\\S\s*/g, "§")
+  const locator = (rest + text.slice(from)).replace(/~/g, " ").replace(/--/g, "–")
+    .replace(/\\S\s*/g, "§");
+  const localized = english ? locator
+    .replace(/(定理|推论|命题|定义|引理|公式)\s*(?=[(\d])/g,
+      (word) => ({ 定理: "Theorem", 推论: "Corollary", 命题: "Proposition", 定义: "Definition",
+        引理: "Lemma", 公式: "Equation" })[word.trim()] + " ")
+    .replace(/PDF\s*物理页\s*(\d+(?:[–-]\d+)?(?:,\s*\d+(?:[–-]\d+)?)*)/g,
+      (_, pages) => (/[-–,]/.test(pages) ? "PDF physical pp. " : "PDF physical p. ") + pages)
+    .replace(/第\s*(\d+(?:[–-]\d+)?(?:,\s*\d+(?:[–-]\d+)?)*)\s*(页|行)/g,
+      (_, range, kind) => (kind === "页"
+        ? (/[-–,]/.test(range) ? "pp. " : "p. ")
+        : (/[-–,]/.test(range) ? "lines " : "line ")) + range)
+    .replace(/，\s*/g, ", ").replace(/；\s*/g, "; ")
+    : locator
     .replace(/\b(PDF physical )?pp?\.\s*(\d+(?:[–-]\d+)?(?:,\s*\d+(?:[–-]\d+)?)*)/gi,
       (_, physical, pages) => (physical ? "PDF 物理页 " + pages : "第 " + pages + " 页"))
     .replace(/\b(Theorem|Corollary|Proposition|Definition|Lemma|Equation)\s+(?=[(\d])/gi,
       (word) => ({ theorem: "定理", corollary: "推论", proposition: "命题", definition: "定义",
         lemma: "引理", equation: "公式" })[word.trim().toLowerCase()] + " ")
-    .replace(/,\s*/g, "，").replace(/;\s*/g, "；")
-    .replace(/\u0000(\d+)\u0000/g, (_, index) => files[index]);
+    .replace(/,\s*/g, "，").replace(/;\s*/g, "；");
+  return localized.replace(/\u0000(\d+)\u0000/g, (_, index) => files[index]);
 }
 
-function formatCitations(text, references, inline) {
+function formatCitations(text, references, inline, locale) {
+  const english = locale === "en";
   const cite = /\\cite\b\s*/g;
   let result = "", from = 0;
   for (let match; (match = cite.exec(text));) {
@@ -73,18 +91,21 @@ function formatCitations(text, references, inline) {
     if (!keys || !keys.value.trim()) continue;
     const cited = keys.value.split(",").map((item) => {
       const key = item.trim();
-      if (key === "source") return "原论文";
       const index = references.findIndex((ref) => ref.key === key);
+      if (english) return index >= 0 ? String(index + 1) : key === "source" ? "Source paper" : "Reference " + key;
+      if (key === "source") return "原论文";
       return index >= 0 ? "文献 [" + (index + 1) + "]" : "文献 " + key;
-    }).join("、");
-    const label = cited + (locator?.value.trim() ? " · " + readableLocator(locator.value) : "");
-    result += text.slice(from, match.index) + (inline ? "〔" + label + "〕" : label);
+    }).join(english ? ", " : "、");
+    const label = cited + (locator?.value.trim()
+      ? (english ? ", " : " · ") + readableLocator(locator.value, english)
+      : "");
+    result += text.slice(from, match.index) + (english ? "[" + label + "]" : inline ? "〔" + label + "〕" : label);
     cite.lastIndex = from = keys.end;
   }
   return result + text.slice(from);
 }
 
-export function readerFragment(input, heading = "", references = []) {
+export function readerFragment(input, heading = "", references = [], locale = "zh") {
   const source = String(input ?? "").trim();
   const wrapped = /^\\begin\s*\{(historical|theorem|definition|introparagraph)\}\s*([\s\S]*?)\s*\\end\s*\{\1\}$/.exec(source);
   let body = wrapped ? wrapped[2].trim() : source;
@@ -92,7 +113,7 @@ export function readerFragment(input, heading = "", references = []) {
   if (wrapped && body.startsWith("[")) {
     const group = groupAt(body, 0);
     if (group) {
-      caption = formatCitations(ungroup(group.value), references, false);
+      caption = formatCitations(ungroup(group.value), references, false, locale);
       body = body.slice(group.end).trimStart();
     }
   }
@@ -103,5 +124,5 @@ export function readerFragment(input, heading = "", references = []) {
       "(?=[ \\t]*\\n)|\\*\\*" + literal + "[.:]?\\*\\*[.:]?|\\\\textbf\\{" + literal + "[.:]?\\}[.:]?)(?:\\s+|$)");
     body = body.replace(title, "");
   }
-  return { text: formatCitations(body, references, true), caption };
+  return { text: formatCitations(body, references, true, locale), caption };
 }

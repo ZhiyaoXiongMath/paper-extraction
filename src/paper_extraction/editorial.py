@@ -59,19 +59,35 @@ REVIEW_GUIDANCE = (
 def reversed_edit_requests(reviews, fields=None):
     """Find opposite structural edits requested against the same original passage."""
     latest = {}
+    grounded = {}
     for review in reviews:
         if review.get("stage") != "review":
             continue
         for issue in review.get("defects", []):
-            if not isinstance(issue, dict) or issue.get("operation") not in {"insert", "remove"}:
+            if not isinstance(issue, dict):
                 continue
             field, source = issue.get("draft_field"), issue.get("evidence_id")
+            if issue.get("core_id") and field and source:
+                family = re.sub(r"^groups\.\d+\.", "", field)
+                family = "historical" if field.startswith("history.") else family
+                key = (issue["core_id"], family, source)
+                grounded.setdefault(key, []).append({"draft_field": field, "round": review.get("attempt"),
+                    "operation": issue.get("operation"), "requested_change": issue.get("required_change", ""),
+                    "requested_text": issue.get("replacement_text", "")})
+                continue
+            if issue.get("operation") not in {"insert", "remove"}:
+                continue
             if not field or not source or (fields is not None and field not in fields):
                 continue
             latest.setdefault((field, source), {})[issue["operation"]] = {
                 "round": review.get("attempt"), "operation": issue["operation"], "requested_change": issue.get("required_change", "")}
-    return [{"draft_field": field, "source_id": source, "prior_requests": sorted(operations.values(), key=lambda row: row["round"] or 0)}
-            for (field, source), operations in latest.items() if len(operations) == 2]
+    result = [{"draft_field": field, "source_id": source, "prior_requests": sorted(operations.values(), key=lambda row: row["round"] or 0)}
+              for (field, source), operations in latest.items() if len(operations) == 2]
+    for (core, _, source), notes in grounded.items():
+        field = notes[-1]["draft_field"]
+        if (fields is None or field in fields) and len({n["round"] for n in notes}) > 1:
+            result.append({"draft_field": field, "core_id": core, "source_id": source, "prior_requests": notes})
+    return result
 
 
 _HISTORY = re.compile(

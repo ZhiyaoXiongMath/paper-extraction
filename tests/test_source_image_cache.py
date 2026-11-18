@@ -56,3 +56,17 @@ def test_simultaneous_reads_transcribe_once(tmp_path):
         requests = [pool.submit(read), pool.submit(read)]
         assert sorted(request.result(timeout=5) for request in requests) == [("x = 1", False), ("x = 1", True)]
     assert calls == [(b"page", 1)]
+def test_two_questions_on_one_crop_keep_distinct_answers(tmp_path):
+    from paper_extraction.source_image_cache import cached_transcription
+
+    asked = []
+    def read(png, page, question):
+        asked.append((png, page, question))
+        return "observed " + question
+
+    work = tmp_path / "work"
+    opts = {"provider": "openai", "vision_model": "test"}
+    for question in ("outer exponent?", "scope of bar?", "outer exponent?"):
+        text, hit = cached_transcription(work, opts, b"same crop", 10, read, question=question)
+        assert text == "observed " + question
+    assert hit and len(asked) == 2

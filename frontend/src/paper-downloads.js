@@ -3,6 +3,9 @@ import { reviewDetails, reviewField } from "./review-format.js";
 
 export function paperDownloads(paper, prefix) {
   if (tone(paper.status) === "good") {
+    if (paper.delivery?.kind === "summary") {
+      return { label: "已交付 · 筛选说明", markdown: prefix + "/artifacts/summary.md" };
+    }
     let label = "已通过 · 成品";
     if (paper.delivery?.status === "reviewed") label = "已交付 · 已通过检查";
     if (paper.delivery?.status === "delivered") {

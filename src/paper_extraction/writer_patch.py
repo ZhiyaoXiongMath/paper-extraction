@@ -4,7 +4,8 @@ from copy import deepcopy
 
 from pydantic import ValidationError
 
-from .models import AdmissionReview, Draft, DraftPatch
+from .models import AdmissionReview, AuthoritativeDraft, CurrentDraft, Draft, DraftPatch
+from .profile_variants import CURRENT_PROFILE, PREVIOUS_PROFILE
 from .profile import bind_formal_citations, saved_build_targets
 
 WRITER_VERSION = "block-patch-v1"
@@ -24,12 +25,35 @@ def _address(draft, block):
     return value, pieces[-1]
 
 
+def _schema(draft):
+    if draft.get("core_bindings"):
+        return AuthoritativeDraft
+    return CurrentDraft if draft.get("editorial_profile") in {CURRENT_PROFILE, PREVIOUS_PROFILE} else Draft
+
+
 def repair_targets(draft, verdict, registered):
     """Plan a patch only when every unresolved issue maps to an existing writable block."""
     if not draft or verdict.get("passed") is not False or not verdict.get("issues"):
         return []
+    if verdict.get("stage") == "combined":
+        merged = {}
+        for check in verdict["checks"]:
+            rows = repair_targets(draft, check, registered)
+            if not rows:
+                return []
+            for row in rows:
+                key = row["block_id"]
+                if key not in merged:
+                    merged[key] = row
+                else:
+                    merged[key]["defects"].extend(row["defects"])
+                    merged[key]["diagnostics"].extend(row["diagnostics"])
+                    merged[key]["required_evidence_ids"] = list(dict.fromkeys(
+                        [*merged[key]["required_evidence_ids"], *row["required_evidence_ids"]]))
+        return list(merged.values())
     try:
-        parsed = Draft.model_validate(draft)
+        schema = _schema(draft)
+        parsed = schema.model_validate(draft)
     except ValidationError:
         return []
     links = {link.block_id: link.evidence_ids for link in parsed.evidence_links}
@@ -58,6 +82,8 @@ def repair_targets(draft, verdict, registered):
                 additions.append(block)
             targets[block] = dict(block_id=block, current_text=current, bound_evidence_ids=links.get(block, []),
                                   required_evidence_ids=[], defects=[], diagnostics=[])
+            if block in draft.get("formal_sources", {}):
+                targets[block]["formal_source"] = draft["formal_sources"][block]
             if is_empty_paragraph or (key == "paragraph" and block.startswith("groups.")):
                 targets[block]["paragraph_position"] = parent.get("paragraph_position", "after")
         return targets[block]
@@ -71,11 +97,16 @@ def repair_targets(draft, verdict, registered):
             return []
         for defect in review.issues:
             row = target(defect.draft_field, allow_append=defect.operation == "insert" and not defect.current_excerpt.strip())
-            if (row is None or defect.operation not in {"replace", "insert"}
-                    or (defect.kind == "improper_selection" and defect.operation != "replace") or defect.evidence_id not in registered
+            lean = bool(draft.get("core_bindings"))
+            if (row is None or defect.operation not in ({"replace", "insert", "remove"} if lean else {"replace", "insert"})
+                    or (not lean and defect.kind == "improper_selection" and defect.operation != "replace") or defect.evidence_id not in registered
                     or (defect.current_excerpt.strip() and defect.current_excerpt not in row["current_text"])):
                 return []
             row["defects"].append(defect.model_dump())
+            if lean and defect.operation == "remove" and defect.current_excerpt.strip() == row["current_text"].strip():
+                if not re.fullmatch(r"(?:groups\.\d+\.paragraph|(?:shared_definitions|groups\.\d+\.definitions)\.\d+)", defect.draft_field):
+                    return []
+                row["remove"] = True
             if defect.evidence_id not in row["required_evidence_ids"]:
                 row["required_evidence_ids"].append(defect.evidence_id)
     elif verdict.get("stage") in {"compile", "visual"}:
@@ -94,14 +125,14 @@ def repair_targets(draft, verdict, registered):
                 return []
             row["diagnostics"].extend(diagnostics)
             row["required_evidence_ids"] = list(row["bound_evidence_ids"])
-    if additions:
+    if additions and not draft.get("core_bindings"):
         prospective = deepcopy(draft)
         for block in additions:
             parent, _ = _address(prospective, block)
             parent.append("Definition")
             prospective["evidence_links"].append({"block_id": block, "evidence_ids": targets[block]["required_evidence_ids"]})
         try:
-            Draft.model_validate(prospective)
+            schema.model_validate(prospective)
         except ValidationError:
             return []
     return list(targets.values())
@@ -112,7 +143,12 @@ def apply_patch(draft, patch, packet, records):
     checked = DraftPatch.model_validate(patch.model_dump(), context=packet)
     result = deepcopy(draft)
     links = {link["block_id"]: link for link in result["evidence_links"]}
+    removed = []
+    targets = {t["block_id"]: t for t in packet["repair_targets"]}
     for row in checked.replacements:
+        if targets[row.block_id].get("remove"):
+            removed.append(row.block_id)
+            continue
         parent, key = _address(result, row.block_id)
         if isinstance(parent, list) and key == len(parent):
             parent.append(row.text)
@@ -120,22 +156,47 @@ def apply_patch(draft, patch, packet, records):
             parent[key] = row.text
         if row.paragraph_position is not None:
             parent["paragraph_position"] = row.paragraph_position
+        if row.formal_source is not None and "formal_sources" in result:
+            result["formal_sources"][row.block_id] = row.formal_source.model_dump()
         if row.block_id in links:
             links[row.block_id]["evidence_ids"] = row.evidence_ids
         elif not row.block_id.startswith("references."):
             result["evidence_links"].append({"block_id": row.block_id, "evidence_ids": row.evidence_ids})
     bound = bind_formal_citations(result, records)
     for row in checked.replacements:
+        if row.block_id in removed:
+            continue
         parent, key = _address(result, row.block_id)
         normalized, _ = _address(bound, row.block_id)
         previous, _ = _address(draft, row.block_id)
         before = ("" if isinstance(previous, list) and key == len(previous)
                   else previous.get(key, "") if key == "paragraph" else previous[key])
         moved = row.paragraph_position is not None and row.paragraph_position != previous.get("paragraph_position", "after")
-        if before == normalized[key] and not moved:
+        citation_changed = row.formal_source is not None and result.get("formal_sources", {}).get(row.block_id) != draft.get("formal_sources", {}).get(row.block_id)
+        if before == normalized[key] and not moved and not citation_changed:
             raise ValueError(f"{row.block_id}: the requested change is missing after binding the original citation")
         parent[key] = normalized[key]
-    Draft.model_validate(result)
+    # Apply all edits to old coordinates first; deleting list entries earlier
+    # would redirect subsequent edits and evidence links to another definition.
+    dropped = {}
+    for field in sorted(removed, key=lambda v: int(v.split(".")[-1]) if v.split(".")[-1].isdigit() else 0,
+                        reverse=True):
+        parent, key = _address(result, field)
+        if isinstance(parent, list):
+            parent.pop(key)
+            dropped.setdefault(field.rsplit(".", 1)[0], []).append(key)
+        else:
+            parent[key] = ""
+    def remap(field):
+        prefix, _, number = field.rpartition(".")
+        if prefix in dropped and number.isdigit():
+            return f"{prefix}.{int(number) - sum(i < int(number) for i in dropped[prefix])}"
+        return field
+    if removed:
+        result["evidence_links"] = [{**row, "block_id": remap(row["block_id"])} for row in result["evidence_links"]
+                                    if row["block_id"] not in removed]
+        result["formal_sources"] = {remap(key): item for key, item in result["formal_sources"].items() if key not in removed}
+    _schema(result).model_validate(result)
     if any(key not in records for link in result["evidence_links"] for key in link["evidence_ids"]):
         raise ValueError("The repaired draft contains unregistered original evidence")
     return result

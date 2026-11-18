@@ -13,9 +13,20 @@ from openai import LengthFinishReasonError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, model_validator
 
 from .editorial import says_no_edit
+from .citation_types import FormalSource
+from .direct_response import normalize_direct_shape, safe_direct_errors, unfence
+from .profile_inputs import is_optimized_workflow
 from .settings import DEFAULT_REASONING_EFFORT, chat_options
+from .usage import invoke_tracked, observe_http
 
 Model = TypeVar("Model", bound=BaseModel)
+
+
+class StructuredResponseError(ValueError):
+    """The provider replied, but no attempt supplied a usable typed response."""
+    def __init__(self, schema, history):
+        self.schema = schema
+        super().__init__(f"Invalid {schema.__name__} response after three attempts: " + " | ".join(history))
 
 
 class Candidate(BaseModel):
@@ -33,6 +44,31 @@ class Candidate(BaseModel):
 class Findings(BaseModel):
     candidates: list[Candidate]
     uncertainties: list[str]
+
+
+class SourceCheck(BaseModel):
+    """One concrete question raised while reading a particular source passage."""
+    source_id: str = Field(min_length=1, description="ID of the supplied passage raising the question")
+    question: str = Field(min_length=1)
+    target_id: str | None = Field(default=None, description="Known ID of the passage to consult")
+    query: str | None = Field(default=None, description="Exact label, symbol or phrase to find in the paper")
+    read_image: bool = Field(default=False, description="Read the PDF page of target_id or source_id for this question")
+    region: tuple[float, float, float, float] | None = Field(default=None, description="Optional normalized left,top,right,bottom")
+
+    @model_validator(mode="after")
+    def check_location(self):
+        if self.region is not None:
+            left, top, right, bottom = self.region
+            if not self.read_image or not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+                raise ValueError("Use a normalized rectangle only for a requested PDF image")
+        if not (self.target_id or (self.query and self.query.strip()) or self.read_image):
+            raise ValueError("Supply the target passage, a concrete search query or an image request")
+        return self
+
+
+class TextFindings(Findings):
+    model_config = ConfigDict(title="Findings")
+    source_checks: list[SourceCheck] = Field(default_factory=list)
 
 
 class Group(BaseModel):
@@ -54,7 +90,8 @@ class EvidenceLink(BaseModel):
 
 class BlockReplacement(EvidenceLink):
     model_config = ConfigDict(extra="forbid")
-    text: str = Field(min_length=1, description="Complete revised text of this existing block, including its citations")
+    text: str = Field(description="Complete revised block; empty only for a requested deletion")
+    formal_source: FormalSource | None = Field(default=None, description="Supply only when this formal attribution must change")
     paragraph_position: Literal["before", "after"] | None = Field(default=None, description="Optional new location for a group paragraph")
 
 
@@ -76,10 +113,17 @@ class DraftPatch(BaseModel):
         for row in self.replacements:
             target = targets[row.block_id]
             revised = " ".join(row.text.split())
+            if target.get("remove"):
+                if revised or row.formal_source or row.paragraph_position is not None:
+                    raise ValueError(f"{row.block_id}: return empty text for a requested deletion")
+                if not set(row.evidence_ids) <= registered:
+                    raise ValueError("Removal cites unregistered evidence")
+                continue
             if row.paragraph_position is not None and "paragraph_position" not in target:
                 raise ValueError("Only a result group's connecting paragraph can change position")
             moved = row.paragraph_position is not None and row.paragraph_position != target.get("paragraph_position")
-            if not revised or (not moved and revised == " ".join(target["current_text"].split())):
+            new_attribution = row.formal_source is not None and row.formal_source.model_dump() != target.get("formal_source")
+            if not revised or (not moved and not new_attribution and revised == " ".join(target["current_text"].split())):
                 raise ValueError(f"{row.block_id}: make the requested edit to the existing text")
             locations = set(row.evidence_ids)
             if not locations <= registered or not set(target["required_evidence_ids"]) <= locations:
@@ -121,6 +165,47 @@ class Draft(BaseModel):
         return self
 
 
+class CurrentDraft(Draft):
+    model_config = ConfigDict(title="Draft")
+    history: list[str] = Field(max_length=3)
+
+
+class AuthoritativeDraft(CurrentDraft):
+    """Every printed result is an admitted core; citations are owned by formal blocks."""
+    core_bindings: dict[str, str] = Field(description="Map every history.i and groups.i.theorem path to its unique admitted candidate_id")
+    formal_sources: dict[str, FormalSource] = Field(description="One heading attribution for every historical theorem, current theorem and definition, keyed by its draft path")
+
+    @model_validator(mode="after")
+    def bound_to_register(self, info: ValidationInfo):
+        histories = {f"history.{i}" for i in range(len(self.history))}
+        results = {f"groups.{i}.theorem" for i in range(len(self.groups))}
+        formal = histories | results
+        if set(self.core_bindings) != formal or len(set(self.core_bindings.values())) != len(formal):
+            raise ValueError("Bind each printed historical/current theorem to exactly one distinct approved core")
+        formal.update(f"shared_definitions.{i}" for i in range(len(self.shared_definitions)))
+        formal.update(f"groups.{i}.definitions.{j}" for i, group in enumerate(self.groups)
+                      for j in range(len(group.definitions)))
+        if set(self.formal_sources) != formal:
+            raise ValueError(f"Provide heading attributions for exactly these blocks: {sorted(formal)}")
+        context = info.context or {}
+        approved = context.get("approved_cores")
+        if approved is not None:
+            if set(self.core_bindings.values()) != set(approved):
+                raise ValueError("The draft must present precisely the admitted cores in approved_cores")
+            links = {link.block_id: set(link.evidence_ids) for link in self.evidence_links}
+            for field, key in self.core_bindings.items():
+                core = approved[key]
+                if (field in histories) != (core.get("kind") == "historical"):
+                    raise ValueError(f"{key}: preserve its approved historical/current role")
+                if not links[field].intersection(core["evidence_ids"]):
+                    raise ValueError(f"{field}: include original evidence for {key}")
+        if "passages" in context:
+            registered = {row["id"] for row in context["passages"]}
+            if any(set(link.evidence_ids) - registered for link in self.evidence_links):
+                raise ValueError("Copy evidence_ids from the supplied original passages")
+        return self
+
+
 class VisualLocation(BaseModel):
     draft_field: str = Field(min_length=1)
     issue: str = Field(min_length=1)
@@ -145,7 +230,7 @@ class EditorialDefect(BaseModel):
     current_excerpt: str = Field(description="Corresponding text in draft_field, or an empty string for absent text")
     evidence_id: str = Field(min_length=1, description="Registered original source location")
     source_excerpt: str = Field(min_length=1, description="Original passage at evidence_id")
-    required_change: str = Field(min_length=1, description="Requested edit and applicable v13 clause")
+    required_change: str = Field(min_length=1, description="Requested edit and applicable rule clause")
     operation: Literal["replace", "insert", "remove", "recover"] = Field(
         description="Edit operation. recover requests the extract route.")
     replacement_text: str = Field(default="", description=(
@@ -177,6 +262,17 @@ class AdmissionReview(BaseModel):
     issues: list[EditorialDefect] = Field(description="Edit records; empty on the pass route")
     evidence_ids: list[str] = Field(description="Original locations to reread on the extract route; otherwise use []")
 
+    @model_validator(mode="before")
+    @classmethod
+    def unwrap_final_evidence_verdict(cls, value):
+        # After a requested source read the wire contract is the verdict itself.
+        # A model may retain the first call's wrapper around an otherwise complete verdict.
+        if isinstance(value, dict) and value.get("source_checks"):
+            raise ValueError("The requested evidence was supplied. Return the final route, issues and evidence_ids.")
+        if isinstance(value, dict) and "route" not in value and isinstance(value.get("verdict"), dict):
+            return value["verdict"]
+        return value
+
     def repair_issues(self) -> list[str]:
         return list(dict.fromkeys(
             f'{issue.draft_field}: {issue.required_change} '
@@ -198,6 +294,12 @@ class AdmissionReview(BaseModel):
 
 def json_text(value) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def structured_request_text(schema, instructions, payload):
+    system = (instructions + "\nReturn one JSON object matching the supplied "
+              "schema; escape TeX backslashes in JSON strings.\n" + json_text(schema.model_json_schema()))
+    return system, json_text(payload)
 
 
 def png_message(request: str, image: bytes) -> HumanMessage:
@@ -261,10 +363,13 @@ class Models:
             raise ValueError("The selected provider requires an API key in the local configuration")
         timeout = settings.get("timeout", 120)
         self.provider = settings["provider"].lower()
+        self.optimized_workflow = is_optimized_workflow(settings)
         text_options = chat_options(settings, "text", timeout=timeout, max_retries=2)
         text_client = ReasoningChatOpenAI if "extra_body" in text_options else ChatOpenAI
         self.text = text_client(**text_options)
         self.vision = ChatOpenAI(**chat_options(settings, "vision", timeout=timeout, max_retries=2))
+        observe_http(self.text)
+        observe_http(self.vision)
         self.tool_model = self.text
         if (self.provider == "openai" and urlparse(settings["base_url"]).hostname == "api.openai.com"
                 and re.match(r"^gpt-6\.2-(?:sol|astra)(?:-|$)", settings["text_model"])):
@@ -278,18 +383,24 @@ class Models:
     def structured(self, schema: type[Model], instructions: str, payload,
                    image: bytes | None = None) -> Model:
         model = self.vision if image is not None else self.text
-        contract = schema.model_json_schema()
-        system = SystemMessage(content=instructions + "\nReturn one JSON object matching the supplied "
-                               "schema; escape TeX backslashes in JSON strings.\n" + json_text(contract))
-        original = png_message(json_text(payload), image) if image is not None else HumanMessage(content=json_text(payload))
+        system_text, user_text = structured_request_text(schema, instructions, payload)
+        system = SystemMessage(content=system_text)
+        original = png_message(user_text, image) if image is not None else HumanMessage(content=user_text)
         next_messages = [system, original]
         original_findings, repair_indexes = None, []
-        keep_previous = schema in (Findings, Draft, DraftPatch, AdmissionReview, Review)
+        keep_previous = (issubclass(schema, (Findings, Draft, DraftPatch, AdmissionReview, Review))
+                         or getattr(schema, "retry_with_previous", False))
         history = []
+        direct = getattr(self, "optimized_workflow", False) and schema.__name__ == "DirectResult"
+        retry_diagnostics = []
         for attempt in range(3):
             runner = model.with_structured_output(schema, method="json_mode", include_raw=True)
             try:
-                response = runner.invoke(next_messages)["raw"]
+                response = invoke_tracked(runner, next_messages, operation=schema.__name__,
+                                          channel="vision" if image is not None else "text",
+                                          passages=payload.get("passages", ()) if isinstance(payload, dict) else (),
+                                          schema_attempt=attempt + 1,
+                                          **({"previous_schema_failure": retry_diagnostics} if retry_diagnostics else {}))["raw"]
                 finish = response.response_metadata.get("finish_reason") or "unknown"
                 out = (response.usage_metadata or {}).get("output_tokens", 0)
                 text = response.content if isinstance(response.content, str) else ""
@@ -300,6 +411,7 @@ class Models:
                 out = getattr(exc.completion.usage, "completion_tokens", 0) or 0
 
             details = ""
+            retry_diagnostics = []
             next_messages = [system, original]
             if finish == "length":
                 # ChatOpenAI aliases max_tokens to max_completion_tokens. These providers
@@ -311,13 +423,19 @@ class Models:
                     model = model.model_copy(update={"extra_body": {**(model.extra_body or {}),
                                                                    "max_tokens": budget}})
                 details = "Truncated output. Regenerate a complete JSON object from the original evidence."
+                if direct:
+                    retry_diagnostics = [{"field": "document", "code": "output_length"}]
             elif not text.strip():
                 details = "Blank JSON output. Produce a complete JSON object using the schema."
+                if direct:
+                    retry_diagnostics = [{"field": "document", "code": "empty_response"}]
             else:
                 try:
-                    document = json.loads(text)
+                    document = json.loads(unfence(text) if direct else text)
                 except json.JSONDecodeError as exc:
                     details = f"Malformed JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}."
+                    if direct:
+                        retry_diagnostics = [{"field": "document", "code": "invalid_json"}]
                 else:
                     if repair_indexes:
                         corrections = document.get("candidates") if isinstance(document, dict) else None
@@ -330,10 +448,22 @@ class Models:
                             document = {**original_findings, "candidates": merged}
                     if not details:
                         try:
-                            return schema.model_validate(document, context=payload if schema is DraftPatch else None)
+                            return schema.model_validate(document, context=payload)
                         except ValidationError as exc:
-                            errors, details = _field_errors(exc, explain=keep_previous)
-                            if schema is Findings:
+                            if direct:
+                                # Only lossless representation changes are local. Revalidate against
+                                # the same complete source and require the same semantic invariants.
+                                normalized = normalize_direct_shape(document)
+                                if normalized is not document:
+                                    try:
+                                        return schema.model_validate(normalized, context=payload)
+                                    except ValidationError as remaining:
+                                        exc = remaining
+                                retry_diagnostics = safe_direct_errors(schema, exc.errors(include_input=False))
+                                details = "; ".join(f"{d['field']}: {d['code']}" for d in retry_diagnostics)
+                            else:
+                                errors, details = _field_errors(exc, explain=keep_previous)
+                            if issubclass(schema, Findings):
                                 indexes = _correctable_candidates(document, errors)
                                 if indexes:
                                     original_findings, repair_indexes = document, indexes
@@ -353,13 +483,22 @@ class Models:
                 })))
             elif len(next_messages) == 2:
                 next_messages.append(HumanMessage(content=details + " Return JSON matching the schema in the system message."))
-        raise ValueError(f"Invalid {schema.__name__} response after three attempts: " + " | ".join(history))
+        raise StructuredResponseError(schema, history)
 
 
     def transcribe(self, image: bytes, page: int) -> str:
-        response = self.vision.invoke([SystemMessage(content=(
+        response = invoke_tracked(self.vision, [SystemMessage(content=(
             "Read the mathematical source page. Transcribe visible definitions, statements, exact "
             "symbols, qualifiers and source labels. Flag any unreadable formula; do not infer it."
-        )), png_message(f"Inspect page {page}.", image)])
+        )), png_message(f"Inspect page {page}.", image)], operation="source_transcription", channel="vision")
         return str(response.content)
+
+    def read_source_region(self, image: bytes, page: int, question: str) -> str:
+        """Answer the actual reading question from this crop, including uncertainty."""
+        reply = invoke_tracked(self.vision, [
+            SystemMessage(content="Read this source image to resolve the stated mathematical question. "
+                          "Quote the relevant expression and conditions. Say which marks remain unreadable."),
+            png_message(json_text({"page": page, "question": question}), image),
+        ], operation="source_region_reading", channel="vision")
+        return str(reply.content)
 

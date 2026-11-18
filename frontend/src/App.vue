@@ -421,7 +421,7 @@ onBeforeUnmount(() => {
           <section class="page-title">
             <div>
               <h1>批次工作台</h1>
-              <p>管理论文批次、跟踪提取进度，下载已交付的引言。</p>
+              <p>管理论文批次、跟踪提取进度并下载结果。</p>
             </div>
             <a class="btn primary" href="#/import"
               ><Icon name="plus" />新建批次</a
@@ -502,6 +502,7 @@ onBeforeUnmount(() => {
                         >已交付 {{ b.stats.completed }} · 失败
                         {{ b.stats.failed }}</small
                       >
+                      <small v-if="b.summary_count">其中筛选说明 {{ b.summary_count }} 篇</small>
                       <small v-if="b.stats.paused || b.stats.cancelled">
                         <span v-if="b.stats.paused">已暂停 {{ b.stats.paused }}</span>
                         <span v-if="b.stats.paused && b.stats.cancelled"> · </span>
@@ -597,7 +598,7 @@ onBeforeUnmount(() => {
                   "
                   download
                   ><Icon name="download" />下载批次 ZIP ·
-                  {{ deliveredCount }} 篇成品</a
+                  {{ deliveredCount }} 篇<span v-if="detail.summary_count">（含 {{ detail.summary_count }} 篇筛选说明）</span></a
                 >
                 <button type="button" class="btn history-delete"
                   :disabled="!canDeleteBatch(detail) || !!changingBatchState[detail.id] || !!deletion"

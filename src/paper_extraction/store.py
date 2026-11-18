@@ -19,8 +19,9 @@ from .scope_reconciliation import saved_count_exception, stale_scope_result
 from .editorial import confirmation_only
 from .draft_artifacts import FILENAMES, capture_files, draft_digest, saved_rounds, snapshot_dir
 from .exporting import batch_export_directory, extraction_basename, standalone_tex
+from .summary_delivery import FORMAL_NAMES, SUMMARY_NAME, artifact_names
 
-NAMES = ("introduction.tex", "introduction.pdf", "preamble-v13.tex")
+NAMES = FORMAL_NAMES
 CONTENT_REVIEW_VERSION = "source-packet-v2"
 
 
@@ -425,13 +426,16 @@ class Store:
         with self.db() as db:
             batches = [dict(r) for r in db.execute("""SELECT b.*, n.name FROM batches b
                         LEFT JOIN batch_names n ON n.batch_id=b.id ORDER BY b.rowid DESC""")]
-            totals = db.execute("SELECT batch_id,status,count(*) n,sum(paused_by_batch) owned FROM papers GROUP BY batch_id,status").fetchall()
+            totals = db.execute("""SELECT batch_id,status,count(*) n,sum(paused_by_batch) owned,
+                       sum(CASE WHEN status='completed' AND json_extract(result,'$.delivery.kind')='summary'
+                                THEN 1 ELSE 0 END) summaries FROM papers GROUP BY batch_id,status""").fetchall()
         for b in batches:
             b["provider"] = json.loads(b.pop("settings"))["provider"]
             b["counts"] = {r["status"]: r["n"] for r in totals if r["batch_id"] == b["id"]}
             b["batch_pause"] = {r["status"]: r["owned"] for r in totals
                                 if r["batch_id"] == b["id"] and r["status"] in {"pausing", "paused"} and r["owned"]}
             b["total"] = sum(b["counts"].values())
+            b["summary_count"] = sum(r["summaries"] for r in totals if r["batch_id"] == b["id"])
         return batches
 
     def describe(self, batch):
@@ -464,6 +468,9 @@ class Store:
             p["events"] = [dict(stage=r["stage"],time=r["time"],data=json.loads(r["data"])) for r in events if r["paper_id"] == p["id"]]
             p.update({k:result.get(k, []) for k in ("candidates","reviews","evidence_links")})
             p["draft"] = result.get("draft")
+            if p["draft"]:
+                from .profile import reader_draft_view
+                p["draft"] = reader_draft_view(p["draft"])
             p["profile_release"] = result.get("profile_release")
             if result.get("delivery"):
                 p["delivery"] = result["delivery"]
@@ -490,7 +497,7 @@ class Store:
             directory = Path(result["result_dir"]).resolve()
             if not directory.is_relative_to(self.work(p)):
                 raise ValueError("成品目录超出本次任务范围")
-            hashes = {name:sha(directory/name) for name in NAMES}
+            hashes = {name:sha(directory/name) for name in artifact_names(result.get("delivery"))}
             result = {**result,"hashes":hashes}
         elif status != "paused":
             status = "failed"
@@ -517,6 +524,10 @@ class Store:
                 raise ValueError("缺少 " + PROVIDERS[effective_provider][1] + "，请先配置模型")
             if switched:
                 apply_reasoning_preferences(updated, self.reasoning_efforts(effective_provider))
+                # A provider switch changes credentials and models, not this batch's workflow.
+                for field in ("extraction_profile", "profile_fingerprint", "workflow_revision"):
+                    if field in previous:
+                        updated[field] = previous[field]
         result = prior["result"]
         # Early v0.1 builds stored exceptions as "ValueError: ..." without a flag.
         # Their checkpoint still contains the failed node's starting state.
@@ -559,11 +570,11 @@ class Store:
         return effective_provider
 
     def artifact(self, p, name):
-        if name not in NAMES or p["status"] != "completed":
-            raise ValueError("成品尚未就绪")
         result = p["result"]
+        if p["status"] != "completed" or name not in artifact_names(result.get("delivery")):
+            raise ValueError("成品尚未就绪")
         path = Path(result["result_dir"])/name
-        if not path.is_file() or sha(path) != result["hashes"][name]:
+        if not path.is_file() or sha(path) != result.get("hashes", {}).get(name):
             raise ValueError("成品与已登记版本不匹配")
         return path
 
@@ -707,6 +718,10 @@ class Store:
         return count
 
     def _write_extraction(self, archive, paper, base, directory=""):
+        if paper["result"].get("delivery", {}).get("kind") == "summary":
+            name = base + ".md"
+            archive.write(self.artifact(paper, SUMMARY_NAME), directory + name)
+            return {name: paper["result"]["hashes"][SUMMARY_NAME]}
         tex = self.export_tex(paper)
         pdf = self.artifact(paper, "introduction.pdf")
         tex_name, pdf_name = base + ".tex", base + ".pdf"
