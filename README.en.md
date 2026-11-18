@@ -8,14 +8,6 @@ A local workbench for mathematical papers. Import PDFs or TeX projects and get a
 
 Use Python 3.11–3.14 and TeX Live with `pdflatex` and `kpsewhich` on PATH. A full TeX Live installation includes the required packages. A minimal installation needs newtx, txfonts, amsmath, amsthm, mathrsfs, enumitem, needspace, microtype, etoolbox, hyperref, titlesec and their dependencies.
 
-The release wheel includes the web interface. Download the wheel and install it inside a virtual environment:
-
-```shell
-python -m pip install paper_extraction-0.1.0-py3-none-any.whl
-paper-extraction --version
-paper-extraction example compactness
-```
-
 For a source checkout, install [uv](https://docs.astral.sh/uv/) and Node.js 22.12 or later. Build the web interface and install the locked Python dependencies:
 
 ```shell
@@ -25,6 +17,14 @@ npm --prefix frontend ci
 npm --prefix frontend run build
 uv sync --locked --python 3.12
 uv run paper-extraction doctor
+```
+
+GitHub Releases lists versioned releases, release notes and any attached installers. If a release includes a `.whl` file, download it and install it inside a Python virtual environment. Use the downloaded filename in the command. The wheel includes the web interface.
+
+```shell
+python -m pip install paper_extraction-0.1.0-py3-none-any.whl
+paper-extraction --version
+paper-extraction example compactness
 ```
 
 For a new installation, copy [.env.example](.env.example) to `.env` in your **launch directory** and set your `OPENAI_API_KEY`. For an existing installation, add this key to the existing file and set `PAPER_EXTRACTION_PROVIDER=openai`. The model settings page also supports DeepSeek and GLM. Environment variables are supported. Use `paper-extraction --env-file path/to/config serve` to select another file. Source passages and page images are sent to the selected provider.
@@ -56,7 +56,54 @@ manifest.json
 
 ## Workflow and acceptance
 
-LangGraph keeps an independent SQLite checkpoint for each paper. LangChain binds read-only tools for searching the paper, reading passages and inspecting page images. Each start or explicit retry can generate up to three drafts, including the first. The first two can be reviewed, revised with targeted edits or supplemented with more evidence. A draft can be delivered as soon as it passes those checks. The third draft goes straight to a two-pass compile and PDF readability check. For a TeX error, the workflow can restore a block tied to the same source evidence or deliver an earlier verified version. When neither is available, it compiles the existing content in a simplified layout. If the compiler is unavailable, it generates a readable PDF locally and labels it accordingly. Finalization uses no additional model calls. The workbench offers the PDF and the final TeX with its preamble embedded, with check results recorded separately.
+FastAPI handles imports and schedules work. Each paper runs in its own LangGraph graph with SQLite checkpoints. Extraction, writing and review call models through LangChain.
+
+```mermaid
+flowchart TB
+    U["Import PDF or TeX files"] --> A["Stage files and show the preview"]
+    A -->|Confirm| B["Create the batch and save source snapshots"]
+    B --> I["Index the source for each paper"]
+    I --> X["Extract candidates and evidence in sections"]
+    X -->|A category is missing| P["Look for more evidence"]
+    X -->|Scan complete| S["Select contributions from the full paper"]
+    P --> S
+    S -->|More evidence needed| P
+    S -->|Ready to write| D["Write or revise the draft"]
+    S -->|Selection failed and no draft exists| N["Record the failure reason"]
+    S -->|Selection failed and a draft exists| F["Compile locally and recover a deliverable version if needed"]
+    D -->|First two drafts| R["Review the mathematical content"]
+    D -->|Third draft| F
+    R -->|Pass| C["Compile TeX and check layout"]
+    C -->|Pass| V["Inspect each PDF page"]
+    V -->|All checks passed| O["Register the result for viewing and download"]
+    R -->|Issue found| Q{"Choose the next step based on the issue"}
+    C -->|Issue found| Q
+    V -->|Issue found| Q
+    Q -->|Check relevant source passages| X
+    Q -->|Revise the affected content| D
+    Q -->|Stop revising| F
+    F -->|Readable result available| O
+```
+
+<details>
+<summary>How evidence tools run</summary>
+
+Extraction, some supplemental evidence searches and content reviews can invoke the evidence graph. Each invocation allows up to four model decisions, and each decision can request multiple read-only tools. Inspecting a PDF page image can call the vision model.
+
+```mermaid
+flowchart TB
+    I["Prepare the rules and source passages"] --> D["Call the model with tools bound through LangChain"]
+    D --> Q{"Did the model request tools?"}
+    Q -->|No| O["Return observations and source locations"]
+    Q -->|Yes| T["ToolNode searches, reads passages or inspects PDF page images"]
+    T --> L{"Have four model decisions completed?"}
+    L -->|No| D
+    L -->|Yes| O
+```
+
+</details>
+
+Each start or explicit retry can generate up to three drafts, including the first. The third draft goes straight to a two-pass compile and PDF readability check. For a TeX error, the workflow can restore a block tied to the same source evidence or deliver an earlier verified version. When neither is available, it compiles the existing content in a simplified layout. If the compiler is unavailable, it generates a readable PDF locally and labels it accordingly. Finalization uses no additional model calls. The workbench offers the PDF and the final TeX with its preamble embedded, and records whether the result passed all checks.
 
 Each introduction includes a separate bibliography. The model selects current theorems, historical comparisons and necessary definitions from the source, and adds context where it helps explain the problem or the scope of the results. Aim for three body pages or fewer, with up to five when the material needs more space. Word counts guide the writing. The compiled checks enforce the measured block, formula and page budgets. The workbench reports missing source evidence and layout problems for each paper. [Original rules](src/paper_extraction/profile_assets/intro-rules-v13.txt)
 

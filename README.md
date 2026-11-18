@@ -1,20 +1,12 @@
 # Paper Extraction
 
-[English](README.en.md) · [发行版本](https://github.com/ZhiyaoXiongMath/paper-extraction/releases)
+[English](README.en.md) · [GitHub 发布页](https://github.com/ZhiyaoXiongMath/paper-extraction/releases)
 
 本地数学论文批处理工作台。导入 PDF 或 TeX，Agent 从原文选择历史定理、主要贡献与必要定义，按 Introduction v13 生成逐篇英文 TeX 与 PDF。中文网页支持点击生成稿中的定理，打开原论文页或源文件行号。
 
 ## 安装和启动
 
 需要 Python 3.11–3.14 及可运行 `pdflatex`、`kpsewhich` 的 TeX Live。完整的 TeX Live 安装包含所需宏包。精简安装须包含 newtx、txfonts、amsmath、amsthm、mathrsfs、enumitem、needspace、microtype、etoolbox、hyperref、titlesec 及依赖。
-
-发行 wheel 内置网页。下载 wheel 后，在 Python 虚拟环境中运行：
-
-```shell
-python -m pip install paper_extraction-0.1.0-py3-none-any.whl
-paper-extraction --version
-paper-extraction example compactness
-```
 
 从仓库运行需安装 [uv](https://docs.astral.sh/uv/) 和 Node.js 22.12 或更新版。使用以下命令构建网页并安装锁定的 Python 依赖：
 
@@ -25,6 +17,14 @@ npm --prefix frontend ci
 npm --prefix frontend run build
 uv sync --locked --python 3.12
 uv run paper-extraction doctor
+```
+
+GitHub 发布页提供带版本号的发布记录、更新说明，以及随版本上传的安装包。如果所选版本附有 `.whl`，下载后在 Python 虚拟环境中安装，命令中的文件名以实际下载为准。安装包内置网页。
+
+```shell
+python -m pip install paper_extraction-0.1.0-py3-none-any.whl
+paper-extraction --version
+paper-extraction example compactness
 ```
 
 首次运行时，把 [.env.example](.env.example) 复制到**启动目录**并命名为 `.env`。默认使用 OpenAI，填写自己的 `OPENAI_API_KEY`。已有配置文件时，在原文件中添加该变量并设置 `PAPER_EXTRACTION_PROVIDER=openai`。DeepSeek 和智谱也可在网页的模型设置中选择。环境变量同样有效。若配置文件在其他位置，请用 `paper-extraction --env-file 配置路径 serve`。论文片段和需要识别的页图会发送给选定的模型服务。
@@ -56,7 +56,54 @@ manifest.json
 
 ## 工作流与判定
 
-LangGraph 为每篇论文保存独立的 SQLite 检查点。LangChain 的模型调用与只读工具让 Agent 搜索原文、读取段落、查看原页。每次启动或主动重试最多写三稿，包含初稿。前两稿按需复核、定向修订或补查原文，通过检查即可交付。第三稿直接双遍编译并确认 PDF 可以打开。若 TeX 编译报错，程序尝试复用原文依据相同的上一稿段落修复，或交付此前经验证的整稿。没有可复用版本时，程序用已有内容编译简明版；本机缺少编译环境时生成可读 PDF 并注明来源。定稿阶段无需再次调用模型。工作台提供 PDF 和内嵌前导内容的成品 TeX，检查结果单独记录。
+FastAPI 负责导入和调度。每篇论文独立运行一张 LangGraph 图，进度保存在 SQLite 中。提取、写稿和复核通过 LangChain 调用模型。
+
+```mermaid
+flowchart TB
+    U["导入 PDF 或 TeX"] --> A["暂存文件并显示预览"]
+    A -->|确认开始| B["创建批次并保存原文快照"]
+    B --> I["为每篇论文建立原文索引"]
+    I --> X["分段提取候选与证据"]
+    X -->|发现类别缺项| P["补查原文"]
+    X -->|扫描完成| S["按整篇原文筛选贡献"]
+    P --> S
+    S -->|仍需补证| P
+    S -->|可写稿| D["写稿或局部修订"]
+    S -->|筛选失败且没有草稿| N["记录失败原因"]
+    S -->|筛选失败且已有草稿| F["在本机编译定稿，必要时恢复可交付版本"]
+    D -->|前两稿| R["复核数学内容"]
+    D -->|第三稿| F
+    R -->|通过| C["编译 TeX 并检查版式"]
+    C -->|通过| V["逐页检查 PDF"]
+    V -->|通过全部检查| O["登记成品，可查看和下载"]
+    R -->|发现问题| Q{"根据问题决定下一步"}
+    C -->|发现问题| Q
+    V -->|发现问题| Q
+    Q -->|定向回查原文| X
+    Q -->|按问题修订稿件| D
+    Q -->|达到停止修订条件| F
+    F -->|生成可读成品| O
+```
+
+<details>
+<summary>取证工具如何运行</summary>
+
+分段提取、部分补证和按需内容复核可调用取证子图。每次调用最多四次模型决策，每次可请求多个只读工具。查看 PDF 页图时可调用视觉模型。
+
+```mermaid
+flowchart TB
+    I["准备规则和原文片段"] --> D["通过 LangChain 调用已绑定工具的模型"]
+    D --> Q{"模型请求工具？"}
+    Q -->|否| O["返回取证观察与原文定位"]
+    Q -->|是| T["ToolNode 执行搜索、读段落或查看 PDF 页图"]
+    T --> L{"已完成四次模型决策？"}
+    L -->|否| D
+    L -->|是| O
+```
+
+</details>
+
+每次启动或主动重试最多写三稿，包含初稿。第三稿直接双遍编译并确认 PDF 可以打开。若 TeX 编译报错，程序尝试复用原文依据相同的上一稿段落修复，或交付此前经验证的整稿。没有可复用版本时，程序用已有内容编译简明版。本机缺少编译环境时生成可读 PDF 并注明来源。定稿阶段无需再次调用模型。工作台提供 PDF 和内嵌前导内容的成品 TeX，并记录成品是否通过全部检查。
 
 成果包含正文和独立参考文献页。模型依据原文筛选定理、历史比较和必要定义，并用连接段交代背景、数学比较及结果适用范围。正文通常以三页内为目标，内容确有需要时最多五页。词数是写作建议，实际块高、公式和页数由编译后的检查验证。来源不足或版式无法满足要求时，批次会说明原因。[原始规则](src/paper_extraction/profile_assets/intro-rules-v13.txt)
 
