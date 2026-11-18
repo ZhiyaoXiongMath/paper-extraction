@@ -78,7 +78,8 @@ class Store:
         return json.loads(row["settings"])
 
     def work(self, p):
-        return self.home/"runs"/p["batch_id"]/p["id"]/f"attempt-{p['attempt']}"
+        work_attempt = p.get("result", {}).get("work_attempt", p["attempt"])
+        return self.home/"runs"/p["batch_id"]/p["id"]/f"attempt-{work_attempt}"
 
     def pending(self):
         with self.db() as db:
@@ -122,6 +123,7 @@ class Store:
                            (pid,attempt,stage,now(),dump(data)))
 
     def finish(self, p, result):
+        result = {**result, "work_attempt":p["result"].get("work_attempt",p["attempt"])}
         status = result.get("status","failed")
         if status == "completed":
             directory = Path(result["result_dir"]).resolve()
@@ -137,9 +139,18 @@ class Store:
                        (status, status, result.get("reason",""), dump(result), p["id"], p["attempt"]))
 
     def retry(self, pid):
+        prior = self.paper(pid)
+        result = prior["result"]
+        # Early v0.1 builds stored exceptions as "ValueError: ..." without a flag.
+        # Their checkpoint still contains the failed node's starting state.
+        interrupted = result.get("resumable", prior["reason"].startswith(
+            ("ValueError: Model did not return valid ", "APIConnectionError:", "APITimeoutError:")))
+        resume = interrupted and (self.work(prior)/"checkpoint.sqlite").is_file()
+        state = {"work_attempt":result.get("work_attempt",prior["attempt"])} if resume else {}
         with self.db() as db:
             row = db.execute("""UPDATE papers SET attempt=attempt+1,status='queued',stage='queued',
-                          reason='',result='{}' WHERE id=? AND status='failed'""",(pid,))
+                          reason='',result=? WHERE id=? AND status='failed' AND attempt=?""",
+                          (dump(state),pid,prior["attempt"]))
             if not row.rowcount:
                 raise ValueError("仅失败任务可重试")
 

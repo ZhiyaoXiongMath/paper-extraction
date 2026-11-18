@@ -178,6 +178,8 @@ def _public(s):
         result["status"], result["reason"] = "failed", "Completed artifacts changed or are missing"
     else:
         result["reason"] = s.get("reason", "Paper processing stopped before publication")
+        if s.get("resumable"):
+            result["resumable"] = True
     return result
 
 
@@ -213,7 +215,11 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
             "applications. Check adjacent evidence before classifying a proof device as a contribution.", packet)
         res = models.structured(Findings, "Extract only source-supported candidate claims with exact "
             "assumptions, original label, needed definitions, admission decision and its reason, and "
-            "registered evidence_ids. Admit significant supported results, exclude proof devices, and "
+            "registered evidence_ids. Emit only plausibly independent substantive contributions, "
+            "source-supported direct historical comparisons, concepts necessary to state them, "
+            "and title/author/setting evidence. Skip proof-only estimates, calculations and "
+            "intermediate lemmas instead of cataloguing them. Do not pad or cap the candidate count. "
+            "Use only the allowed kind and decision values. Admit supported significant results and "
             "mark significance unresolved where evidence is insufficient. Preserve the exact title "
             "and full ordered author list as a setting candidate when present. Empty findings are "
             "appropriate for proof-only passages. Keep uncertainty explicit.",
@@ -396,6 +402,7 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
     source_root = Path(source_root).resolve() if source_root is not None else None
     work.mkdir(parents=True, exist_ok=True)
     state = {}
+    resumable = False
     try:
         if source_root and (not source.is_relative_to(source_root) or work.is_relative_to(source_root)):
             raise ValueError("Source entry must be inside its declared root, and output outside it")
@@ -423,7 +430,9 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
             try:
                 state = graph.invoke(initial, config)
             except Exception:
-                state = graph.get_state(config).values
+                interrupted = graph.get_state(config)
+                state = interrupted.values
+                resumable = bool(interrupted.next)
                 raise
         return _public(state)
     except Exception as exc:
@@ -431,5 +440,6 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
         key = settings.get("api_key")
         if key:
             detail = detail.replace(str(key), "[redacted]")
-        return _public({**state, "status": "failed", "reason": f"{type(exc).__name__}: {detail[:3000]}"})
+        return _public({**state, "status": "failed", "resumable": resumable,
+                        "reason": f"{type(exc).__name__}: {detail[:3000]}"})
 

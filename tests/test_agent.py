@@ -129,7 +129,7 @@ def test_visual_failure_stops_after_two_repairs(paper):
     model.visual_passes = False
     result = run()
     assert result["status"] == "failed", result
-    assert "clipping" in result["reason"] and "result_dir" not in result
+    assert "clipping" in result["reason"] and "result_dir" not in result and "resumable" not in result
     assert len(builds) == 3
     assert not any(n == "publish" for n, _ in events)
 
@@ -139,6 +139,7 @@ def test_recovery_resumes_unfinished_checkpoint(paper):
     model.interrupt_review = True
     first = run()
     assert first["status"] == "failed" and "transient interruption" in first["reason"]
+    assert first["resumable"] is True
     second = run()
     assert second["status"] == "completed", second
     assert model.extracts == model.drafts == len(builds) == 1

@@ -90,6 +90,23 @@ def test_missing_source_dependency_is_diagnosed(tmp_path):
         SourceIndex(source,tmp_path,tmp_path/"work").catalog()
 
 
+def test_retry_preserves_interrupted_graph_work_but_allocates_new_content_attempt(tmp_path):
+    store = Store(tmp_path)
+    store.create("batch", {"provider":"deepseek"}, [
+        dict(id="paper",name="test",kind="tex",source="main.tex",root=None)])
+    first = store.paper("paper")
+    work = store.work(first)
+    work.mkdir(parents=True)
+    (work/"checkpoint.sqlite").touch()
+    store.finish(first, {"status":"failed","reason":"network interrupted","resumable":True})
+    store.retry("paper")
+    resumed = store.paper("paper")
+    assert resumed["attempt"] == 2 and store.work(resumed) == work
+    store.finish(resumed, {"status":"failed","reason":"source has no supported history"})
+    store.retry("paper")
+    assert store.work(store.paper("paper")) != work
+
+
 def test_pasted_paths_cannot_leave_staging(tmp_path):
     with TestClient(create_app(tmp_path)) as client:
         res=client.post("/api/imports",files=[("files",("a.tex",b"A"))],data={"paths":'["../a.tex"]'})
