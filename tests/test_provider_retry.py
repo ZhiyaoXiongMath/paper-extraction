@@ -60,8 +60,9 @@ def test_switch_then_retry_and_resume_uses_public_frozen_attempt_settings(tmp_pa
     monkeypatch.setenv("OPENAI_API_KEY", "rotated-offline-token")
     calls = []
 
-    def fake_run(work, source, root, settings, notify, *, retry_legacy_review):
+    def fake_run(work, source, root, settings, notify, *, retry_legacy_review, read_api_key):
         calls.append((work, dict(settings), retry_legacy_review))
+        assert read_api_key() == settings["api_key"]
         work.mkdir(parents=True, exist_ok=True)
         (work/"checkpoint.sqlite").touch()
         return {"status": "failed", "reason": "Offline transient error.", "resumable": True}

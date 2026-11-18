@@ -33,6 +33,23 @@ export interface BatchSummary {
   total: number;
 }
 export interface Candidate {
+  candidate_id?: string;
+  independent_question?: string | null;
+  local_kind?: string;
+  local_decision?: string;
+  local_reason?: string;
+  local_evidence_ids?: string[];
+  selection_evidence_ids?: string[];
+  needed_by?: string[];
+  represented_by?: string;
+  context_for?: string[];
+  scope_group_id?: string;
+  scope_role?: string;
+  scope_excerpt?: string;
+  scope_evidence_id?: string;
+  scope_evidence_version?: string;
+  scope_reason_type?: string;
+  scope_central_open?: boolean;
   kind: string;
   claim: string;
   assumptions: string;
@@ -50,7 +67,19 @@ export interface Review {
   issues: string[];
   route?: "extract" | "draft" | "pass";
   evidence_ids?: string[];
+  defects?: EditorialDefect[];
+  repair_targets?: { draft_field: string; current_text: string; diagnostics: string[] }[];
   page?: number;
+}
+export interface EditorialDefect {
+  kind?: string;
+  draft_field?: string;
+  current_excerpt?: string;
+  evidence_id?: string;
+  source_excerpt?: string;
+  required_change?: string;
+  operation?: string;
+  replacement_text?: string;
 }
 export interface EvidenceLink {
   block_id: string;

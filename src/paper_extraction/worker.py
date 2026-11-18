@@ -18,8 +18,9 @@ def process(home, pid):
         if paper["status"] not in {"queued","running"}:
             return
         settings = store.paper_settings(paper)
-        private = provider_settings(settings["provider"], with_key=True)
-        settings["api_key"] = private["api_key"]
+        def read_api_key():
+            return provider_settings(settings["provider"], with_key=True)["api_key"]
+        settings["api_key"] = read_api_key()
         def notify(stage, data):
             store.event(pid, paper["attempt"], stage, data)
         try:
@@ -29,7 +30,8 @@ def process(home, pid):
                              "text_model": settings.get("text_model"), "vision_model": settings.get("vision_model")})
             result = run_paper(store.work(paper), Path(paper["source"]),
                                Path(paper["root"]) if paper["root"] else None,
-                               settings, notify, retry_legacy_review=paper["result"].get("retry_legacy_review", False))
+                               settings, notify, retry_legacy_review=paper["result"].get("retry_legacy_review", False),
+                               read_api_key=read_api_key)
             store.finish(paper, result)
         except Exception as exc:
             reason = str(exc).replace(settings["api_key"], "[redacted]") if settings["api_key"] else str(exc)

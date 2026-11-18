@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import io
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources import files
 from pathlib import Path
 import shutil
 import threading
@@ -45,7 +46,7 @@ def provider_answer(request, visual_pages):
         data = json.loads(payload)
 
     if request.get("tools"):
-        rules = (Path(__file__).parents[1] / "src/paper_extraction/profile_assets/intro-rules-v13.txt").read_text("utf-8")
+        rules = files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text("utf-8")
         assert sys_msg.startswith(rules + "\n") and "Return the original location IDs" in sys_msg[len(rules):]
         spans = data.get("passages") or data.get("original_abstract_intro_results_and_applications")
         if spans and not any(m["role"] == "tool" for m in request["messages"]):

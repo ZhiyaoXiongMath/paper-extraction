@@ -6,6 +6,8 @@ import json
 import os
 import re
 from collections.abc import Callable
+from contextlib import contextmanager
+from functools import wraps
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated, TypedDict
@@ -159,7 +161,24 @@ def _restore_scan_readings(saver, config, index):
 
 
 
-def _evidence_agent(index, models, allowed_ids, notify):
+@contextmanager
+def _private_model_errors(keys):
+    # LangGraph persists node exceptions. Sanitize provider errors before either graph sees them.
+    try:
+        yield
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        if status in (401, 403):
+            raise RuntimeError(f"Model access denied (HTTP {status}). Check the configured API key and permissions.") from None
+        original = detail = str(exc)
+        for key in sorted(keys, key=len, reverse=True):
+            detail = detail.replace(key, "[redacted]")
+        if detail != original:
+            raise RuntimeError(detail) from None
+        raise
+
+
+def _evidence_agent(index, models, allowed_ids, notify, keys):
     @tool
     def search_source(query: str) -> str:
         """Find relevant passages in this paper and return their source location IDs."""
@@ -182,7 +201,8 @@ def _evidence_agent(index, models, allowed_ids, notify):
         if not locations:
             return "No PDF image for this page. For TeX, use read_span on a source location."
         notify("evidence", {"tool": "read_page_image", "page": page, "region": region, "locations": locations})
-        transcription = models.transcribe(index.image(page, region), page)
+        with _private_model_errors(keys):
+            transcription = models.transcribe(index.image(page, region), page)
         return json_text({"page": page, "region": region, "source_ids": locations,
                           "transcription": transcription})
 
@@ -190,7 +210,8 @@ def _evidence_agent(index, models, allowed_ids, notify):
     tool_model = models.text.bind_tools(tools)
 
     def decide(state: EvidenceState):
-        reply = tool_model.invoke(state["messages"])
+        with _private_model_errors(keys):
+            reply = tool_model.invoke(state["messages"])
         return {"messages": [reply], "rounds": state["rounds"] + 1}
 
     graph = StateGraph(EvidenceState)
@@ -246,7 +267,7 @@ def _public(s):
     return result
 
 
-def _make_graph(work, source, source_root, settings, notify, checkpointer, rules, index):
+def _make_graph(work, source, source_root, settings, notify, checkpointer, rules, index, read_api_key):
     rubric = files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8")
     catalog = index.catalog()
     records = {str(r["id"]): r for r in catalog}
@@ -255,8 +276,27 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
     if len(records) != len(catalog):
         raise ValueError("The source index contains duplicate location IDs")
     batches = _batches(catalog, stable_scan=True)
+    active_key = settings.get("api_key")
+    keys = {active_key} if active_key else set()
     models = Models(settings)
-    reader = _evidence_agent(index, models, records, notify)
+    reader = _evidence_agent(index, models, records, notify, keys)
+
+    def at_model_boundary(node):
+        @wraps(node)
+        def run(state):
+            nonlocal active_key, models, reader
+            with _private_model_errors(keys):
+                if read_api_key is not None:
+                    key = read_api_key()
+                    if not key or not key.strip():
+                        raise ValueError("缺少模型 API Key，请更新配置后从检查点继续")
+                    if key != active_key:
+                        keys.add(key)
+                        updated = Models({**settings, "api_key": key})
+                        reader = _evidence_agent(index, updated, records, notify, keys)
+                        models, active_key = updated, key
+                return node(state)
+        return run
 
     def extract(s):
         cursor = s["cursor"]
@@ -505,6 +545,8 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
     for name, node in (("extract", extract), ("prerequisites", prerequisites), ("select", select),
                        ("draft", write_draft), ("review", review),
                        ("compile", compile_pdf), ("visual", visual), ("publish", publish), ("failed", failed)):
+        if name in {"extract", "prerequisites", "select", "draft", "review", "visual"}:
+            node = at_model_boundary(node)
         graph.add_node(name, node)
     graph.add_edge(START, "extract")
     def after_extract(s):
@@ -532,15 +574,15 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
 
 
 def run_paper(work: Path, source: Path, source_root: Path | None, settings: dict, notify: Notify,
-              *, retry_legacy_review: bool = False) -> dict:
+              *, retry_legacy_review: bool = False, read_api_key: Callable[[], str] | None = None) -> dict:
     work = Path(work).resolve()
     work.mkdir(parents=True, exist_ok=True)
     with FileLock(work / "paper.lock"):
-        return _run_locked(work, source, source_root, settings, notify, retry_legacy_review)
+        return _run_locked(work, source, source_root, settings, notify, retry_legacy_review, read_api_key)
 
 
 def _run_locked(work: Path, source: Path, source_root: Path | None, settings: dict, notify: Notify,
-                retry_legacy_review: bool) -> dict:
+                retry_legacy_review: bool, read_api_key: Callable[[], str] | None) -> dict:
     work, source = Path(work).resolve(), Path(source).resolve()
     source_root = Path(source_root).resolve() if source_root is not None else None
     work.mkdir(parents=True, exist_ok=True)
@@ -563,7 +605,7 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
             return _public(json.loads(receipt.read_text("utf-8")))
         with SqliteSaver.from_conn_string(os.fspath(work / "checkpoint.sqlite")) as saver:
             index = SourceIndex(source, source_root, work)
-            graph, batch_count = _make_graph(work, source, source_root, settings, notify, saver, rules, index)
+            graph, batch_count = _make_graph(work, source, source_root, settings, notify, saver, rules, index, read_api_key)
             config = {"configurable": {"thread_id": thread}, "recursion_limit": 3 * batch_count + 30}
             prior = graph.get_state(config)
             state = prior.values

@@ -1,25 +1,34 @@
 <script setup lang="ts">
-import { ref, watch, onMounted } from "vue";
-import renderMathInElement from "katex/contrib/auto-render";
+import { computed } from "vue";
 import "katex/dist/katex.min.css";
-const props = defineProps({ text: String });
-const el = ref<HTMLElement>();
-function render() {
-  if (!el.value) return;
-  el.value.textContent = props.text || "";
-  renderMathInElement(el.value, {
-    throwOnError: false,
-    trust: false,
-    strict: "ignore",
-    delimiters: [
-      { left: "$$", right: "$$", display: true },
-      { left: "\\[", right: "\\]", display: true },
-      { left: "\\(", right: "\\)", display: false },
-      { left: "$", right: "$", display: false },
-    ],
-  });
+import { renderMarkdown } from "./rich-text.js";
+
+const props = defineProps<{ text?: string; candidateIds?: ReadonlySet<string> }>();
+const emit = defineEmits<{ candidate: [id: string] }>();
+const content = computed(() => renderMarkdown(props.text || "", props.candidateIds));
+function navigate(event: MouseEvent) {
+  const target = event.target;
+  if (!(target instanceof Element)) return;
+  const id = target.closest<HTMLElement>("[data-candidate-ref]")?.dataset.candidateRef;
+  if (id && props.candidateIds?.has(id)) emit("candidate", id);
 }
-onMounted(render);
-watch(() => props.text, render, { flush: "post" });
 </script>
-<template><div class="math-text" ref="el"></div></template>
+
+<template><div class="math-text" v-html="content" @click="navigate"></div></template>
+
+<style scoped>
+.math-text { white-space: normal; overflow-wrap: anywhere; min-width: 0; }
+.math-text :deep(p) { margin: 0; }
+.math-text :deep(p + p), .math-text :deep(ul), .math-text :deep(ol),
+.math-text :deep(blockquote), .math-text :deep(pre) { margin-block: .55em; }
+.math-text :deep(ul), .math-text :deep(ol) { padding-inline-start: 1.5em; }
+.math-text :deep(pre) { overflow-x: auto; white-space: pre; }
+.math-text :deep(code) { font-size: .9em; overflow-wrap: anywhere; }
+.math-text :deep(.katex) { font-size: 1.08em; }
+.math-text :deep(.katex-display) { overflow-x: auto; overflow-y: hidden; margin-block: .65em; }
+.math-text :deep(.candidate-ref) {
+  color: #315c47; background: transparent; border: 0; padding: 0 .07em; font: inherit;
+  font-weight: 600; text-decoration: underline; text-underline-offset: .16em; cursor: pointer;
+}
+.math-text :deep(.candidate-ref:hover) { color: #193d2a; }
+</style>
