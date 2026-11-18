@@ -67,7 +67,7 @@ jobs:
           uv pip install --python "$PY" pytest
           fixture="$RUNNER_TEMP/wheel-smoke"
           mkdir -p "$fixture/tests" "$fixture/examples"
-          cp tests/test_vertical.py "$fixture/tests/"
+          cp tests/test_vertical.py tests/fixture_selection.py "$fixture/tests/"
           cd "$fixture"
           export PAPER_EXTRACTION_HOME="$fixture/app-data"
           unset PYTHONPATH
