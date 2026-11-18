@@ -1,14 +1,14 @@
 const statuses = {
-  queued: ["排队中", "neutral"],
+  queued: ["排队", "neutral"],
   pending: ["排队中", "neutral"],
-  running: ["运行中", "working"],
+  running: ["处理中", "working"],
   processing: ["运行中", "working"],
   passed: ["已通过", "good"],
   accepted: ["已通过", "good"],
   succeeded: ["已通过", "good"],
   success: ["已通过", "good"],
-  completed: ["已通过", "good"],
-  failed: ["未通过", "bad"],
+  completed: ["已完成", "good"],
+  failed: ["失败", "bad"],
   rejected: ["未通过", "bad"],
   error: ["运行失败", "bad"],
   partial: ["证据不足", "bad"],
@@ -42,12 +42,18 @@ export const tone = (status) => statuses[status]?.[1] ?? "neutral";
 export const terminal = (status) => ["bad", "good"].includes(tone(status));
 export const stageName = (stage) => stages[stage] ?? stage ?? "—";
 export function metrics(batches) {
-  const result = { total: 0, working: 0, good: 0, bad: 0 };
+  const result = { total: 0, queued: 0, running: 0, completed: 0, failed: 0 };
+  const groups = {
+    neutral: "queued",
+    working: "running",
+    good: "completed",
+    bad: "failed",
+  };
   for (const batch of batches) {
     result.total += Number(batch.total || 0);
     for (const [status, count] of Object.entries(batch.counts || {})) {
-      const group = tone(status);
-      result[group === "neutral" ? "working" : group] += Number(count || 0);
+      if (Object.hasOwn(statuses, status))
+        result[groups[tone(status)]] += Number(count || 0);
     }
   }
   return result;

@@ -52,6 +52,9 @@ const selectedPaper = computed(() =>
   detail.value?.papers?.find((p) => p.id === route.value.paper),
 );
 const stats = computed(() => metrics(batches.value));
+const batchRows = computed(() =>
+  batches.value.map((b) => ({ ...b, stats: metrics([b]) })),
+);
 const completeCount = computed(
   () => detail.value?.papers?.filter((p) => terminal(p.status)).length || 0,
 );
@@ -59,8 +62,8 @@ const queueFilter = ref("all");
 const filters = [
   ["all", "全部"],
   ["queued", "排队"],
-  ["running", "处理"],
-  ["completed", "完成"],
+  ["running", "处理中"],
+  ["completed", "已完成"],
   ["failed", "失败"],
 ];
 const visiblePapers = computed(() =>
@@ -92,10 +95,10 @@ const nav = [
   { view: "settings", icon: "settings", name: "模型设置" },
 ];
 const statList = [
-  ["total", "论文总数", "stack"],
-  ["working", "等待与运行", "clock"],
-  ["good", "已通过", "check"],
-  ["bad", "未通过", "fail"],
+  ["queued", "排队", "clock"],
+  ["running", "处理中", "activity"],
+  ["completed", "已完成", "check"],
+  ["failed", "失败", "fail"],
 ] as const;
 function onHash() {
   route.value = readRoute();
@@ -367,7 +370,7 @@ onBeforeUnmount(() => {
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="b in batches" :key="b.id">
+                  <tr v-for="b in batchRows" :key="b.id">
                     <td>
                       <a :href="path(b.id)" class="text-link mono"
                         >#{{ shortId(b.id) }}</a
@@ -382,16 +385,18 @@ onBeforeUnmount(() => {
                           :style="{
                             width:
                               (b.total
-                                ? (100 *
-                                    (metrics([b]).good + metrics([b]).bad)) /
+                                ? (100 * (b.stats.completed + b.stats.failed)) /
                                   b.total
                                 : 0) + '%',
                           }"
                         ></i>
                       </div>
                       <small
-                        >{{ metrics([b]).good }} 通过 ·
-                        {{ metrics([b]).bad }} 未通过</small
+                        >排队 {{ b.stats.queued }} · 处理中
+                        {{ b.stats.running }}</small
+                      ><small
+                        >已完成 {{ b.stats.completed }} · 失败
+                        {{ b.stats.failed }}</small
                       >
                     </td>
                     <td>
@@ -443,7 +448,8 @@ onBeforeUnmount(() => {
               <div class="page-title">
                 <div>
                   <h1>
-                    批次 <span class="id-title">#{{ shortId(detail.id) }}</span>
+                    批次 <span class="id-title">#{{ shortId(detail.id) }}</span
+                    ><small> · {{ detail.total }} 篇论文</small>
                   </h1>
                   <p>
                     {{ formatDate(detail.created_at) }} 创建

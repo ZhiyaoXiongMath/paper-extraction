@@ -7,10 +7,19 @@ test("counts queued, running, accepted and failed independently", () => {
     metrics([
       { total: 8, counts: { queued: 2, running: 1, accepted: 4, failed: 1 } },
     ]),
-    { total: 8, working: 3, good: 4, bad: 1 },
+    { total: 8, queued: 2, running: 1, completed: 4, failed: 1 },
   );
   assert.equal(terminal("queued"), false);
   assert.equal(terminal("accepted"), true);
+});
+test("two actively processing papers do not appear in the queue", () => {
+  assert.deepEqual(metrics([{ total: 2, counts: { running: 2 } }]), {
+    total: 2,
+    queued: 0,
+    running: 2,
+    completed: 0,
+    failed: 0,
+  });
 });
 test("reader block ids preserve the source evidence links", () => {
   const blocks = readBlocks({

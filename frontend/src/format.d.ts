@@ -10,9 +10,10 @@ export function eventSummary(event: {
 export function stageName(stage?: string): string;
 export function metrics(batches: BatchSummary[]): {
   total: number;
-  working: number;
-  good: number;
-  bad: number;
+  queued: number;
+  running: number;
+  completed: number;
+  failed: number;
 };
 export function formatDate(v?: string): string;
 export function shortId(s?: string): string;
