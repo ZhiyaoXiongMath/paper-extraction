@@ -1,0 +1,15 @@
+\section{Sequential compactness}
+\begin{definition}\label{def:equicontinuity}
+A family $\mathcal F$ in $C([0,1],\mathbb R)$ is equicontinuous if for
+every $\varepsilon>0$ there is $\delta>0$ such that $|x-y|<\delta$ implies
+$|f(x)-f(y)|<\varepsilon$ for all $x,y\in[0,1]$ and $f\in\mathcal F$.
+\end{definition}
+\begin{theorem}[Arzel\`a--Ascoli criterion]\label{thm:criterion}
+A family $\mathcal F\subset C([0,1],\mathbb R)$ is relatively compact
+in the supremum norm if and only if it is uniformly bounded and
+equicontinuous. Uniform boundedness means that one constant $M$ satisfies
+$|f(x)|\le M$ for every $f\in\mathcal F$ and every $x\in[0,1]$.
+\end{theorem}
+In particular, every sequence from such a family has a subsequence
+converging uniformly to a continuous real-valued function.
+This last sentence describes the sequential form of the same result.

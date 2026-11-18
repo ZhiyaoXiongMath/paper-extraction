@@ -1,0 +1,80 @@
+Angstrom Arrowvert Bbbk Bot Bumpeq Cap Colonapprox Colondash Coloneq Colonsim Cup Dashcolon
+Delta Deltait Deltaup Diamond DiamondLeft DiamondRight Diamondblack Diamonddot DiamonddotLeft
+DiamonddotRight Diamonddotleft Diamonddotright Diamondleft Diamondright Downarrow Eqcolon Euler
+Finv Game Gamma Gammait Gammaup Im Join Lambda Lambdait Lambdaup Lbag Leftarrow Leftrightarrow
+Lleftarrow Lsh Mappedfromchar Mapstochar Mmappedfromchar Mmapstochar Nearrow Nwarrow Omega
+Omegait Omegaup Perp Phi Phiit Phiup Pi Piit Piup Psi Psiit Psiup Rbag Re Rightarrow Rrightarrow
+Rsh Searrow Sigma Sigmait Sigmaup Subset Supset Swarrow Theta Thetait Thetaup Top Uparrow
+Updownarrow Upsilon Upsilonit Upsilonup VDash Vdash Vert VvDash Vvdash Wr Xi Xiit Xiup Zbar
+acute aleph alpha alphait alphaup amalg angle approx approxeq arrowvert ast asymp backepsilon
+backprime backsim backsimeq backslash bar barbar barhat bartilde barwedge bbdotlessi bbdotlessj
+because beta betait betaup beth between bigcap bigcapop bigcapplusop bigcirc bigcup bigcupdotop
+bigcupop bigodot bigodotop bigoplus bigoplusop bigotimes bigotimesop bigsqcapop bigsqcapplusop
+bigsqcup bigsqcupop bigsqcupplusop bigstar bigtimesop bigtriangledown bigtriangleup biguplus
+biguplusop bigvee bigveeop bigwedge bigwedgeop blacklozenge blacksquare blacktriangle
+blacktriangledown blacktriangleleft blacktriangleright bot boxLeft boxRight boxast boxbar
+boxbslash boxdot boxdotLeft boxdotRight boxdotleft boxdotright boxleft boxminus boxplus boxright
+boxslash boxtimes braceld bracelu bracerd braceru bracevert breve bullet bulletS bulletSS
+bulletSSS bumpeq cap cdot cdotB cdotBB cdotp centerdot check chi chiit chiup circ circS circeq
+circlearrowleft circlearrowright circledS circledast circledbar circledbslash circledcirc
+circleddash circleddotleft circleddotright circledgtr circledless circledvee circledwedge
+circleleft circleright clubsuit colon colonapprox colondash coloneq colonsim complement cong
+coprod coprodop cup curlyeqprec curlyeqsucc curlyvee curlywedge curvearrowleft curvearrowright
+dAlembertian dagger daleth dashcolon dashleftarrow dashleftrightarrow dashrightarrow dashv
+ddagger ddddot dddot ddot delta deltait deltaup diagdown diagup diamond diamondsuit digamma div
+divideontimes dot doteq doteqdot dotplus doublebarwedge downarrow downdownarrows downharpoonleft
+downharpoonright ell emptyset emptysetAlt epsilon epsilonit epsilonup eqcirc eqcolon eqsim
+eqslantgtr eqslantless equiv eta etait etaup eth exists fallingdotseq fintslop fintupop flat
+forall frakdotlessi frakdotlessj frown gamma gammait gammaup ge geq geqq geqslant gets gg ggg
+gimel gnapprox gneq gneqq gnsim grave groupld grouplda grouplu grouplua grouprd grouprda groupru
+grouprua gtrapprox gtrdot gtreqless gtreqqless gtrless gtrsim gvertneqq harpoonacc hat hatbar
+hathat hattilde hbar hbarAlt heartsuit hermtransp highbar hslash hslashAlt iiiintslop iiiintupop
+iiintslop iiintupop iintslop iintupop imath imathup in infty intercal intop intslop intupop
+invamp iota iotait iotaup jmath jmathup kappa kappait kappaup lJoin lVert lambda lambdabar
+lambdait lambdaslash lambdaup land langle laplac laplace lbag lbrace lceil ldotp le leadsto
+leadstoext leftarrow leftarrowtail leftharpoondown leftharpoonup leftleftarrows leftrightarrow
+leftrightarrows leftrightharpoons leftrightsquigarrow leftsquigarrow leftthreetimes leq leqq
+leqslant lessapprox lessdot lesseqgtr lesseqqgtr lessgtr lesssim lfloor lgroup lharpoonacc lhd
+lhook ll llbracket llcorner lll lmoustache lnapprox lneq lneqq lnot lnsim looparrowleft
+looparrowright lor lozenge lrcorner lrharpoonacc lrtimes lrvec ltimes lvec lvert lvertneqq
+mappedfromchar mapstochar mathdollar mathparagraph mathring mathsection measuredangle medbullet
+medcirc mho mid midbar mmappedfromchar mmapstochar mp mu muit multimap multimapboth
+multimapbothvert multimapdot multimapdotboth multimapdotbothA multimapdotbothAvert
+multimapdotbothB multimapdotbothBvert multimapdotbothvert multimapdotinv multimapinv muup
+nBumpeq nLeftarrow nLeftrightarrow nPerp nRightarrow nSubset nSupset nVDash nVdash nabla napprox
+napproxeq nasymp natural nbacksim nbacksimeq nbumpeq ncong nearrow neg neq nequiv nexists ngeq
+ngeqq ngeqslant ngg ngtr ngtrapprox ngtrless ngtrsim ni nleftarrow nleftrightarrow nleq nleqq
+nleqslant nless nlessapprox nlessgtr nlesssim nll nmid not notin notni nparallel nplus nprec
+nprecapprox npreccurlyeq npreceq npreceqq nprecsim nrightarrow nshortmid nshortparallel nsim
+nsimeq nsqsubset nsqsubseteq nsqsupset nsqsupseteq nsubset nsubseteq nsubseteqq nsucc
+nsuccapprox nsucccurlyeq nsucceq nsucceqq nsuccsim nsupset nsupseteq nsupseteqq nthickapprox
+ntriangleleft ntrianglelefteq ntriangleright ntrianglerighteq ntwoheadleftarrow
+ntwoheadrightarrow nu nuit nuup nvDash nvarparallel nvarparallelinv nvdash nwarrow odot
+oiiintslop oiiintupop oiintslop oiintupop ointctrclockwiseslop ointctrclockwiseupop ointop
+ointslop ointupop omega omegait omegaup ominus openJoin opentimes oplus oslash otimes owns
+parallel partial perp phi phiit phiup pi piit pitchfork piup pm prec precapprox preccurlyeq
+preceq preceqq precnapprox precneqq precnsim precsim prime primeS prod prodop propto psi psiit
+psiup rJoin rVert rangle rbag rbrace rceil rfloor rgroup rhd rho rhoAlt rhoit rhook rhoup
+rightarrow rightarrowtail rightharpoondown rightharpoonup rightleftarrows rightleftharpoons
+rightrightarrows rightsquigarrow rightthreetimes risingdotseq rmoustache rrbracket rtimes rvert
+scrdotlessi scrdotlessj searrow setminus sharp shortmid shortparallel sigma sigmait sigmaup sim
+simeq slashbar smallcoprod smallfintsl smallfintup smallfrown smalliiiintsl smalliiiintup
+smalliiintsl smalliiintup smalliintsl smalliintup smallint smallintsl smallintup smalloiiintsl
+smalloiiintup smalloiintsl smalloiintup smallointctrclockwisesl smallointctrclockwiseup
+smallointsl smallointup smallprod smallsetminus smallsmile smallsqintsl smallsqintup smallsum
+smallsumintsl smallsumintup smallvarointclockwisesl smallvarointclockwiseup smile smlbrace
+smrbrace spadesuit sphericalangle sqcap sqcapplus sqcup sqcupplus sqintslop sqintupop sqsubset
+sqsubseteq sqsupset sqsupseteq square star strictfi strictif strictiff subset subseteq subseteqq
+subsetneq subsetneqq succ succapprox succcurlyeq succeq succeqq succnapprox succneqq succnsim
+succsim sum sumintslop sumintupop sumop supset supseteq supseteqq supsetneq supsetneqq swarrow
+tau tauit tauup therefore theta thetait thetaup thickapprox thicksim tilde tildebar tildehat
+tildetilde times to top transp triangle triangledown triangleleft trianglelefteq triangleq
+triangleright trianglerighteq twoheadleftarrow twoheadrightarrow ulcorner unlhd unrhd uparrow
+updownarrow upharpoonleft upharpoonright uplus uppartial upsilon upsilonit upsilonup upuparrows
+urcorner vDash varbigtriangledown varbigtriangleup varclubsuit vardiamondsuit varepsilon
+varepsilonit varepsilonup varg varheartsuit varkappa varkappait varkappaup varnothing
+varointclockwiseslop varointclockwiseupop varparallel varparallelinv varphi varphiit varphiup
+varpi varpiit varpiup varpropto varrho varrhoit varrhoup varsigma varsigmait varsigmaup
+varspadesuit varsubsetneq varsubsetneqq varsupsetneq varsupsetneqq vartheta varthetait
+varthetaup vartriangle vartriangleleft vartriangleright varv varw vary vdash vec vee veebar vert
+wedge wideOarc widearc widehat widetilde wp wr xi xiit xiup zeta zetait zetaup

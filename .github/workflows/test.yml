@@ -1,0 +1,87 @@
+name: Test and package
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@v6
+      - name: Restore the TeX Live profile used by the public sample
+        if: runner.os == 'Linux'
+        id: tex
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/paper-texlive
+          key: texlive-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/test.yml', 'src/paper_extraction/profile_assets/preamble-v13.tex') }}
+      - name: Install the v13 TeX Live subset
+        if: runner.os == 'Linux' && steps.tex.outputs.cache-hit != 'true'
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        run: |
+          # TeX Live's network installer and its package repository on the same CTAN mirror.
+          repo=https://ctan.math.illinois.edu/systems/texlive/tlnet
+          curl --fail --location --retry 3 "$repo/install-tl-unx.tar.gz" -o install-tl-unx.tar.gz
+          curl --fail --location --retry 3 "$repo/install-tl-unx.tar.gz.sha512" -o installer.sha512
+          sha512sum --check installer.sha512
+          mkdir installer
+          tar -xzf install-tl-unx.tar.gz -C installer --strip-components=1
+          tlroot="$RUNNER_TEMP/paper-texlive"
+          perl installer/install-tl --no-interaction --scheme=scheme-basic --texdir="$tlroot" \
+            --no-doc-install --no-src-install --repository="$repo"
+          "$tlroot/bin/x86_64-linux/tlmgr" --repository "$repo" --verify-repo=main install \
+            amscls amsfonts enumitem etoolbox figureversions fontaxes fontname geometry hyperref \
+            jknapltx microtype mweights needspace newtx rsfs titlesec xcolor xkeyval xpatch xstring
+      - name: Activate pdfLaTeX on Linux
+        if: runner.os == 'Linux'
+        run: echo "$RUNNER_TEMP/paper-texlive/bin/x86_64-linux" >> "$GITHUB_PATH"
+      - run: npm ci
+        working-directory: frontend
+      - run: npm test
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
+      - run: uv sync --locked --python 3.12
+      - run: uv run pytest -q
+      - run: uv build --wheel
+      - name: Install the wheel in a fresh environment
+        shell: bash
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/consumer"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then PY="$RUNNER_TEMP/consumer/Scripts/python.exe"; else PY="$RUNNER_TEMP/consumer/bin/python"; fi
+          uv pip install --python "$PY" dist/*.whl
+          "$PY" -c "from importlib.resources import files; from pathlib import Path; import sys; p=files('paper_extraction'); assert Path(p).is_relative_to(Path(sys.prefix)); assert (p/'static/index.html').is_file(); assert (p/'profile_assets/SHA256SUMS.txt').is_file()"
+          "$PY" -m paper_extraction.cli --version
+      - name: Exercise the installed wheel with its public example
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          PY="$RUNNER_TEMP/consumer/bin/python"
+          uv pip install --python "$PY" pytest
+          fixture="$RUNNER_TEMP/wheel-smoke"
+          mkdir -p "$fixture/tests" "$fixture/examples"
+          cp tests/test_vertical.py "$fixture/tests/"
+          cd "$fixture"
+          export PAPER_EXTRACTION_HOME="$fixture/app-data"
+          unset PYTHONPATH
+          "$PY" -m paper_extraction.cli doctor
+          "$PY" -m paper_extraction.cli example examples/compactness
+          "$PY" - <<'PY'
+          import re
+          from fastapi.testclient import TestClient
+          from paper_extraction.api import create_app
+          with TestClient(create_app()) as client:
+              root = client.get("/")
+              assert root.status_code == 200, root.text
+              script = re.search(r'<script\b[^>]*\bsrc="([^"]+)"', root.text)
+              assert script and client.get(script[1]).status_code == 200, root.text
+          PY
+          "$PY" -m pytest -q tests/test_vertical.py
+

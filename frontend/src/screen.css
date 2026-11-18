@@ -1,0 +1,192 @@
+@media (max-width: 1000px) {
+  .btn.mobile-evidence {
+    display: inline-flex;
+    margin-bottom: 12px;
+  }
+  .shell {
+    grid-template-columns: 188px minmax(0, 1fr);
+  }
+  .sidebar {
+    padding: 27px 12px;
+  }
+  .panel-head {
+    padding: 15px 17px;
+  }
+  .stat {
+    padding: 15px;
+  }
+  .stats {
+    gap: 9px;
+  }
+  .panel-pad,
+  .model {
+    padding: 17px;
+  }
+  .import-grid {
+    grid-template-columns: minmax(0, 1.4fr) minmax(212px, 0.85fr);
+  }
+  .detail-grid.withEvidence {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .evidence {
+    position: fixed;
+    z-index: 3;
+    bottom: 12px;
+    left: 50%;
+    top: auto;
+    transform: translateX(-50%);
+    width: min(90%, 550px);
+    max-height: 55dvh;
+    overflow: auto;
+    box-shadow: 0 6px 30px #1c352934;
+  }
+  .source-text {
+    max-height: 25dvh;
+  }
+}
+@media (max-width: 760px) {
+  .shell {
+    display: block;
+  }
+  .sidebar {
+    position: relative;
+    height: auto;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+  }
+  .brand {
+    font-size: 15px;
+    padding: 0;
+    gap: 6px;
+  }
+  .brand .mark {
+    width: 31px;
+    height: 34px;
+  }
+  .brand svg {
+    width: 20px;
+  }
+  .sidebar nav {
+    margin: 0 0 0 auto;
+    display: flex;
+    gap: 2px;
+  }
+  .sidebar nav a {
+    padding: 8px;
+    gap: 4px;
+    font-size: 12px;
+  }
+  .sidebar nav svg {
+    width: 14px;
+  }
+  .side-bottom {
+    display: none;
+  }
+  .topbar {
+    min-height: 42px;
+    padding: 0 17px;
+  }
+  .crumb {
+    font-size: 11px;
+    gap: 5px;
+  }
+  .profile {
+    font-size: 10px;
+    gap: 4px;
+  }
+  main#main {
+    padding: 25px 16px 45px;
+  }
+  .page-title {
+    gap: 12px;
+    align-items: flex-start;
+    margin-bottom: 19px;
+  }
+  .page-title .btn {
+    flex: none;
+    font-size: 12px;
+    min-height: 34px;
+    padding: 8px;
+  }
+  .page-title p {
+    font-size: 12px;
+  }
+  .stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-bottom: 16px;
+  }
+  .stat strong {
+    font-size: 29px;
+    margin-top: 9px;
+  }
+  .stat-head {
+    font-size: 12px;
+  }
+  .import-grid,
+  .models {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .paper-row {
+    padding: 11px;
+    gap: 7px;
+  }
+  .paper-row .file-icon {
+    display: none;
+  }
+  .paper-row .stage {
+    display: none;
+  }
+  .detail-heading {
+    display: block;
+  }
+  .detail-heading > .pill {
+    margin-top: 8px;
+  }
+  .tabs {
+    gap: 16px;
+  }
+  .tabs button {
+    font-size: 12px;
+  }
+  .reader {
+    padding: 18px;
+  }
+  .drop {
+    padding: 25px 8px;
+  }
+  .reference-list li {
+    overflow-wrap: anywhere;
+  }
+}
+@media (max-width: 420px) {
+  .sidebar nav a {
+    display: grid;
+    justify-items: center;
+    font-size: 10px;
+    line-height: 1.1;
+    gap: 4px;
+    padding: 7px;
+  }
+  .sidebar nav svg {
+    height: 15px;
+    width: 15px;
+  }
+  .model-head {
+    gap: 8px;
+  }
+  .panel-head h2 {
+    font-size: 16px;
+  }
+  .tabs {
+    gap: 12px;
+  }
+  .file-actions .btn {
+    font-size: 12px;
+  }
+  .profile {
+    font-size: 9px;
+  }
+}

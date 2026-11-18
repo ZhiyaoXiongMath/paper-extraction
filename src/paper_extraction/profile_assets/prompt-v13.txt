@@ -1,0 +1,21 @@
+MATHEMATICAL INTRODUCTION — v13
+Release: intro-v13.0.0-rc1-20261023
+
+Read the designated original paper and all three matching companions completely:
+intro-rules-v13.txt, preamble-v13.tex, template-v13.tex. Keep them unchanged.
+Produce a SELECTIVE Introduction, not an expanded source theorem catalogue.
+Apply the rules' core/assumptions/definitions/refinements split before writing.
+
+Required reader structure: source-supported Theorem A/B/C for history; flat
+Theorem 1/2/3/4 for admitted current contributions; numbered Definitions.
+No substitution of prose history, no Theorem 1.1, no sprawling theorem/definition.
+Use the rules' exact word, rendered-height, formula-row and 22U group budgets.
+Long originals MUST be simplified faithfully: select the core, remove repetitions
+and proof-only witnesses, define genuine concepts locally, retain necessary data.
+Do not launder excess into new definitions or relax the common profile.
+
+Use the template's measured environments and Release assertion. Compile/check
+and inspect final pages. Failed mandatory checks are not acceptable PDFs.
+Deliver introduction.tex/pdf plus preamble-v13.tex; use unique case directories.
+Report source or scope limitations honestly. No claim of independent testing,
+mathematical tier certification or reader approval without the corresponding evidence.

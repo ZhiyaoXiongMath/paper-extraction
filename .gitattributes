@@ -1,0 +1,7 @@
+* text=auto eol=lf
+src/paper_extraction/profile_assets/intro-rules-v13.txt -text
+src/paper_extraction/profile_assets/template-v13.tex -text
+src/paper_extraction/profile_assets/prompt-v13.txt -text
+src/paper_extraction/profile_assets/preamble-v13.tex -text
+*.png binary
+*.pdf binary

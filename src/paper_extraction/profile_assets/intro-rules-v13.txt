@@ -1,0 +1,228 @@
+MATHEMATICAL INTRODUCTION — v13
+Release: intro-v13.0.0-rc1-20261023
+Companions: preamble-v13.tex, template-v13.tex, prompt-v13.txt.
+
+DELIVERABLE AND PRIORITY
+Produce an English mathematical Introduction, at most THREE body pages, followed
+by a separate bibliography. Deliver introduction.tex/pdf and the unchanged local
+preamble. This is a SELECTIVE mathematical introduction, not a transcription of
+all source statements. Source fidelity applies to the assertion actually selected;
+it does not oblige inclusion of every clause of its source theorem or proof.
+The current user task controls scope. These rules control selection and writing;
+the preamble enforces numbering and rendered-size limits. No per-paper relaxation,
+font reduction, negative spacing or hidden migration of excess text is allowed.
+
+HARD STANDARD-PROFILE BUDGETS
+U is the normal 11pt body baseline fixed at document start (about 14.08 TeX pt).
+Height includes the heading, citation, prose, formulas, lists and internal spacing.
+It is measured by TeX after actual typesetting, NOT guessed from source line count.
+                         count       prose words/block   height   display rows
+Theorem A, B, C           1–3         75                  8U       2
+Theorem 1, 2, 3, 4        1–4         100                 12U      3
+Definition 1, 2, ...      0–6         65                  7U       3
+introparagraph           as needed   45                  4U       0
+A resultgroup contains exactly one current theorem, at most TWO dedicated
+Definitions and any indispensable connecting paragraph: combined height <=22U.
+At most TWO genuinely shared Definitions may precede the result groups, <=14U
+combined. All connecting paragraphs together <=16U. These combined limits prevent
+splitting one excessive block into many small blocks or dumping it into a preamble.
+The theorem may have at most TWO display groups; a historical theorem at most ONE;
+a definition at most TWO. A display's source-row count is one plus each nonterminal
+TeX line-break command, including nested cases/matrices. A trailing break adds zero.
+Prose-word counting excludes math and citations but includes words inside math
+\text/\mbox; rendered height remains binding regardless of word-count shortcuts.
+These numerical values are v13's editorial contract, not claims of mathematical
+importance. If faithful rewriting cannot meet them, report the scope/size conflict;
+do not silently lower mathematical precision, omit an admitted major contribution,
+or label an oversized document accepted. Never add filler to reach a count.
+
+A. BIND THE TASK AND THE EVIDENCE
+A1. Read all four matching companions and identify the exact original paper,
+version, title and authors. Keep sources unchanged. In a development test bind the
+four files, checker and supplied source snapshot by SHA-256. A multi-file TeX input
+requires an explicitly declared source root; a root-file hash is not full binding.
+Use distinct case-id--snapshot-prefix directories; occupied names receive a new
+run suffix via atomic creation. Ordinary writing needs no separate audit artifact.
+A2. Read the abstract, introduction, principal statements, important applications,
+and the definitions/body statements needed to check candidates. Search for material
+contributions, not only source Theorem 1.1. Inspect PDF pages where extraction makes
+signs, constants or quantifiers unclear. A generated old Intro is an observed output,
+not evidence for missing original mathematics. Do not audit all proofs by default.
+A3. Record source locations for retained claims and definitions. Do not silently
+supply unread external results or remembered background. A standard notation may
+be fixed without inventing a new claim; a new substantive definition or historical
+assertion needs supplied support or explicit authorization for another source.
+Source accuracy, importance admission, compact presentation and engineering status
+are separate questions. Reporting a manuscript is not certifying its proof/status.
+
+B. SELECT AND SIMPLIFY THE MATHEMATICAL CORE
+B1. Admit only the first two importance tiers, not the best two results in each
+paper. Tier 1: a substantial resolution of a central problem/characterization.
+Tier 2: a substantial independent theorem or important consequence for a recognizable
+object class. Routine substitutions, proof stages, implementation lemmas and minor
+refinements do not earn a slot. Environment names, difficulty and length do not grade
+importance. Apply the same admission threshold to prose, examples and formal blocks.
+B2. For each candidate identify: (i) the mathematical objects and exact conclusion;
+(ii) the independent question it resolves or comparison it improves; (iii) the source
+facts supporting that significance. A clean statement alone, or “useful/reusable”,
+is insufficient. For a technical candidate ask whether its objects are identifiable
+without being “the output of step k” of this proof. Construction-only accuracy,
+support and waiting-time details cannot be promoted by renaming a Proposition.
+B3. Separate each source statement into: core claim; necessary assumptions and
+normalizations; definitions; explanatory repetitions; independent applications;
+proof/construction refinements. Retain the selected core WITH its necessary data.
+Move only genuine reusable concepts into Definitions; delete repetitions. Assess
+independent applications separately. Omit construction formulas and witness choices
+when the retained claim is an existence/comparison result that does not require them.
+Do not disguise a long technical hypothesis package as a newly invented “admissible”
+definition just to shorten a theorem. Definitions serve meaning, not length evasion.
+B4. Keep source support distinct from admitted/excluded/unresolved significance.
+An unresolved side branch is omitted with an external note, not called low-value.
+If the only central candidate is accurate but admission remains open, mark central
+admission unresolved and deliver a scoped explanation, not an accepted Intro.
+If essential source data are missing, mark content partial. “No qualifying result”
+is reserved for completed assessment, not missing evidence. These explanatory
+artifacts do not pass the standard-profile checker and must not masquerade as tests.
+B5. One current theorem states ONE core contribution, with at most TWO tightly
+linked conclusion clauses (or one genuine equivalence with at most three items).
+A core convergence theorem keeps its actual quantifiers, topology, multiplicity,
+fixed/modulo symmetry and asserted rate. It need not absorb a separable weak-solution
+representative theorem or every source Remark. Select the supported smooth/weak or
+other part explicitly in the source attribution. A short derivation does not make
+a major new application unimportant. Do not discard important applications for size.
+B6. When a block exceeds its budget, act in this order: remove duplicate explanation
+and unneeded “does not assert” tails; use already defined concepts; extract a genuine
+missing definition; select the actual core assertion and separately assess optional
+refinements; split only independently useful admitted contributions. Recheck the
+22U group budget and the total page budget. Never delete a necessary condition or
+reduce convergence strength. If no faithful compact arrangement exists, deliver a
+clearly marked scope/size exception, not a passing document or a weakened fake theorem.
+
+C. FIX THE READING STRUCTURE
+C1. Use this reading order: brief setting/question; the minimum definitions needed
+for the comparison; HISTORICAL THEOREMS A/B/C; current-result groups with local
+Definitions followed by Theorems 1/2/3/4. Every selected important historical conclusion
+MUST be formal, not merely a name or a prose synopsis. Choose two or three directly
+relevant source-supported comparisons when available; one is sufficient when only
+one qualifies. Never invent or pad history. If none can be sourced, report the gap
+and do not claim a standard-profile acceptance. History must precede current results.
+C2. Historical statements include actual assumptions and conclusions with compact
+author/source attribution. A conjecture/question is not a historical theorem. State
+a reported unpublished result as a reported manuscript assertion, not established
+consensus. State indirect attribution once in the reference note. A bridging sentence
+explains the mathematical difference; it does not retell the historical theorem.
+C3. Define a core nonstandard property once in a numbered Definition. One complete
+standard convention may be inline in an introparagraph. Each Definition has one
+concept or one genuinely paired comparison, not several unrelated concepts. Separate
+unrelated invariants rather than making an encyclopedic “definitions” block. Give
+domain, criterion, quantifiers and essential normalization. Stop at background
+language; do not recursively define every elementary word in the definition.
+C4. Among source-supported formulations choose one whose specialized objects can
+be identified from declared data. Replacing an unknown term by several unexplained
+ones is not completion. Identify the new objects minimally or choose another supported
+formulation. A definition required only by an unselected refinement stays out. A
+complex concept may be split only at real conceptual boundaries, with <=2 dedicated
+Definitions per resultgroup; a proof-specific checklist is not a conceptual split.
+C5. Put all nonformal body prose in introparagraph. Its function is setting,
+question, genuine contrast or necessary convention, not a result/definition overflow
+channel. No proof roadmap, long technical tail, secondary-result Remark or negative
+claim catalogue. Do not repeat a formula in a preview, a theorem and its paraphrase.
+A whole paragraph that only restates the adjacent theorem is deleted.
+
+D. WRITE COMPACT, CLOSED STATEMENTS
+D1. All retained current contributions use the theorem environment, displayed as
+Theorem 1, Theorem 2, etc., without a section prefix. This is uniform editorial
+numbering, not a claim that an original Corollary/Proposition was an independent
+source theorem. Preserve its original role and number in the source citation, or
+in a compact “application” caption. History uses historical; concepts use definition.
+Do not print Corollary 1.2/Proposition 1.2 or hand-type a fake numbered heading.
+D2. A theorem consists of minimal objects/assumptions, the decisive statement and
+only necessary scope. Keep tensor/endomorphism types, metric dependence, parameter
+ranges, some/every and subsequence/full-family distinctions. Definitions and shared
+notation need not be copied into every theorem. Explanations of ordinary convergence,
+redundant “no extra assumption” sentences, derivations and explicit proof witnesses
+are not appended. A limiting object's identity is not left to a vague pronoun.
+D3. Each separated theorem must be readable with its precisely cited Definitions.
+Restate a short indispensable setting; do not repeat the entire preceding theorem.
+When a long premise recurs, define a genuine shared mathematical setting once within
+the applicable budget, then name it explicitly. “As above”, “the previous theorem”
+and a remote bare number are not substitutes for objects or assumptions. The packet
+of theorem plus declared definitions is reusable; universal word-for-word duplication
+is neither required nor permitted to defeat the budget.
+D4. Keep a genuine equivalence inside ONE theorem with explicit equivalence wording
+and an enumerate list of at most three complete items. Do not split a necessary
+if-and-only-if or equality/rigidity package. Separately conditional conclusions need
+their own attached hypotheses. The source number belongs in a short citation; the
+reader heading does not carry a proof-section inventory.
+D5. Main results may be stated through a source-supported named criterion. An
+important dimension-range/application theorem may select the existence consequence
+without reproducing the product construction, special scaling representative or
+proof of maximality. Mark the selected source part, keep its actual parameters and
+conclusion, and do not claim complete coverage of the original multi-clause theorem.
+Source fidelity means no alteration of what is retained, not exhaustive copying.
+D6. Use displays for the core criterion or conclusion. For INDEPENDENT hypotheses,
+use conditions with EVERY row beginning '&': their left edges agree. Put shared
+index ranges in the preceding sentence; no detached far-right range column. For a
+true calculation/equality chain use relations with exactly ONE relation anchor per
+row. Do not use flalign, eqnarray, full-width arrays, \hfill or manual spacing to
+stretch short formulas. Top-level align/gather/multline are unsupported: use the
+provided two forms or one \[...\]. At most three source rows per display; no single
+formula shrinkage, min/max towers with unexplained indices, or separated conditions.
+D7. Use precise source locations without copying the source bibliography. Do not
+add a proof-section qualification solely to lengthen a citation. Keep exact title
+and all verified authors. No theorem's optional caption longer than 12 prose words;
+citations are excluded from that word count but included in rendered height. All
+facts in the reader text are source-supported; limitations belong in a separate note.
+
+E. APPLY THE MEASURABLE PRESENTATION CONTRACT
+E1. Use the unchanged local preamble-v13.tex and the executable Release assertion
+from template-v13.tex. A4, 11pt, 22mm, newtx typography stays fixed. No font, margins,
+spacing, counter, environment or budget redefinitions. The supported engine is
+pdfLaTeX/T1 Latin text plus standard TeX math; unsupported Unicode must be disclosed,
+not silently translated. Deliver installation requirements, never system font files.
+E2. Every body block uses historical, definition, theorem or introparagraph. Each
+current theorem is inside its own resultgroup. Only up to two genuinely SHARED
+definitions are outside such groups. Dedicated definitions go immediately before
+their theorem inside that group. The public preamble measures natural block height
+and rejects excess; the checker also enforces counts, word/display budgets and
+forbidden bypasses. Do not invoke raw internal environments or put body text outside
+measured blocks. Do not raise limits to force a failed sample through.
+E3. Bounded blocks are kept together with their heading and formulas; they are NOT
+visibly boxed. Blocks are measured once and output unchanged. Never split one claim
+into sequential theorem fragments for formatting. Definitions are not footnotes;
+no unsupported material is concealed in references. Ordinary white space at the end
+of a body page is acceptable; do not force one page or pad three pages.
+E4. Put References on a new page with the profile's invisible markers and inline
+bibliography. The checker verifies that its first page contains no preceding body
+content. A mixed page counts toward the body cap and fails the separation check.
+Do not override a failed detection with an assumed “pages minus one”.
+E5. Inspect every final page: aligned hypotheses must share a visible left edge;
+relation chains must share their relation column; index ranges stay with their
+condition; no overfull/clipped formulas, tall isolated operators, or orphaned source
+citations. A log measuring height cannot judge the visual composition by itself.
+Record observed defects and repair the affected passage, without changing typography.
+
+F. FINISH AND TEST HONESTLY
+F1. Use one sequence: identify inputs; decide contributions; assign the finite block
+budget; write the compact source-grounded core; compile/check; inspect pages; repair
+concrete defects. No fixed rewrite quota, multi-agent review or score database is
+required. Record a first complete draft only for development, not every ordinary run.
+F2. Before acceptance check EACH retained theorem's core/assumption/definition/refinement
+split, historical formalization, exact closed statement and dependent definitions.
+Check excluded proof refinements did not re-enter as prose or artificial definitions.
+Check that admitted major applications were not lost merely for space. Word/height
+PASS is not proof of source accuracy or a tier grade; do those source-based decisions.
+F3. Compile twice with -halt-on-error -file-line-error -no-shell-escape -recorder.
+Use a third run only for actual cross-reference requests. A rebuild invalidates old
+PDF/state BEFORE preflight. Verify the executed release, actually read profile,
+input snapshots, resolved references, required measured-block telemetry, flat
+numbering and all budgets. Any mandatory engineering check fails => nonzero exit,
+no accepted deliverable PDF. compile-only is explicit and does not prove source binding.
+F4. Deliver current supported source, its accepted PDF and local dependency, with
+verified paths. Distinguish content selection, source support, deterministic format,
+compilation and human/assistant visual inspection. Do not call a budget exception,
+missing-history artifact or unresolved central selection fully compliant. Disclose
+same-context/self-check testing; do not invent independent Codex or human approval.
+Mathematical importance is an editorial judgment with source reasons, never inferred
+from a clean build. Preserve useful engineering safeguards; they serve this reader
+contract and must not replace it.

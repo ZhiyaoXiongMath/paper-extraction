@@ -1,0 +1,21 @@
+{
+  "name": "paper-extraction-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "test": "node --test src/format.test.js"
+  },
+  "dependencies": {
+    "katex": "0.16.31",
+    "vue": "3.5.45"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.11",
+    "typescript": "5.9.3",
+    "vite": "7.3.8",
+    "vue-tsc": "3.1.4"
+  }
+}

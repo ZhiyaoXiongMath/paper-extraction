@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "paper-extraction"
+version = "0.1.0"
+description = "A local agent for source-grounded mathematical introductions"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = "MIT"
+authors = [{name = "ZhiyaoXiongMath"}]
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn>=0.34,<1", "python-multipart>=0.0.20",
+  "pydantic>=2.10,<3", "langchain>=1,<2", "langchain-openai>=1,<2",
+  "langgraph>=1,<2", "langgraph-checkpoint-sqlite>=3,<4",
+  "pypdfium2>=5,<6", "Pillow>=11", "python-dotenv>=1,<2",
+  "filelock>=3.16", "platformdirs>=4", "httpx>=0.27,<1"
+]
+
+[project.scripts]
+paper-extraction = "paper_extraction.cli:main"
+
+[project.urls]
+Repository = "https://github.com/ZhiyaoXiongMath/paper-extraction"
+
+[dependency-groups]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/paper_extraction"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"examples/compactness" = "paper_extraction/examples/compactness"
+"README.md" = "paper_extraction/documentation/README.md"
+"README.en.md" = "paper_extraction/documentation/README.en.md"
+"THIRD_PARTY.md" = "paper_extraction/documentation/THIRD_PARTY.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
