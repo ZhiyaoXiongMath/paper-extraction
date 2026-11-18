@@ -104,6 +104,7 @@ def test_latest_current_verdict_prevents_migrating_old_intermediate_reviews(tmp_
     work.mkdir(parents=True)
     (work / "checkpoint.sqlite").touch()
     result = old_result()
+    result["repair_policy"] = "source-bound-repair-1"
     result["reviews"][1]["review_version"] = "source-packet-v1"
     result["reviews"][2]["review_version"] = CONTENT_REVIEW_VERSION
     result["selection_version"] = SELECTION_VERSION

@@ -17,6 +17,7 @@ def selection_reply(register, *, single_current=False):
             continue
         deps = definitions if kind == "current" and not has_current else []
         selected.append({"candidate_id": key, "independent_question": row["claim"],
+                         "b2_source_facts": [{"source_id": row["evidence_ids"][0], "fact": row["claim"]}],
                          "source_reason": "This fixture selects the cited original assertion.",
                          "evidence_ids": row["evidence_ids"], "definition_ids": deps, "variant_ids": []})
         has_current = has_current or kind == "current"

@@ -60,7 +60,11 @@ def test_switch_then_retry_and_resume_uses_public_frozen_attempt_settings(tmp_pa
     monkeypatch.setenv("OPENAI_API_KEY", "rotated-offline-token")
     calls = []
 
-    def fake_run(work, source, root, settings, notify, *, retry_legacy_review, read_api_key):
+    def fake_run(work, source, root, settings, notify, *, retry_legacy_review, read_api_key, save_draft,
+                 previous_failure, pause_requested, count_draft_starts):
+        assert previous_failure is None
+        assert not pause_requested()
+        assert count_draft_starts() == 0
         calls.append((work, dict(settings), retry_legacy_review))
         assert read_api_key() == settings["api_key"]
         work.mkdir(parents=True, exist_ok=True)

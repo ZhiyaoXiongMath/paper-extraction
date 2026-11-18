@@ -42,8 +42,10 @@ def test_batch_import_evidence_download_and_retry(tmp_path,monkeypatch):
         store.event(pid,p["attempt"],"evidence",{"locations":[r["id"] for r in rows]})
         dest = store.work(p)/"result"
         dest.mkdir()
-        for name in ("introduction.tex","introduction.pdf","preamble-v13.tex"):
-            (dest/name).write_bytes(name.encode())
+        (dest / "introduction.tex").write_text(r"\input{preamble-v13.tex}" + "\n"
+                                              r"\begin{document}Sample.\end{document}", encoding="utf-8")
+        (dest / "introduction.pdf").write_bytes(b"pdf fixture")
+        (dest / "preamble-v13.tex").write_text(r"\documentclass{article}", encoding="utf-8")
         store.finish(p,{"status":"completed","result_dir":str(dest),"evidence_links":[{"block_id":"groups.0.theorem","evidence_ids":[rows[-1]["id"]]}]})
 
     app = create_app(tmp_path,runner=runner)
@@ -62,7 +64,7 @@ def test_batch_import_evidence_download_and_retry(tmp_path,monkeypatch):
         assert client.get(f"/api/papers/{bad['id']}/artifacts/introduction.pdf").status_code == 400
         assert "event: update" in client.get(f"/api/batches/{bid}/events").text
         zipped = zipfile.ZipFile(io.BytesIO(client.get(f"/api/batches/{bid}/download").content))
-        assert len(zipped.namelist()) == 4 and "manifest.json" in zipped.namelist()
+        assert {Path(name).name for name in zipped.namelist()} == {"main-extraction.tex", "main-extraction.pdf", "manifest.json"}
         assert client.post(f"/api/papers/{bad['id']}/retry").status_code == 200
         assert next(p for p in wait_for(client,bid) if p["id"]==bad["id"])["attempt"] == 2
     with TestClient(create_app(tmp_path,runner=runner)) as client:

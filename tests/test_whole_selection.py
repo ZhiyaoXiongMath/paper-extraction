@@ -23,7 +23,8 @@ def finding(kind, label, text, loc):
 
 
 def pick(cid, loc, **extra):
-    return {"candidate_id": cid, "independent_question": "Which objects admit a solution?",
+    return {"candidate_id": cid, "b2_source_facts": [{"source_id": loc, "fact": "The source frames the solvability question."}],
+            "independent_question": "Which objects admit a solution?",
             "source_reason": "The introduction poses the existence problem and cites this result.",
             "evidence_ids": [loc], **extra}
 
@@ -76,7 +77,7 @@ def test_selection_repairs_invalid_ids_using_register_and_original_evidence():
                 assert schema is WholePaperSelection and "B2." in instructions
                 assert payload["passages"] == records
                 assert payload["candidate_register"][0]["candidate_id"] == "c1"
-                return schema(selected=[pick("c1", "wrong-id")])
+                return schema(selected=[pick("c1", "wrong-id", b2_source_facts=[{"source_id": "intro", "fact": "We prove the main result."}])])
             assert schema is SelectionCorrection
             assert "requires registered source IDs" in payload["conflict"]
             assert payload["previous_bindings"][0]["evidence_ids"] == ["wrong-id"]
@@ -93,11 +94,13 @@ def test_selection_repairs_invalid_ids_using_register_and_original_evidence():
     (False, "patch"), (False, "layout"), (True, "patch"),
 ])
 def test_old_compile_failure_and_pending_publish_reselect_before_delivery(tmp_path, monkeypatch, pending, prior_verdict):
-    source = tmp_path / "source.tex"
+    source_root = tmp_path / "input"
+    source_root.mkdir()
+    source = source_root / "source.tex"
     source.write_text("The source claim is a statement on compact objects.", encoding="utf-8")
     settings = {"provider": "offline", "text_model": "mock", "vision_model": "mock", "base_url": "http://localhost"}
     store = Store(tmp_path / "home")
-    store.create("batch", settings, [dict(id="id", name="Original", kind="tex", source=str(source), root=None)])
+    store.create("batch", settings, [dict(id="id", name="Original", kind="tex", source=str(source), root=str(source_root))])
     prior = store.paper("id")
     work = store.work(prior)
     work.mkdir(parents=True)
@@ -107,7 +110,7 @@ def test_old_compile_failure_and_pending_publish_reselect_before_delivery(tmp_pa
         state = old_result()
         state["reviews"].append({"stage": "compile", "passed": False, "issues": ["Outdated layout"], "attempt": 3})
         state["reviews"][-2]["review_version"] = CONTENT_REVIEW_VERSION
-    config = {"configurable": {"thread_id": agent._thread_id(source, None, settings, agent._rules())}}
+    config = {"configurable": {"thread_id": agent._thread_id(source, source_root, settings, agent._rules())}}
     with SqliteSaver.from_conn_string(str(work / "checkpoint.sqlite")) as saver:
         old = StateGraph(agent.PaperState)
         old.add_node("extract", lambda s: {"cursor": 1, "issues": [], "attempt": 3, "uncertainties": [], **state})
@@ -136,7 +139,7 @@ def test_old_compile_failure_and_pending_publish_reselect_before_delivery(tmp_pa
         store.finish(prior, state)
         assert stale_selection_failure(state)
         assert not stale_selection_failure({**state, "selection_version": SELECTION_VERSION})
-        assert agent.run_paper(work, source, None, settings, lambda *args: events.append(args))["status"] == "failed"
+        assert agent.run_paper(work, source, source_root, settings, lambda *args: events.append(args))["status"] == "failed"
         assert not events
         store.retry("id")
         queued = store.paper("id")
@@ -144,8 +147,14 @@ def test_old_compile_failure_and_pending_publish_reselect_before_delivery(tmp_pa
         with store.db() as db:
             original = json.loads(db.execute("SELECT result FROM archived_reviews").fetchone()[0])
         assert original["reviews"] == state["reviews"]
-    result = agent.run_paper(work, source, None, settings, lambda *args: events.append(args),
+    result = agent.run_paper(work, source, source_root, settings, lambda *args: events.append(args),
                              retry_legacy_review=not pending)
+    if pending:
+        assert result["status"] == "completed" and result["delivery"]["status"] == "delivered"
+        assert result["draft"] == state["draft"] and result["draft_round"] == 3
+        assert [stage for stage, _ in events] == ["compile", "publish"]
+        assert models.extracts == models.drafts == 0
+        return
     assert result["status"] == "completed", result
     assert models.extracts == 0 and models.drafts == 1
     assert result["selection_version"] == SELECTION_VERSION
@@ -162,7 +171,10 @@ def test_targeted_source_read_reselects_and_writer_only_sees_global_candidates(p
     def traced(schema, instructions, packet, image=None):
         if schema in (Draft, AdmissionReview):
             received.append([c["candidate_id"] for c in packet["candidates"]])
-            assert all(c["decision"] == "admitted" and c["independent_question"] for c in packet["candidates"])
+            if schema is Draft:
+                assert all(c["decision"] == "admitted" and c["independent_question"] for c in packet["candidates"])
+            else:
+                assert all(set(c) == {"candidate_id", "source_number", "evidence_ids"} for c in packet["candidates"])
         return original(schema, instructions, packet, image)
 
     models.structured = traced
@@ -237,7 +249,8 @@ def test_selected_definitions_and_setting_keep_original_role_without_consuming_c
         finding("definition", "Definition 5", "A reference form.", "intro"),
         finding("setting", "Theorem A", "Every compact space has a solution.", "intro"),
     ])
-    picks = [pick("c1", "intro"), pick("c2", "intro"), pick("c3", "absent"), pick("c4", "intro", role="current")]
+    picks = [pick("c1", "intro"), pick("c2", "intro"), pick("c3", "absent", b2_source_facts=[]),
+             pick("c4", "intro", role="current")]
     rows = apply_selection(register, WholePaperSelection(selected=picks), catalog)
     assert [(row["kind"], row["decision"]) for row in rows] == [
         ("definition", "admitted"), ("setting", "admitted"), ("definition", "unresolved"), ("current", "admitted")]

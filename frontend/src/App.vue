@@ -1,12 +1,16 @@
 <script setup lang="ts">
-import type { BatchSummary, BatchDetail, Config } from "./contracts";
+import type { BatchSummary, BatchDetail, Config, ReasoningSettings } from "./contracts";
 import { ref, computed, onMounted, onBeforeUnmount, watch } from "vue";
 import Icon from "./Icon.vue";
 import ImportPanel from "./ImportPanel.vue";
+import BatchNameEditor from "./BatchNameEditor.vue";
+import BatchPauseControl from "./BatchPauseControl.vue";
+import DeleteHistoryDialog from "./DeleteHistoryDialog.vue";
 import SettingsPanel from "./SettingsPanel.vue";
 import PaperDetail from "./PaperDetail.vue";
-import { request, post, errorMessage } from "./api";
+import { ApiError, request, post, errorMessage } from "./api";
 import {
+  canDeleteBatch,
   metrics,
   formatDate,
   shortId,
@@ -48,6 +52,8 @@ const error = ref(""),
   listReady = ref(false),
   provider = ref(""),
   retrying = ref(false);
+const changingPaperState = ref(false);
+const changingBatchState = ref<Record<string, "pause" | "resume">>({});
 const selectedPaper = computed(() =>
   detail.value?.papers?.find((p) => p.id === route.value.paper),
 );
@@ -55,6 +61,49 @@ const stats = computed(() => metrics(batches.value));
 const batchRows = computed(() =>
   batches.value.map((b) => ({ ...b, stats: metrics([b]) })),
 );
+const endedBatches = computed(() => batches.value.filter((batch) => canDeleteBatch(batch, false)));
+const deleteBlockedHint = "全部暂停或结束后可删除";
+const deletion = ref<{ batchId?: string; batchIds: string[]; name: string; paperCount: number } | null>(null);
+const historyNotice = ref("");
+function askDeletion(batch?: BatchSummary) {
+  if (deletion.value || (batch && (!canDeleteBatch(batch) || changingBatchState.value[batch.id]))) return;
+  const targets = batch ? [batch] : endedBatches.value;
+  if (!targets.length) return;
+  historyNotice.value = "";
+  deletion.value = {
+    batchId: batch?.id, name: batch?.name || (batch ? "批次 #" + shortId(batch.id) : ""),
+    batchIds: targets.map((item) => item.id), paperCount: targets.reduce((sum, item) => sum + item.total, 0),
+  };
+}
+function clearDeletedBatches(ids: string[]) {
+  const removed = new Set(ids);
+  ++listSeq;
+  batches.value = batches.value.filter((batch) => !removed.has(batch.id));
+  try {
+    const last = localStorage.getItem("paper-extraction.last-batch");
+    if (last && removed.has(last)) localStorage.removeItem("paper-extraction.last-batch");
+  } catch {}
+  if (route.value.view === "batch" && removed.has(route.value.batch)) {
+    ++detailSeq;
+    closeStream();
+    detail.value = null;
+    history.replaceState(null, "", "#/");
+    onHash();
+  }
+}
+function finishDeletion(ids: string[]) {
+  const skipped = (deletion.value?.batchIds.length ?? ids.length) - ids.length;
+  deletion.value = null;
+  clearDeletedBatches(ids);
+  historyNotice.value = "已删除 " + ids.length + " 个批次。" +
+    (skipped > 0 ? "另有 " + skipped + " 个所选批次状态已变化或已被删除。" : "");
+  void fetchList();
+}
+function cancelDeletion() {
+  deletion.value = null;
+  void fetchList();
+  if (route.value.view === "batch") void fetchDetail();
+}
 const completeCount = computed(
   () => detail.value?.papers?.filter((p) => terminal(p.status)).length || 0,
 );
@@ -63,7 +112,7 @@ const filters = [
   ["all", "全部"],
   ["queued", "排队"],
   ["running", "处理中"],
-  ["completed", "已完成"],
+  ["completed", "已交付"],
   ["failed", "失败"],
 ];
 const visiblePapers = computed(() =>
@@ -71,7 +120,7 @@ const visiblePapers = computed(() =>
     (p) => queueFilter.value === "all" || p.status === queueFilter.value,
   ),
 );
-const passedCount = computed(
+const deliveredCount = computed(
   () =>
     detail.value?.papers.filter((p) => p.status === "completed").length ?? 0,
 );
@@ -97,12 +146,18 @@ const nav = [
 const statList = [
   ["queued", "排队", "clock"],
   ["running", "处理中", "activity"],
-  ["completed", "已完成", "check"],
+  ["completed", "已交付", "check"],
   ["failed", "失败", "fail"],
 ] as const;
 function onHash() {
+  historyNotice.value = "";
   route.value = readRoute();
   window.scrollTo(0, 0);
+}
+function nameSaved(id: string, name: string) {
+  const batch = batches.value.find(b => b.id === id);
+  if (batch) batch.name = name;
+  if (detail.value?.id === id) detail.value.name = name;
 }
 async function fetchList() {
   const seq = ++listSeq;
@@ -146,6 +201,10 @@ function setProvider(p: string) {
     localStorage.setItem("paper-extraction.provider", p);
   } catch {}
 }
+function setReasoning(id: string, settings: ReasoningSettings) {
+  const item = config.value.providers.find((p) => p.id === id);
+  if (item) item.reasoning = settings;
+}
 function closeStream() {
   events?.close();
   events = null;
@@ -178,8 +237,14 @@ async function fetchDetail() {
       await fetchList();
     } else if (!events || streamBatch !== id) subscribe(id);
   } catch (e) {
-    if (alive && seq === detailSeq && route.value.view === "batch")
-      error.value = errorMessage(e);
+    if (alive && seq === detailSeq && route.value.view === "batch") {
+      if (e instanceof ApiError && e.status === 404) {
+        clearDeletedBatches([id]);
+        historyNotice.value = "该批次已不存在。";
+      } else {
+        error.value = errorMessage(e);
+      }
+    }
   } finally {
     if (seq === detailSeq) loading.value = false;
   }
@@ -233,6 +298,33 @@ async function retry() {
     error.value = errorMessage(e);
   } finally {
     retrying.value = false;
+  }
+}
+async function changePaperState(action: "pause" | "resume") {
+  const paper = selectedPaper.value;
+  if (!paper || changingPaperState.value) return;
+  changingPaperState.value = true;
+  error.value = "";
+  try {
+    await post("/papers/" + encodeURIComponent(paper.id) + "/" + action, {});
+    await fetchDetail();
+  } catch (err) {
+    error.value = errorMessage(err);
+  } finally {
+    changingPaperState.value = false;
+  }
+}
+async function changeBatchState(id: string, action: "pause" | "resume") {
+  if (changingBatchState.value[id]) return;
+  changingBatchState.value[id] = action;
+  error.value = "";
+  try {
+    await post("/batches/" + encodeURIComponent(id) + "/" + action, {});
+    await Promise.all([fetchList(), detail.value?.id === id ? fetchDetail() : undefined]);
+  } catch (err) {
+    error.value = errorMessage(err);
+  } finally {
+    delete changingBatchState.value[id];
   }
 }
 watch(route, changeView);
@@ -311,6 +403,7 @@ onBeforeUnmount(() => {
         <span class="profile"><i></i> paper-extraction-v13</span>
       </header>
       <main id="main" tabindex="-1">
+        <div v-if="historyNotice" class="notice" role="status">{{ historyNotice }}</div>
         <div v-if="error" class="notice error" role="alert">
           <Icon name="fail" /><span>{{ error }}</span
           ><button
@@ -328,7 +421,7 @@ onBeforeUnmount(() => {
           <section class="page-title">
             <div>
               <h1>批次工作台</h1>
-              <p>管理论文批次、跟踪提取进度，查看通过自动检查的成品。</p>
+              <p>管理论文批次、跟踪提取进度，下载已交付的引言。</p>
             </div>
             <a class="btn primary" href="#/import"
               ><Icon name="plus" />新建批次</a
@@ -350,9 +443,11 @@ onBeforeUnmount(() => {
           <section class="panel">
             <div class="panel-head">
               <h2>批次记录</h2>
-              <span v-if="listReady" class="muted mono"
-                >{{ batches.length }} 个批次</span
-              >
+              <div v-if="listReady" class="history-actions">
+                <span class="muted mono">{{ batches.length }} 个批次</span>
+                <button type="button" class="btn history-clear" :disabled="!endedBatches.length || !!deletion"
+                  @click="askDeletion()"><Icon name="trash" :size="15" />清除已结束批次</button>
+              </div>
             </div>
             <div v-if="!listReady" class="empty">正在读取批次记录…</div>
             <div v-else-if="!batches.length" class="empty home-empty">
@@ -364,23 +459,26 @@ onBeforeUnmount(() => {
               >
             </div>
             <div v-else class="table-wrap">
-              <table>
+              <table class="batch-record-table">
                 <thead>
                   <tr>
-                    <th>批次</th>
+                    <th>批次名称</th>
                     <th>创建时间</th>
                     <th>模型服务</th>
                     <th>论文数</th>
                     <th>进度</th>
-                    <th><span class="sr">查看</span></th>
+                    <th><span class="sr">批次操作</span></th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-for="b in batchRows" :key="b.id">
                     <td>
-                      <a :href="path(b.id)" class="text-link mono"
-                        >#{{ shortId(b.id) }}</a
-                      >
+                      <BatchNameEditor class="batch-name-cell" :id="b.id" :name="b.name" @saved="nameSaved">
+                        <a :href="path(b.id)" class="batch-name-link" :title="b.name || '#' + shortId(b.id)">
+                          <span v-if="b.name" class="named-batch">{{ b.name }}</span>
+                          <template v-else><span class="unnamed-batch">未命名</span><span class="batch-code mono">#{{ shortId(b.id) }}</span></template>
+                        </a>
+                      </BatchNameEditor>
                     </td>
                     <td>{{ formatDate(b.created_at) }}</td>
                     <td>{{ providerName(b.provider) }}</td>
@@ -391,7 +489,7 @@ onBeforeUnmount(() => {
                           :style="{
                             width:
                               (b.total
-                                ? (100 * (b.stats.completed + b.stats.failed)) /
+                                ? (100 * (b.stats.completed + b.stats.failed + (b.stats.cancelled || 0))) /
                                   b.total
                                 : 0) + '%',
                           }"
@@ -401,17 +499,32 @@ onBeforeUnmount(() => {
                         >排队 {{ b.stats.queued }} · 处理中
                         {{ b.stats.running }}</small
                       ><small
-                        >已完成 {{ b.stats.completed }} · 失败
+                        >已交付 {{ b.stats.completed }} · 失败
                         {{ b.stats.failed }}</small
                       >
+                      <small v-if="b.stats.paused || b.stats.cancelled">
+                        <span v-if="b.stats.paused">已暂停 {{ b.stats.paused }}</span>
+                        <span v-if="b.stats.paused && b.stats.cancelled"> · </span>
+                        <span v-if="b.stats.cancelled">已终止 {{ b.stats.cancelled }}</span>
+                      </small>
                     </td>
                     <td>
+                      <div class="row-batch-actions">
                       <a
                         class="icon-link"
                         :href="path(b.id)"
-                        :aria-label="'查看批次 ' + shortId(b.id)"
+                        :aria-label="'查看批次 ' + (b.name || shortId(b.id))"
                         ><Icon name="chevron" :size="16"
                       /></a>
+                      <BatchPauseControl :batch="b" :busy="changingBatchState[b.id]" @change="changeBatchState(b.id, $event)" />
+                      <div class="batch-delete-action">
+                        <button type="button" class="btn history-delete"
+                          :disabled="!canDeleteBatch(b) || !!changingBatchState[b.id] || !!deletion"
+                          :aria-label="'删除批次 ' + (b.name || shortId(b.id))"
+                          @click="askDeletion(b)"><Icon name="trash" :size="15" />删除批次</button>
+                        <small v-if="!canDeleteBatch(b)">{{ deleteBlockedHint }}</small>
+                      </div>
+                      </div>
                     </td>
                   </tr>
                 </tbody>
@@ -435,6 +548,7 @@ onBeforeUnmount(() => {
           :concurrency="config.concurrency"
           @provider="setProvider"
           @concurrency="config.concurrency = $event"
+          @reasoning="setReasoning"
         />
         <template v-else>
           <div v-if="loading && !detail" class="empty">正在读取批次…</div>
@@ -446,7 +560,10 @@ onBeforeUnmount(() => {
               :paper="selectedPaper"
               :back="path(detail.id)"
               :retrying="retrying"
+              :changing-state="changingPaperState"
               @retry="retry"
+              @pause="changePaperState('pause')"
+              @resume="changePaperState('resume')"
             />
             <section v-else-if="route.paper" class="empty">
               <h2>当前批次没有这篇论文</h2>
@@ -458,16 +575,19 @@ onBeforeUnmount(() => {
               >
               <div class="page-title">
                 <div>
-                  <h1>
-                    批次 <span class="id-title">#{{ shortId(detail.id) }}</span
-                    ><small> · {{ detail.total }} 篇论文</small>
-                  </h1>
+                  <BatchNameEditor class="batch-heading-editor" :key="detail.id" :id="detail.id" :name="detail.name" @saved="nameSaved">
+                    <h1 class="batch-title">{{ detail.name || "未命名批次" }}</h1>
+                  </BatchNameEditor>
                   <p>
-                    {{ formatDate(detail.created_at) }} 创建
+                    {{ detail.total }} 篇论文 <span class="sep">/</span> {{ formatDate(detail.created_at) }} 创建
                     <span class="sep">/</span>
                     {{ providerName(detail.provider) }}
+                    <span class="sep">/</span>
+                    <span class="mono">#{{ shortId(detail.id) }}</span>
                   </p>
                 </div>
+                <div class="history-actions">
+                <BatchPauseControl :batch="detail" :busy="changingBatchState[detail.id]" @change="changeBatchState(detail.id, $event)" />
                 <a
                   class="btn"
                   :href="
@@ -477,8 +597,13 @@ onBeforeUnmount(() => {
                   "
                   download
                   ><Icon name="download" />下载批次 ZIP ·
-                  {{ passedCount }} 篇成品</a
+                  {{ deliveredCount }} 篇成品</a
                 >
+                <button type="button" class="btn history-delete"
+                  :disabled="!canDeleteBatch(detail) || !!changingBatchState[detail.id] || !!deletion"
+                  :title="canDeleteBatch(detail) ? undefined : deleteBlockedHint"
+                  @click="askDeletion(detail)"><Icon name="trash" :size="15" />删除此批次</button>
+                </div>
               </div>
               <section class="panel">
                 <div class="panel-head">
@@ -532,4 +657,5 @@ onBeforeUnmount(() => {
       </main>
     </div>
   </div>
+  <DeleteHistoryDialog v-if="deletion" v-bind="deletion" @deleted="finishDeletion" @cancel="cancelDeletion" />
 </template>

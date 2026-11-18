@@ -34,30 +34,31 @@ paper-extraction doctor --live --provider openai
 paper-extraction serve
 ```
 
-Prefix these commands with `uv run` in a source checkout. Open **http://127.0.0.1:8765** in your browser. Use `serve --port 8766` for another port. The model settings dialog also tests text and vision separately. Connection tests make live API requests.
+Prefix these commands with `uv run` in a source checkout. Open **http://127.0.0.1:8765** in your browser. Use `serve --port 8766` for another port. Model Settings offers separate reasoning controls for supported text and vision models. The defaults are `medium` for supported OpenAI models, `high` for DeepSeek Flash, and `low` for GLM-5.3. GLM-4.6V has thinking enabled and manages its own effort. Each new batch records the selected settings, and connection tests use the saved settings for live requests.
 
 ## Process a batch
 
 1. Choose files or a folder in the new-batch view. Inspect the preview and select the entry point for TeX packages with competing main files.
 2. Select a provider and start. Two papers run concurrently by default. Closing the browser leaves the local worker active. Starting the service again resumes unfinished jobs.
-3. Open a paper to read the generated content, examine original evidence and browse execution events. Preview and download accepted artifacts. Failed papers retain the reason and can be retried individually.
-4. Download a ZIP containing all currently completed papers. The manifest also lists pending, running and failed items.
+3. Open a paper to read the generated content, examine its evidence and check the results. The TeX and PDF download buttons each show the file available for that drafting round. After a layout or visual check fails, you can download any readable PDF from the round to inspect the reported defect. The paper retains its failed status and can be retried individually.
+4. A batch ZIP uses the batch name and groups each paper's PDF and self-contained TeX file in its own folder. Both single-paper and batch downloads name paper files after the input file with the suffix `-extraction`. For multi-file TeX projects, the selected main file supplies the name. The batch manifest includes pending, running and failed items.
+5. Once every paper in a batch is paused or finished, you can delete that batch from the workbench or its detail view. Use “Clear finished batches” to remove batches where every paper has finished. Download any files you want to keep before confirming. Deletion removes the batch history, drafts and deliverables from the workbench.
+6. Use the paper detail view to pause or resume a paper. Queued papers pause immediately. Running papers save a checkpoint when the current step finishes and resume from the following step.
 
 **Example.** Import the [examples/compactness](examples/compactness) folder. One main file includes a separate chapter, illustrating how generated statements link to original source lines. This teaching manuscript presents the classical Arzelà–Ascoli theorem. The selected statements and their wording depend on the model run. A completed batch yields:
 
 ```text
 001-compactness/
-  introduction.tex
-  introduction.pdf
-  preamble-v13.tex
+  main-extraction.tex
+  main-extraction.pdf
 manifest.json
 ```
 
 ## Workflow and acceptance
 
-LangGraph keeps an independent SQLite checkpoint for each paper. LangChain binds read-only tools for searching the paper, reading passages and inspecting page images. Missing material contributions route back to extraction; errors in retained statements return to drafting. The program renders the fixed v13 profile, compiles twice, checks the actual layout and page counts, and submits every final page for visual inspection. A passing first draft is delivered immediately. Specific defects trigger at most two repair rounds. Engineering and visual checks are recorded separately. Mathematical selection is a machine editorial judgment.
+LangGraph keeps an independent SQLite checkpoint for each paper. LangChain binds read-only tools for searching the paper, reading passages and inspecting page images. Each start or explicit retry can generate up to three drafts, including the first. The first two can be reviewed, revised with targeted edits or supplemented with more evidence. A draft can be delivered as soon as it passes those checks. The third draft goes straight to a two-pass compile and PDF readability check. For a TeX error, the workflow can restore a block tied to the same source evidence or deliver an earlier verified version. When neither is available, it compiles the existing content in a simplified layout. If the compiler is unavailable, it generates a readable PDF locally and labels it accordingly. Finalization uses no additional model calls. The workbench offers the PDF and the final TeX with its preamble embedded, with check results recorded separately.
 
-The profile allows up to three body pages followed by a separate bibliography, 1–3 historical results, 1–4 current contributions and up to six definitions. Source and scope conflicts are recorded for the individual paper. [Profile rules](src/paper_extraction/profile_assets/intro-rules-v13.txt)
+Each introduction includes a separate bibliography. The model selects current theorems, historical comparisons and necessary definitions from the source, and adds context where it helps explain the problem or the scope of the results. Aim for three body pages or fewer, with up to five when the material needs more space. Word counts guide the writing. The compiled checks enforce the measured block, formula and page budgets. The workbench reports missing source evidence and layout problems for each paper. [Original rules](src/paper_extraction/profile_assets/intro-rules-v13.txt)
 
 ## Configuration and development
 

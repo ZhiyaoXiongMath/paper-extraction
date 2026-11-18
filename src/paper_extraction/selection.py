@@ -9,14 +9,21 @@ from pydantic import BaseModel, Field
 
 from .editorial import evidence_packet
 from .scope_reconciliation import reconcile_scope
+from .profile_variants import COUNT_OVERRIDE
 
 SELECTION_VERSION = "v13-whole-paper-3"
+
+
+class SourceFact(BaseModel):
+    source_id: str = Field(min_length=1)
+    fact: str = Field(min_length=1)
 
 
 class CoreChoice(BaseModel):
     candidate_id: str
     role: Literal["historical", "current", "application"] | None = None
     independent_question: str | None = None
+    b2_source_facts: list[SourceFact]
     source_reason: str = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
     definition_ids: list[str] = Field(default_factory=list)
@@ -42,10 +49,11 @@ class WholePaperSelection(BaseModel):
 
 
 SELECTION_FIELDS = """candidate_id, definition_ids, variant_ids and metadata_ids refer to candidate_register IDs.
-evidence_ids refer to source_locations IDs. For an exclusion group, c7..c23 denotes the inclusive ID range.
+evidence_ids identify the source locations for the assertion. b2_source_facts records B2(iii)
+as pairs of fact and source_id, using source_locations IDs. For an exclusion group, c7..c23 denotes the inclusive ID range.
 central_open_ids refers to unresolved candidate IDs for the B4 central-admission status."""
 CORRECTION_FIELDS = """Return replacements only for affected_selected_ids. replacement rows use the same
-candidate and source ID namespaces. Omit an affected row to remove that row; other rows remain in place."""
+candidate and source ID namespaces, including source_id in b2_source_facts. Omit an affected row to remove that row; other rows remain in place."""
 
 
 def _source_row(row):
@@ -73,7 +81,7 @@ def candidate_register(candidates):
                "local_reason": c.get("local_reason", c["decision_reason"]),
                "evidence_ids": list(original_ids), "local_evidence_ids": list(original_ids),
                "dependencies": list(c.get("dependencies", []))}
-        for prior in ("represented_by", "independent_question", "selection_evidence_ids", "needed_by", "context_for",
+        for prior in ("represented_by", "independent_question", "b2_source_facts", "selection_evidence_ids", "needed_by", "context_for",
                       "scope_evidence_id", "scope_excerpt", "scope_role", "scope_group_id", "scope_central_open",
                       "scope_evidence_version", "scope_reason_type"):
             row.pop(prior, None)
@@ -104,17 +112,14 @@ def selection_packet(catalog, register):
             "candidate_register": navigators}
 
 
-def exclusion_notes(candidates):
-    """Brief paper-wide reasons for the reviewer to verify or rebut from the original."""
-    categories = {}
-    for row in candidates:
-        if not row.get("candidate_id") or row["decision"] not in {"excluded", "unresolved"}:
-            continue
-        key = (row["decision"], row["decision_reason"])
-        categories.setdefault(key, []).append({"id": row["candidate_id"], "label": row.get("source_number"),
-            "claim": row["claim"][:120], "source_id": next(iter(row.get("evidence_ids", [])), None)})
-    return [{"decision": decision, "reason": reason, "observations": items}
-            for (decision, reason), items in categories.items()]
+def review_navigator(candidates):
+    """Give the independent review source coordinates for every observation, including legacy rows."""
+    return [{"candidate_id": row.get("candidate_id"), "source_number": row.get("source_number"),
+             "evidence_ids": list(dict.fromkeys([
+                 *row.get("local_evidence_ids", []), *row.get("evidence_ids", []),
+                 *row.get("selection_evidence_ids", []),
+                 *(fact["source_id"] for fact in row.get("b2_source_facts", [])),
+             ]))} for row in candidates]
 
 
 class SelectionConflict(ValueError):
@@ -139,6 +144,9 @@ def apply_selection(register, choice: WholePaperSelection, catalog):
         key = item.candidate_id
         if key not in rows:
             raise SelectionConflict(f"Unknown selected candidate ID {key}", key)
+        unregistered = sorted({fact.source_id for fact in item.b2_source_facts} - source_ids)
+        if unregistered:
+            raise SelectionConflict(f"{key} has unregistered b2_source_facts.source_id: {', '.join(unregistered)}", key)
         role = item.role or rows[key]["local_kind"]
         if role not in core_kinds:
             # Authors' definitions or setting may be selected as necessary material.
@@ -153,6 +161,9 @@ def apply_selection(register, choice: WholePaperSelection, catalog):
                 raise SelectionConflict(f"{key} received incompatible core roles", key)
             changes = {field: list(dict.fromkeys(getattr(existing, field) + getattr(item, field)))
                        for field in ("evidence_ids", "definition_ids", "variant_ids")}
+            changes["b2_source_facts"] = list({
+                (fact.source_id, fact.fact): fact for fact in [*existing.b2_source_facts, *item.b2_source_facts]
+            }.values())
             choices[key] = existing.model_copy(update=changes)
         else:
             choices[key] = item
@@ -176,9 +187,13 @@ def apply_selection(register, choice: WholePaperSelection, catalog):
             known.update(rows[other]["evidence_ids"])
         if not set(pick.evidence_ids) <= source_ids or not known.intersection(pick.evidence_ids):
             raise SelectionConflict(f"{key} requires registered source IDs including evidence for the selected assertion", key)
+        if not any(fact.fact.strip() for fact in pick.b2_source_facts):
+            raise SelectionConflict(f"{key}: b2_source_facts is empty; enter the source fact and source_id for B2(iii)", key)
         row.update(kind=pick.role or row["local_kind"], decision="admitted", decision_reason=pick.source_reason,
                    independent_question=pick.independent_question, selection_evidence_ids=pick.evidence_ids,
-                   evidence_ids=list(dict.fromkeys(row["evidence_ids"] + pick.evidence_ids)))
+                   b2_source_facts=[fact.model_dump() for fact in pick.b2_source_facts],
+                   evidence_ids=list(dict.fromkeys([*row["evidence_ids"], *pick.evidence_ids,
+                                                    *(fact.source_id for fact in pick.b2_source_facts)])))
         for dep in dict.fromkeys(pick.definition_ids):
             if dep in rows and dep != key:
                 definitions.setdefault(dep, []).append(key)
@@ -242,9 +257,14 @@ def _repair_choice(conflict, choice, register, catalog, models, rubric):
         related.update(item.definition_ids)
     exact = [_source_row(row) for row in register if row["candidate_id"] in related]
     locations = {loc for row in exact for loc in row["local_evidence_ids"]}
+    if catalog:
+        locations.add(catalog[0]["id"])
+    locations.update(loc for item in affected for loc in item.evidence_ids)
+    locations.update(fact.source_id for item in affected for fact in item.b2_source_facts)
     bindings = {"candidate_id", "role", "evidence_ids", "definition_ids", "variant_ids"}
     payload = {"conflict": str(conflict), "affected_selected_ids": sorted(conflict.owners),
-               "previous_bindings": [p.model_dump(include=bindings) for p in affected],
+               "previous_bindings": [{**p.model_dump(include=bindings),
+                                      "b2_source_ids": [f.source_id for f in p.b2_source_facts]} for p in affected],
                "candidate_rows": exact,
                "original_passages": [r for r in catalog if r["id"] in locations]}
     if any(key not in {row["candidate_id"] for row in exact} for key in conflict.owners):
@@ -258,12 +278,17 @@ def _repair_choice(conflict, choice, register, catalog, models, rubric):
     return choice.model_copy(update={"selected": retained + replacements})
 
 
-def select_contributions(catalog, candidates, models):
+def select_contributions(catalog, candidates, models, previous_failure=None, rules=None, *, unlimited_current=False):
     register = candidate_register(candidates)
     if not register:
         return []
     packet = selection_packet(catalog, register)
-    rubric = files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8")
+    if previous_failure:
+        from .retry_context import attach_previous_failure
+        attach_previous_failure(packet, previous_failure, catalog)
+    rubric = rules or files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8")
+    if unlimited_current:
+        rubric += "\n" + COUNT_OVERRIDE
     instructions = rubric + "\n" + SELECTION_FIELDS
     choice = models.structured(WholePaperSelection, instructions, packet)
     for attempt in range(3):
@@ -274,4 +299,4 @@ def select_contributions(catalog, candidates, models):
             if attempt == 2:
                 raise
             choice = _repair_choice(exc, choice, register, catalog, models, rubric)
-    return reconcile_scope(catalog, rows, models, rubric)
+    return rows if unlimited_current else reconcile_scope(catalog, rows, models, rubric, previous_failure)

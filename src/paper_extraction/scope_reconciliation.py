@@ -54,11 +54,14 @@ def _source_packet(catalog, current):
             "standard_current_group_max": MAX_CURRENT_GROUPS}
 
 
-def reconcile_scope(catalog, rows, models, rubric):
+def reconcile_scope(catalog, rows, models, rubric, previous_failure=None):
     current = [row for row in rows if row["decision"] == "admitted" and row["kind"] in {"current", "application"}]
     if len(current) <= MAX_CURRENT_GROUPS:
         return rows
     packet = _source_packet(catalog, current)
+    if previous_failure:
+        from .retry_context import attach_previous_failure
+        attach_previous_failure(packet, previous_failure, catalog, "original_statements_and_context")
     supplied = {r["id"] for field in ("original_overview", "original_statements_and_context")
                 for r in packet[field]}
     original = {r["id"]: r for r in catalog if r["id"] in supplied}
@@ -150,13 +153,15 @@ def reconcile_scope(catalog, rows, models, rubric):
     return rows
 
 
-def scope_failure_reason(candidates):
+def scope_failure_reason(candidates, *, unlimited_current=False):
     current = [row for row in candidates if row["decision"] == "admitted" and row["kind"] in {"current", "application"}]
     if not current:
         unsettled = [r for r in candidates if r.get("scope_central_open")]
         if unsettled:
             details = [f'{r.get("source_number") or r["candidate_id"]} [{r["scope_evidence_id"]}] {r["decision_reason"]}' for r in unsettled]
             return "v13 B4：当前核心成果的独立准入仍未确定。\n" + "\n".join(details)
+    if unlimited_current:
+        return ""
     groups = {r.get("scope_group_id") or r["candidate_id"] for r in current}
     if len(groups) <= MAX_CURRENT_GROUPS:
         return ""
@@ -170,3 +175,14 @@ def stale_scope_result(result):
     current = [r for r in result.get("candidates", []) if r.get("decision") == "admitted"
                and r.get("kind") in {"current", "application"} and r.get("scope_role") in {"independent", "admitted"}]
     return len(current) > MAX_CURRENT_GROUPS and any(r.get("scope_evidence_version") != SCOPE_EVIDENCE_VERSION for r in current)
+
+
+def saved_count_exception(result, expected_selection):
+    """Reuse source-checked candidates when a saved draft was blocked only by the old count limit."""
+    selected = result.get("candidates", [])
+    return (result.get("status") == "failed" and not result.get("draft") and
+            result.get("selection_version") == expected_selection and
+            result.get("reason", "").startswith("v13 范围例外：") and
+            any(r.get("kind") == "historical" and r.get("decision") == "admitted" for r in selected) and
+            len({r.get("scope_group_id") or r.get("candidate_id") for r in selected if r.get("decision") == "admitted"
+                 and r.get("kind") in {"current", "application"}}) > MAX_CURRENT_GROUPS)

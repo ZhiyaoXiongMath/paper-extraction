@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import shutil
 import unittest
@@ -7,6 +8,12 @@ from tempfile import TemporaryDirectory
 from paper_extraction import pdfops, profile
 from paper_extraction.sources import SourceIndex
 from paper_extraction.profile_assets.tools import v13_check
+
+
+def test_grave_accent_in_paper_title():
+    draft = synthetic_draft()
+    draft["title"] = r"Monge-Amp\`ere measures"
+    assert r"\paperheader{Monge-Amp\`ere measures}" in profile.render_tex(draft)
 
 
 def synthetic_draft():
@@ -22,6 +29,109 @@ def synthetic_draft():
 
 
 class ProfileTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt" and shutil.which("pdflatex"), "requires Windows and pdfLaTeX")
+    def test_build_and_recovery_with_nested_windows_job_path_and_long_source_title(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            source = base / (("An-equation-for-large-scale-mathematical-geometry-" * 3) + ".pdf")
+            source.write_bytes(b"Synthetic source snapshot.")
+            runs = base / ("r" * max(1, 141 - len(str(base))))
+            draft = {**synthetic_draft(), "editorial_profile": "reader"}
+
+            case = profile.build_case(runs, source, None, draft)
+            binding = json.loads((case / "input-manifest.json").read_text("utf-8"))
+            status = json.loads((case / "build-status.json").read_text("utf-8"))
+            artifact = case / status["diagnostic_artifacts"]["directory"] / "introduction.pdf"
+            self.assertEqual(binding["case_id"], source.stem)
+            self.assertTrue(case.name.endswith("--" + binding["snapshot"]["sha256"][:12]))
+            self.assertLess(len(case.name), 100)
+            self.assertTrue(artifact.is_file())
+            self.assertEqual(profile.recover_draft_case(runs, source, None, draft), case)
+
+            bundle = profile.profile_bundle(profile.ASSETS, runs, v13_check.EXPANDED_RELEASE)
+            another = v13_check.allocate(bundle, source, runs)
+            self.assertTrue(another.name.endswith("--run-002"))
+            self.assertEqual(profile.recover_draft_case(runs, source, None, draft), case)
+
+    @unittest.skipUnless(shutil.which("pdflatex"), "requires pdfLaTeX")
+    def test_math_spacing_with_connective_passes_and_stacked_spacing_is_located(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source.md"
+            source.write_text("Synthetic source.", "utf-8")
+            draft = synthetic_draft()
+            draft["groups"][0]["theorem"] = (
+                r"For a real number $x$, \[ x>0\quad\Longrightarrow\quad x+x>0. \] \cite[Theorem 2]{source}"
+            )
+            case = profile.build_case(base / "runs", source, None, draft)
+            self.assertTrue((case / "introduction.pdf").is_file())
+
+            theorem = draft["groups"][0]["theorem"]
+            draft["groups"][0]["theorem"] = theorem.replace(r"\quad\Longrightarrow", r"\quad\qquad\Longrightarrow")
+            with self.assertRaises(profile.BuildFailure) as failed:
+                profile.build_case(base / "runs", source, None, draft)
+            self.assertFalse(failed.exception.technical)
+            self.assertIn("theorem_1_manual_spacing", str(failed.exception))
+            self.assertEqual([row["draft_field"] for row in failed.exception.repair_targets], ["groups.0.theorem"])
+
+    def test_missing_source_snapshot_is_a_technical_build_failure(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with self.assertRaises(profile.BuildFailure) as failed:
+                profile.build_case(base / "runs", base / "missing.md", None, synthetic_draft())
+            self.assertTrue(failed.exception.technical)
+            self.assertEqual(failed.exception.repair_targets, [])
+
+    def test_printed_numbers_candidate_bindings_and_local_definition_scope(self):
+        draft = synthetic_draft()
+        draft["shared_definitions"] = ["First concept.", "Second concept."]
+        draft["history"] += ["Another comparison."]
+        draft["groups"] = [{"definitions": [], "theorem": "One."},
+                           {"definitions": ["Third concept."], "theorem": "Two."}]
+        candidates = [{"candidate_id": "c2", "kind": "definition", "needed_by": ["c5"],
+                       "evidence_ids": ["p2-1"], "decision_reason": "Previous model's judgment"},
+                      {"candidate_id": "c5", "source_number": "Theorem 6"}]
+        data = profile.renderer_context(draft, candidates)
+        self.assertEqual(data["visible_headings"], {
+            "shared_definitions.0": "Definition 1", "shared_definitions.1": "Definition 2",
+            "history.0": "Theorem A", "history.1": "Theorem B", "groups.0.theorem": "Theorem 1",
+            "groups.1.definitions.0": "Definition 3", "groups.1.theorem": "Theorem 2"})
+        self.assertEqual(data["result_groups"][0]["definitions_printed_in_this_group"], [])
+        self.assertEqual(data["result_groups"][1]["definitions_printed_in_this_group"], ["groups.1.definitions.0"])
+        self.assertEqual(data["source_candidate_dependencies"][0]["needed_by_candidates"],
+                         [{"candidate_id": "c5", "source_number": "Theorem 6"}])
+        self.assertNotIn("decision_reason", str(data))
+        self.assertEqual(profile.renderer_context(None)["visible_headings"], {})
+
+    def test_standalone_leading_locator_moves_once_without_rewriting_prose_attribution(self):
+        draft = synthetic_draft()
+        citation = r"\cite[Theorem 3]{source}"
+        for separator in (" ", ". "):
+            draft["groups"][0]["theorem"] = citation + separator + "Let the hypotheses hold."
+            tex = profile.render_tex(draft)
+            self.assertIn(r"\begin{theorem}[{" + citation + "}]\nLet the hypotheses hold.", tex)
+            self.assertEqual(tex.count(citation), 1)
+            self.assertEqual(profile.render_tex(draft, _legacy_citations=True).count(citation), 2)
+        draft["groups"][0]["theorem"] = citation + " proves a statement about positive reals."
+        self.assertIn("\n" + draft["groups"][0]["theorem"], profile.render_tex(draft))
+
+    @unittest.skipUnless(shutil.which("pdflatex"), "requires the v13 TeX toolchain")
+    def test_recovery_recognizes_the_original_pre_deduplication_tex(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source.md"
+            source.write_text("Synthetic source.", "utf8")
+            draft = synthetic_draft()
+            draft["groups"][0]["theorem"] = r"\cite[Theorem 3]{source} Let the hypotheses hold."
+            runs = base / "runs"
+            case = v13_check.allocate(profile.ASSETS, source, runs)
+            old_text = profile.render_tex(draft, _legacy_citations=True)
+            (case / "introduction.tex").write_text(old_text, "utf8")
+            self.assertTrue(v13_check.build(profile.ASSETS, case)["engineering_accepted"])
+            self.assertNotEqual(old_text, profile.render_tex(draft))
+            self.assertEqual(profile.recover_draft_case(runs, source, None, draft), case)
+            self.assertEqual((case / "introduction.tex").read_text("utf8"), old_text)
+
     def test_inputs_bound_to_v13_and_current_checker(self):
         record = v13_check.verify(profile.ASSETS)
         self.assertEqual(record["sha256"]["preamble-v13.tex"],
@@ -164,6 +274,46 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual([t["draft_field"] for t in error.exception.repair_targets], ["paragraph"])
             self.assertTrue(pdf.exists())
             self.assertEqual(len(list((root / "runs").glob("*/introduction.pdf"))), 1)
+            case = error.exception.case_dir
+            blocked = json.loads((case / "build-status.json").read_text("utf8"))
+            archive = blocked["diagnostic_artifacts"]
+            saved = case / archive["directory"]
+            self.assertFalse(blocked["engineering_accepted"])
+            self.assertFalse(blocked["pdf_available"])
+            self.assertEqual(archive["pages"], 2)
+            for name, expected in archive["files"].items():
+                self.assertEqual(v13_check.digest(saved / name), expected)
+            self.assertEqual(archive, json.loads((saved / "receipt.json").read_text("utf8")))
+            self.assertNotEqual(archive["run_id"], state["diagnostic_artifacts"]["run_id"])
+
+            # Recovery is explicitly labelled, idempotent and isolated from the recorded round.
+            self.assertEqual(profile.recover_draft_case(root / "runs", source, None, failed), case)
+            self.assertEqual(profile.recover_draft_case(root / "runs", source, None, first_draft), first)
+            previous_ok = dict(state)
+            del previous_ok["diagnostic_artifacts"]
+            (first / "build-status.json").write_text(json.dumps(previous_ok), "utf8")
+            self.assertEqual(profile.recover_draft_case(root / "runs", source, None, first_draft), first)
+            legacy = dict(blocked)
+            del legacy["diagnostic_artifacts"]
+            (case / "build-status.json").write_text(json.dumps(legacy), "utf8")
+            replay = profile.recover_draft_case(root / "runs", source, None, failed)
+            self.assertIsNotNone(replay)
+            self.assertEqual(replay, profile.recover_draft_case(root / "runs", source, None, failed))
+            provenance = json.loads((replay / "draft-recovery.json").read_text("utf8"))
+            self.assertEqual(provenance["original_run_id"], blocked["run_id"])
+            self.assertEqual(provenance["original_tex_sha256"], v13_check.digest(replay / "introduction.tex"))
+            self.assertIsNone(profile.recover_draft_case(root / "runs", source, None, {**failed, "title": "Another draft"}))
+
+            # A new failed compiler invocation must never inherit or remove the preceding PDF.
+            (case / "introduction.tex").write_text(profile.render_tex(failed).replace(
+                r"\begin{document}", r"\begin{document}\unknowncompilercommand"), "utf8")
+            broken = v13_check.build(profile.ASSETS, case)
+            fresh = broken["diagnostic_artifacts"]
+            self.assertFalse(broken["engineering_accepted"])
+            self.assertEqual(fresh["pages"], 0)
+            self.assertNotIn("introduction.pdf", fresh["files"])
+            self.assertNotEqual(fresh["directory"], archive["directory"])
+            self.assertEqual(v13_check.digest(saved / "introduction.pdf"), archive["files"]["introduction.pdf"])
 
 
 if __name__ == "__main__":

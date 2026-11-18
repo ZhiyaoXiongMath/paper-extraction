@@ -76,7 +76,7 @@ class OfflineModels:
                     "required_change": "Restrict the claim to compact objects. The draft also admits noncompact ones.",
                     "operation": "replace", "replacement_text": "compact objects",
                 }], evidence_ids=[])
-            if self.missing_application and not any(c["kind"] == "application" for c in payload["candidates"]):
+            if self.missing_application and not any(c["source_number"] == "Corollary 2" for c in payload["candidates"]):
                 return AdmissionReview(route="extract", issues=[{
                     "kind": "missing_required_content", "draft_field": "groups", "current_excerpt": "",
                     "evidence_id": "t1-1", "source_excerpt": "an example exists for every dimension n >= 10",
@@ -94,7 +94,9 @@ class OfflineModels:
 def paper(tmp_path, monkeypatch):
     models = OfflineModels()
     monkeypatch.setattr(agent, "Models", lambda _: models)
-    source = tmp_path / "source.tex"
+    source_root = tmp_path / "input"
+    source_root.mkdir()
+    source = source_root / "source.tex"
     source.write_text("The source claim is a statement on compact objects. Corollary 2: "
                       "an example exists for every dimension n >= 10.", encoding="utf-8")
     work = tmp_path / "case"
@@ -115,7 +117,7 @@ def paper(tmp_path, monkeypatch):
     events = []
 
     def run():
-        return agent.run_paper(work, source, None, settings, lambda name, data: events.append((name, data)))
+        return agent.run_paper(work, source, source_root, settings, lambda name, data: events.append((name, data)))
 
     return models, run, builds, events
 
@@ -150,7 +152,11 @@ def test_source_defect_returns_to_writer_without_rescanning(paper, monkeypatch):
             assert instructions.startswith(prefix + "\n")
             assert instructions.count(rules) == 1
             if schema is AdmissionReview:
-                assert "previous_model_exclusion_notes" in payload
+                assert "previous_model_exclusion_notes" not in payload
+                assert all(set(row) == {"candidate_id", "source_number", "evidence_ids"}
+                           for row in payload.get("candidates", []))
+                if "changed_blocks" in payload:
+                    assert "draft" not in payload and [r["draft_field"] for r in payload["changed_blocks"]] == ["groups.0.theorem"]
                 assert "Reopen an excluded" not in instructions[len(prefix):]
         return original(schema, instructions, payload, image)
     monkeypatch.setattr(model, "structured", observe)
@@ -167,14 +173,15 @@ def test_source_defect_returns_to_writer_without_rescanning(paper, monkeypatch):
     assert not any(data.get("targeted") for stage, data in events if stage == "extract")
 
 
-def test_visual_failure_stops_after_two_repairs(paper):
+def test_unlocated_visual_failure_delivers_without_rewriting(paper):
     model, run, builds, events = paper
     model.visual_passes = False
     result = run()
-    assert result["status"] == "failed", result
-    assert "clipping" in result["reason"] and "result_dir" not in result and "resumable" not in result
-    assert len(builds) == 3
-    assert not any(n == "publish" for n, _ in events)
+    assert result["status"] == "completed", result
+    assert result["delivery"]["status"] == "delivered"
+    assert "clipping" in " ".join(issue for review in result["reviews"] for issue in review["issues"])
+    assert len(builds) == model.drafts == 1
+    assert [data["delivery"] for n, data in events if n == "publish"] == ["delivered"]
 
 
 def test_recovery_resumes_unfinished_checkpoint(paper):

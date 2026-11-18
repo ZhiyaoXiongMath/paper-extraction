@@ -2,6 +2,7 @@
 import type { Paper, Evidence } from "./contracts";
 import { computed, ref, nextTick, watch } from "vue";
 import { request, paperUrl, errorMessage } from "./api";
+import { paperDownloads, visibleFailureReasons } from "./paper-downloads.js";
 import {
   shortId,
   formatDate,
@@ -10,12 +11,13 @@ import {
   stageName,
 } from "./format.js";
 import IntroductionReader from "./IntroductionReader.vue";
+import HistoryDrafts from "./HistoryDrafts.vue";
 import Icon from "./Icon.vue";
 import CandidatePanel from "./CandidatePanel.vue";
 import MathText from "./MathText.vue";
 import ReviewsPanel from "./ReviewsPanel.vue";
-const props = defineProps<{ paper: Paper; back: string; retrying: boolean; retryProvider: string }>();
-const emit = defineEmits(["retry"]);
+const props = defineProps<{ paper: Paper; back: string; retrying: boolean; retryProvider: string; changingState: boolean }>();
+const emit = defineEmits(["retry", "pause", "resume"]);
 const outcome = computed(() => paperOutcome(props.paper));
 const tabSelected = ref(false);
 const tab = ref(outcome.value.initialTab),
@@ -25,7 +27,9 @@ const tab = ref(outcome.value.initialTab),
   evLoading = ref(false),
   evPanel = ref<HTMLElement>();
 const prefix = computed(() => paperUrl(props.paper.id));
-const passed = computed(() => tone(props.paper.status) === "good");
+const downloads = computed(() => paperDownloads(props.paper, prefix.value));
+const failureReasons = computed(() => visibleFailureReasons(props.paper));
+const published = computed(() => tone(props.paper.status) === "good");
 const links = computed(() =>
   Object.fromEntries(
     (props.paper.links?.length
@@ -92,7 +96,7 @@ watch(
 watch(
   firstSource,
   (id) => {
-    if (id && passed.value && window.matchMedia("(min-width: 1001px)").matches)
+    if (id && published.value && window.matchMedia("(min-width: 1001px)").matches)
       openEvidence(id, false);
   },
   { immediate: true },
@@ -113,42 +117,57 @@ watch(
     </div>
     <span class="pill" :class="tone(paper.status)">{{ outcome.title }}</span>
   </section>
-  <div class="file-actions">
-    <a
-      v-if="paper.kind === 'pdf'"
-      :href="prefix + '/source'"
-      class="btn"
-      target="_blank"
-      rel="noopener"
-      ><Icon name="file" :size="15" />打开原文</a
-    >
-    <template v-if="passed"
-      ><a
-        class="btn"
-        :href="prefix + '/artifacts/introduction.pdf'"
-        target="_blank"
-        rel="noopener"
-        ><Icon name="ext" :size="15" />成品 PDF</a
-      ><a class="btn primary" :href="prefix + '/download'" download
-        ><Icon name="download" :size="15" />下载单篇 ZIP</a
-      ></template
-    >
+  <section class="paper-downloads" aria-label="论文文件下载">
+    <div class="download-context">
+      <strong>{{ downloads.label }}</strong>
+      <span v-if="downloads.recompiled">按本轮保存稿重新编译</span>
+      <span v-else-if="downloads.restored">已恢复本轮保存稿</span>
+      <span v-if="downloads.missingPdf">{{ downloads.missingPdf }}</span>
+    </div>
+    <div class="download-buttons">
+      <a v-if="downloads.tex" class="btn primary" :href="downloads.tex" download>
+        <Icon name="download" :size="15" />下载 .tex</a>
+      <button v-else class="btn" disabled><Icon name="download" :size="15" />下载 .tex</button>
+      <a v-if="downloads.pdf" class="btn" :href="downloads.pdf" download>
+        <Icon name="download" :size="15" />下载 .pdf</a>
+      <button v-else class="btn" disabled><Icon name="download" :size="15" />下载 .pdf</button>
+      <a v-if="published" class="btn" :href="prefix + '/download'" download>
+        <Icon name="download" :size="15" />下载单篇 ZIP</a>
+    </div>
+    <p v-if="published && paper.delivery?.note" class="delivery-note">{{ paper.delivery.note }}</p>
+  </section>
+  <div class="file-actions" v-if="paper.kind === 'pdf' || ['failed','queued','running','pausing','paused'].includes(paper.status)">
+    <a v-if="paper.kind === 'pdf'" :href="prefix + '/source'" class="btn" target="_blank" rel="noopener">
+      <Icon name="file" :size="15" />打开原文</a>
     <button
-      v-if="tone(paper.status) === 'bad'"
+      v-if="paper.status === 'failed'"
       class="btn"
       :disabled="retrying"
       @click="emit('retry')"
     >
       <Icon name="refresh" :size="15" />{{
-        retrying ? "正在提交…" : "用 " + retryProvider + " 重新提取"
+        retrying ? "正在提交…" : "用 " + retryProvider + " 重试此篇"
       }}
     </button>
+    <button v-if="['queued','running','pausing'].includes(paper.status)" type="button" class="btn"
+      :disabled="changingState || paper.status === 'pausing'" @click="emit('pause')">
+      {{ paper.status === 'pausing' ? '当前环节完成后暂停' : '暂停提取' }}
+    </button>
+    <button v-if="paper.status === 'paused'" type="button" class="btn"
+      :disabled="changingState" @click="emit('resume')">继续提取</button>
   </div>
-  <div v-if="paper.reason" class="notice error" role="status">
+  <HistoryDrafts :versions="paper.draft_artifacts || []" />
+  <div v-if="paper.status === 'paused' || paper.status === 'cancelled'" class="notice" role="status">
+    {{ paper.reason || (paper.status === 'paused' ? '已暂停，可从检查点继续。' : '用户已终止此任务。') }}
+  </div>
+  <div v-else-if="!published && (paper.reason || failureReasons.length)" class="notice error" role="status">
     <Icon name="fail" />
     <div>
       <p>{{ outcome.summary }}</p>
-      <details class="diagnostic">
+      <ul v-if="failureReasons.length" class="failure-reasons">
+        <li v-for="item in failureReasons" :key="item"><MathText :text="item" /></li>
+      </ul>
+      <details v-if="paper.reason" class="diagnostic">
         <summary>查看技术诊断</summary>
         <p>{{ paper.reason }}</p>
       </details>
@@ -263,3 +282,13 @@ watch(
     </aside>
   </div>
 </template>
+<style scoped>
+.paper-downloads { margin: 0 0 15px; }
+.download-context, .download-buttons { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.download-context { margin-bottom: 8px; font-size: 13px; color: var(--muted); }
+.download-context strong { color: var(--ink, #26372e); }
+.delivery-note { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+.download-buttons .btn:disabled { cursor: default; opacity: .52; }
+.failure-reasons { margin: .45rem 0; padding-inline-start: 1.2rem; }
+.failure-reasons li + li { margin-top: .25rem; }
+</style>

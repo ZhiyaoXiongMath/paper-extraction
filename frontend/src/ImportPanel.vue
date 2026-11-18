@@ -15,6 +15,7 @@ const picker = ref<HTMLInputElement>(),
   folder = ref<HTMLInputElement>(),
   preview = ref<ImportPreview | null>(null),
   rows = ref<(SourcePaper & { selected: boolean })[]>([]),
+  batchName = ref(""),
   pending = ref(""),
   error = ref(""),
   drag = ref(false);
@@ -71,6 +72,7 @@ async function start() {
   try {
     const b = await post<{ id: string }>("/batches", {
       import_id: preview.value.id,
+      name: batchName.value.trim() || undefined,
       provider: props.provider,
       papers: selected.value.map((r) => ({ id: r.id, entry: r.entry })),
     });
@@ -188,6 +190,9 @@ function choose(e: Event) {
     <section class="panel run-config">
       <div class="panel-head"><h2>批次配置</h2></div>
       <div class="panel-pad">
+        <label class="control">批次名称（选填）
+          <input v-model="batchName" type="text" placeholder="例如：曲率流论文" :disabled="pending === 'start'" />
+        </label>
         <label class="control"
           >模型服务<select
             :value="provider"

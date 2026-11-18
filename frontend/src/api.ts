@@ -1,3 +1,9 @@
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
 export async function request<T>(
   path: string,
   options: RequestInit = {},
@@ -11,7 +17,7 @@ export async function request<T>(
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     const message = body?.detail ?? body?.message;
-    throw new Error(
+    throw new ApiError(response.status,
       typeof message === "string"
         ? message
         : Array.isArray(message)

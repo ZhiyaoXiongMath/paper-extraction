@@ -8,21 +8,23 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Annotated, Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.routing import APIRoute
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 from starlette.exceptions import HTTPException as FormHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .exporting import batch_archive_filename, extraction_basename
 from .importing import prepare_sources, stage
-from .settings import PROVIDERS, data_home, probe, provider_settings, public_config, workbench_limits
+from .settings import (PROVIDERS, apply_reasoning_preferences, data_home, probe, provider_settings, public_config,
+                       reasoning_choices, reasoning_config, workbench_limits)
 from .sources import SourceIndex
-from .store import Store
+from .store import BatchStillActive, Store
 
 
 class PaperChoice(BaseModel):
@@ -30,10 +32,22 @@ class PaperChoice(BaseModel):
     entry: str
 
 
+BatchName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class BatchRename(BaseModel):
+    name: BatchName
+
+
+class BatchDeletion(BaseModel):
+    batch_ids: list[str]
+
+
 class BatchInput(BaseModel):
     import_id: str
     provider: Literal["openai","deepseek","zhipu"]
     papers: list[PaperChoice]
+    name: BatchName | None = None
 
 
 class RetryInput(BaseModel):
@@ -47,6 +61,14 @@ class ConnectionTest(BaseModel):
 
 class ConcurrencyChange(BaseModel):
     concurrency: int = Field(strict=True, gt=0)
+
+
+ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max"]
+
+
+class ReasoningChange(BaseModel):
+    text: ReasoningEffort | None = None
+    vision: ReasoningEffort | None = None
 
 
 class ImportRoute(APIRoute):
@@ -71,6 +93,12 @@ class ImportRoute(APIRoute):
 
 def launch_worker(home, pid):
     subprocess.run([sys.executable,"-m","paper_extraction.worker",str(home),pid],check=True)
+
+
+def _file_disposition(filename: str, kind: str = "attachment") -> dict[str, str]:
+    encoded = quote(filename, safe="")
+    parameter = f'filename="{filename}"' if encoded == filename else f"filename*=UTF-8''{encoded}"
+    return {"Content-Disposition": f"{kind}; {parameter}"}
 
 
 class Dispatcher:
@@ -99,8 +127,10 @@ class Dispatcher:
     def restore(self):
         self._enqueue(self.store.pending_attempts())
 
-    def submit_new_batch(self, papers):
-        self._enqueue((paper["id"], 1) for paper in papers)
+    def submit_new_batch(self, bid):
+        # The batch may already be visible to another tab with a pause button.
+        with self.lock:
+            self._enqueue_locked(self.store.pending_attempts(bid))
 
     def submit(self, pid):
         paper = self.store.paper(pid)
@@ -109,17 +139,23 @@ class Dispatcher:
 
     def _enqueue(self, tokens):
         with self.lock:
-            if self.closed:
-                return
-            for token in tokens:
-                if token not in self.active:
-                    self.queued.setdefault(token, None)
-            self._start_ready()
+            self._enqueue_locked(tokens)
+
+    def _enqueue_locked(self, tokens):
+        if self.closed:
+            return
+        for token in tokens:
+            if token not in self.active:
+                self.queued.setdefault(token, None)
+        self._start_ready()
 
     def _start_ready(self):
         """Called under lock. Lower limits take effect as existing workers leave."""
         while not self.closed and self.queued and len(self.active) < self._concurrency:
-            token, _ = self.queued.popitem(last=False)
+            token = next((job for job in self.queued if job not in self.active), None)
+            if token is None:
+                return
+            self.queued.pop(token)
             self.active.add(token)
             try:
                 Thread(target=self._run, args=(token,), name=f"paper-worker-{token[0]}",
@@ -135,7 +171,10 @@ class Dispatcher:
 
     def _mark_failed(self, token, error):
         pid, attempt = token
-        paper = self.store.paper(pid)
+        try:
+            paper = self.store.paper(pid)
+        except KeyError:
+            return  # A paused batch may have been deleted while a worker was exiting.
         if paper["attempt"] == attempt:
             self.store.finish(paper, {"status": "failed", "reason": f"工作进程退出：{type(error).__name__}"})
 
@@ -148,11 +187,38 @@ class Dispatcher:
             with self.lock:
                 self.active.discard(token)
                 self._start_ready()
+            # A paused batch can be deleted before its worker closes the lock file.
+            self.store.clean_deleted_batch_files()
 
     def close(self):
         with self.lock:
             self.closed = True
             self.queued.clear()
+
+    def set_paused(self, pid, paused):
+        with self.lock:
+            state, attempt = self.store.set_paper_paused(pid, paused)
+            token = (pid, attempt)
+            if state == "paused":
+                self.queued.pop(token, None)
+            elif not paused and state == "queued" and not self.closed:
+                # A resume can arrive just before the preceding worker releases its slot.
+                self.queued.setdefault(token, None)
+                self._start_ready()
+            return state
+
+    def set_batch_paused(self, bid, paused):
+        with self.lock:
+            changes = self.store.set_batch_paused(bid, paused)
+            for pid, attempt, status in changes:
+                token = (pid, attempt)
+                if status == "paused":
+                    self.queued.pop(token, None)
+                elif status == "queued" and not self.closed:
+                    # Keep a pending resume even if its previous worker is releasing the slot.
+                    self.queued.setdefault(token, None)
+            self._start_ready()
+            return len(changes)
 
 
 def create_app(home=None, runner=launch_worker):
@@ -160,6 +226,7 @@ def create_app(home=None, runner=launch_worker):
     limits = workbench_limits(concurrency=store.concurrency())
     @asynccontextmanager
     async def lifespan(app):
+        store.clean_deleted_batch_files()
         app.state.dispatch = Dispatcher(store, runner, store.concurrency(default=limits["concurrency"]))
         app.state.dispatch.restore()
         try:
@@ -186,7 +253,20 @@ def create_app(home=None, runner=launch_worker):
 
     @app.get("/api/config")
     def config():
-        return {**public_config(), **limits, "concurrency": app.state.dispatch.concurrency}
+        efforts = {provider: store.reasoning_efforts(provider) for provider in PROVIDERS}
+        return {**public_config(efforts), **limits, "concurrency": app.state.dispatch.concurrency}
+
+    @app.post("/api/config/{provider}/reasoning")
+    def change_reasoning(provider: Literal["openai", "deepseek", "zhipu"], body: ReasoningChange):
+        selected = body.model_dump(exclude_none=True)
+        configured = provider_settings(provider)
+        for mode, effort in selected.items():
+            if effort not in reasoning_choices(provider, configured[mode + "_model"]):
+                label = "文本" if mode == "text" else "视觉"
+                raise ValueError(f"当前{label}模型不支持所选推理档位")
+        store.set_reasoning_efforts(provider, selected)
+        apply_reasoning_preferences(configured, store.reasoning_efforts(provider))
+        return {"reasoning": reasoning_config(configured)}
 
     @app.patch("/api/config/concurrency")
     @app.post("/api/config/concurrency")
@@ -195,7 +275,7 @@ def create_app(home=None, runner=launch_worker):
 
     @app.post("/api/config/test")
     def test_connection(body: ConnectionTest):
-        return probe(body.provider,body.mode)
+        return probe(body.provider, body.mode, reasoning_efforts=store.reasoning_efforts(body.provider))
 
     def receive(files: Annotated[list[UploadFile],File()], paths: Annotated[str,Form()]):
         rel = json.loads(paths)
@@ -207,13 +287,14 @@ def create_app(home=None, runner=launch_worker):
 
     @app.post("/api/batches",status_code=201)
     def create(body: BatchInput):
-        settings = provider_settings(body.provider,with_key=True)
+        settings = provider_settings(body.provider, with_key=True)
         if not settings.pop("api_key"):
             raise ValueError("缺少 " + PROVIDERS[body.provider][1] + "，请先配置模型")
+        apply_reasoning_preferences(settings, store.reasoning_efforts(body.provider))
         bid = uuid4().hex
         papers = prepare_sources(store.home,body.import_id,body.papers,bid)
-        store.create(bid,settings,papers)
-        app.state.dispatch.submit_new_batch(papers)
+        store.create(bid,settings,papers,name=body.name)
+        app.state.dispatch.submit_new_batch(bid)
         return {"id":bid}
 
     @app.get("/api/batches")
@@ -223,6 +304,30 @@ def create_app(home=None, runner=launch_worker):
     @app.get("/api/batches/{bid}")
     def detail(bid: str):
         return store.describe(bid)
+
+    @app.post("/api/batches/{bid}/pause")
+    def pause_batch(bid: str):
+        return {"id": bid, "affected": app.state.dispatch.set_batch_paused(bid, True)}
+
+    @app.post("/api/batches/{bid}/resume")
+    def resume_batch(bid: str):
+        return {"id": bid, "affected": app.state.dispatch.set_batch_paused(bid, False)}
+
+    @app.delete("/api/batches")
+    def clear_finished(body: BatchDeletion | None = None):
+        return {"deleted_batch_ids": store.delete_finished_batches(batch_ids=body.batch_ids if body else None)}
+
+    @app.delete("/api/batches/{bid}")
+    def delete_batch(bid: str):
+        try:
+            return {"deleted_batch_ids": store.delete_batch(bid)}
+        except BatchStillActive as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.patch("/api/batches/{bid}/name")
+    def rename(bid: str, body: BatchRename):
+        store.rename_batch(bid, body.name)
+        return {"id": bid, "name": body.name}
 
     @app.get("/api/batches/{bid}/events")
     async def events(bid: str, req: Request):
@@ -238,7 +343,7 @@ def create_app(home=None, runner=launch_worker):
                 if signature != before:
                     yield "event: update\ndata: " + json.dumps({"batch_id":bid,"sequence":watermark}) + "\n\n"
                     before = signature
-                if all(row[1] in {"failed","completed"} for row in states):
+                if all(row[1] in {"failed","completed","cancelled"} for row in states):
                     return
                 tick += 1
                 if tick % 15 == 0:
@@ -264,23 +369,46 @@ def create_app(home=None, runner=launch_worker):
         app.state.dispatch.submit(pid)
         return {"id": pid, "status": "queued", "provider": provider}
 
-    @app.get("/api/papers/{pid}/artifacts/{name}")
-    def artifact(pid:str,name:str):
-        path = store.artifact(store.paper(pid),name)
-        return FileResponse(path,media_type="application/pdf" if name.endswith(".pdf") else "text/plain; charset=utf-8")
+    @app.post("/api/papers/{pid}/pause")
+    def pause(pid: str):
+        return {"id": pid, "status": app.state.dispatch.set_paused(pid, True)}
 
-    def zip_response(data,name):
-        return Response(data, media_type="application/zip",
-                        headers={"Content-Disposition": f'attachment; filename="{name}.zip"'})
+    @app.post("/api/papers/{pid}/resume")
+    def resume(pid: str):
+        return {"id": pid, "status": app.state.dispatch.set_paused(pid, False)}
+
+    @app.get("/api/papers/{pid}/artifacts/{name}")
+    def artifact(pid: str, name: str):
+        paper = store.paper(pid)
+        basename = extraction_basename(paper["source"])
+        if name == "introduction.tex":
+            return Response(store.export_tex(paper), media_type="text/plain",
+                            headers=_file_disposition(basename + ".tex", "inline"))
+        path = store.artifact(paper, name)
+        if name == "introduction.pdf":
+            return FileResponse(path, media_type="application/pdf", filename=basename + ".pdf",
+                                content_disposition_type="inline")
+        return FileResponse(path, media_type="text/plain")
+
+    @app.get("/api/papers/{pid}/drafts/{attempt}/{round_no}/{digest}/{name}")
+    def draft_artifact(pid: str, attempt: int, round_no: int, digest: str, name: str, sha256: str | None = None):
+        path = store.draft_artifact(pid, attempt, round_no, digest, name, sha256)
+        basename = extraction_basename(store.paper(pid)["source"])
+        return FileResponse(path, media_type="application/pdf" if path.suffix == ".pdf" else "text/plain",
+                            filename=basename + path.suffix, content_disposition_type="inline")
+
+    def zip_response(data, filename):
+        return Response(data, media_type="application/zip", headers=_file_disposition(filename))
 
     @app.get("/api/batches/{bid}/download")
-    def download(bid:str):
-        return zip_response(store.archive(bid), "papers-"+bid[:10])
+    def download(bid: str):
+        filename = batch_archive_filename(bid, store.batch_name(bid))
+        return zip_response(store.archive(bid), filename)
 
     @app.get("/api/papers/{pid}/download")
-    def download_paper(pid:str):
+    def download_paper(pid: str):
         p = store.paper(pid)
-        return zip_response(store.archive(p["batch_id"],pid),"introduction-"+pid[:10])
+        return zip_response(store.archive(p["batch_id"], pid), extraction_basename(p["source"]) + ".zip")
 
     static = Path(__file__).parent/"static"
     if static.is_dir():

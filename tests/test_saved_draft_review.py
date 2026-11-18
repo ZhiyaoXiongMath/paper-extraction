@@ -9,7 +9,7 @@ from paper_extraction import agent
 from paper_extraction.editorial import EDIT_CONTRACT_VERSION
 from paper_extraction.models import AdmissionReview, DraftPatch, Review
 from paper_extraction.selection import SELECTION_VERSION
-from paper_extraction.store import CONTENT_REVIEW_VERSION, Store, legacy_confirmation_failure
+from paper_extraction.store import CONTENT_REVIEW_VERSION, Store, legacy_confirmation_failure, resolved_renderer_failure
 from test_agent import OfflineModels
 
 
@@ -37,6 +37,13 @@ def old_terminal(mode):
              "decision_reason": "source-supported", "significance": "central", "source_number": k,
              "dependencies": [], "evidence_ids": ["t1-1"], "selection_evidence_ids": ["t1-1"],
              "candidate_id": f"c{i}"} for i, k in enumerate(("current", "historical"), 1)]
+    if mode == "old_renderer":
+        draft["title"] = r"Monge--Amp\`ere"
+        error = r"title uses unsupported TeX command \`. Use standard notation."
+        checks = [{"stage": "review", "route": "pass", "passed": True, "attempt": 3, "issues": [], "defects": []},
+                  {"stage": "compile", "passed": False, "attempt": 3, "issues": [error]}]
+        return {"status": "failed", "selection_version": SELECTION_VERSION, "draft": draft, "candidates": rows,
+                "draft_round": 3, "reason": error, "reviews": checks}
     if mode in {"confirmation", "confirmation_layout"}:
         defects = [old_defect("history.0", "The two assertions are equivalent and the draft copies the source; "
                              "no defect. (Retained only to record that this was checked.)"),
@@ -77,7 +84,25 @@ def test_only_affirmative_legacy_verdict_can_reuse_unchanged_draft():
     assert not legacy_confirmation_failure(mismatched)
 
 
-@pytest.mark.parametrize("mode", ["confirmation", "citation", "patch", "layout", "confirmation_layout"])
+def test_recompile_requires_the_same_approved_round_and_a_resolved_renderer_error():
+    for case in ("layout", "citation", "confirmation"):
+        assert not resolved_renderer_failure(old_terminal(case))
+    confirmed = old_terminal("old_renderer")
+    assert resolved_renderer_failure(confirmed)
+    for change in ("round", "unsupported", "mixed", "unapproved"):
+        case = deepcopy(confirmed)
+        if change == "round":
+            case["reviews"][-2]["attempt"] -= 1
+        elif change == "unsupported":
+            case["draft"]["title"] = r"Untested \unknownsymbol"
+        elif change == "mixed":
+            case["reviews"][-1]["issues"].append("Block exceeds 12U")
+        else:
+            case["reviews"][-2]["passed"] = False
+        assert not resolved_renderer_failure(case)
+
+
+@pytest.mark.parametrize("mode", ["confirmation", "citation", "patch", "layout", "confirmation_layout", "old_renderer"])
 def test_explicit_retry_reuses_final_draft_and_actual_selection_version(tmp_path, monkeypatch, mode):
     store = Store(tmp_path / "home")
     root = tmp_path / "source"
@@ -113,6 +138,13 @@ def test_explicit_retry_reuses_final_draft_and_actual_selection_version(tmp_path
                 return DraftPatch(replacements=[dict(block_id=target["block_id"],
                                                      text=text, evidence_ids=target["required_evidence_ids"])])
             assert schema in (AdmissionReview, Review), f"Unexpected {schema}: attempted to regenerate the draft"
+            if schema is AdmissionReview and mode == "patch":
+                assert instructions.startswith(agent._rules() + "\n")
+                assert "draft" in payload and "changed_blocks" not in payload
+                assert payload["source_locations"] and all(set(c) == {"candidate_id", "source_number", "evidence_ids"}
+                    for c in payload["candidates"])
+            if schema is AdmissionReview and mode == "layout":
+                assert "changed_blocks" in payload and "source_locations" not in payload
             seen.append(schema)
             return super().structured(schema, instructions, payload, image)
     monkeypatch.setattr(agent, "Models", lambda _: OnlyReview())
@@ -139,21 +171,32 @@ def test_explicit_retry_reuses_final_draft_and_actual_selection_version(tmp_path
     assert store.work(queued) == work and queued["result"]["retry_legacy_review"]
     result = agent.run_paper(work, source, root, settings, notify, retry_legacy_review=True)
     assert result["status"] == "completed", result
+    if mode == "old_renderer":
+        assert events == ["compile", "visual", "publish"] and seen == [Review]
+        assert result["reviews"][:2] == previous["reviews"]
+        assert result["draft"] == previous["draft"] and result["draft_round"] == 3
+        assert result["candidates"] == previous["candidates"]
+        return
     before_review = ([AdmissionReview, DraftPatch] if mode == "confirmation_layout" else
                      [DraftPatch] if mode in {"patch", "layout"} else [])
     assert seen == before_review + [AdmissionReview, Review]
     assert "compile" in events and "publish" in events
     assert result["selection_version"] == previous["selection_version"]
     assert result["candidates"] == previous["candidates"]
-    assert result["reviews"][0]["edit_contract_version"] == EDIT_CONTRACT_VERSION
+    final_math = next(row for row in reversed(result["reviews"]) if row["stage"] == "review")
+    assert final_math["edit_contract_version"] == EDIT_CONTRACT_VERSION
+    if mode in {"patch", "layout"}:
+        assert final_math["attempt"] == 4
+        assert result["reviews"][:len(previous["reviews"])] == previous["reviews"]
     if mode == "confirmation":
         assert result["draft"] == previous["draft"]
     elif mode == "patch":
         changed = deepcopy(previous["draft"])
         changed["groups"][0]["theorem"] = changed["groups"][0]["theorem"].replace("compact", "connected compact")
+        changed["editorial_profile"] = "reader"
         assert changed == result["draft"]
     elif mode in {"layout", "confirmation_layout"}:
-        assert result["draft"] == {**previous["draft"], "paragraph": "Scope."}
+        assert result["draft"] == {**previous["draft"], "paragraph": "Scope.", "editorial_profile": "reader"}
     else:
         assert result["draft"]["groups"][0]["theorem"].startswith(previous["draft"]["groups"][0]["theorem"])
     with SqliteSaver.from_conn_string(str(work / "checkpoint.sqlite")) as saver:

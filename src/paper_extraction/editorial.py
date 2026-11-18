@@ -56,6 +56,24 @@ REVIEW_GUIDANCE = (
 )
 
 
+def reversed_edit_requests(reviews, fields=None):
+    """Find opposite structural edits requested against the same original passage."""
+    latest = {}
+    for review in reviews:
+        if review.get("stage") != "review":
+            continue
+        for issue in review.get("defects", []):
+            if not isinstance(issue, dict) or issue.get("operation") not in {"insert", "remove"}:
+                continue
+            field, source = issue.get("draft_field"), issue.get("evidence_id")
+            if not field or not source or (fields is not None and field not in fields):
+                continue
+            latest.setdefault((field, source), {})[issue["operation"]] = {
+                "round": review.get("attempt"), "operation": issue["operation"], "requested_change": issue.get("required_change", "")}
+    return [{"draft_field": field, "source_id": source, "prior_requests": sorted(operations.values(), key=lambda row: row["round"] or 0)}
+            for (field, source), operations in latest.items() if len(operations) == 2]
+
+
 _HISTORY = re.compile(
     r"\b(?:previously|earlier|formerly|classical|was known|known (?:when|under|for|in)|"
     r"showed that|proved that|established that|asserted that|attributed to|due to|"

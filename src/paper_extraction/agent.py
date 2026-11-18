@@ -22,19 +22,26 @@ from langgraph.prebuilt import ToolNode
 
 from .models import AdmissionReview, Draft, DraftPatch, Findings, Models, Review, json_text
 from .editorial import DRAFT_GUIDANCE, EDIT_CONTRACT_VERSION, EXTRACTION_GUIDANCE, REVIEW_GUIDANCE, evidence_packet
-from .profile import BuildFailure, bind_formal_citations, build_case, saved_build_targets
+from .profile import BuildFailure, bind_formal_citations, bind_source_reference, build_case, renderer_context, saved_build_targets
+from .profile_variants import READER_PROFILE, reader_guidance, release_for_draft
+from .editorial import reversed_edit_requests
 from .pdfops import page_count, render_page
+from .retry_context import attach_previous_failure
 from .sources import SourceIndex
-from .selection import SELECTION_VERSION, exclusion_notes, select_contributions
-from .scope_reconciliation import scope_failure_reason
+from .selection import SELECTION_VERSION, review_navigator, select_contributions
+from .scope_reconciliation import saved_count_exception, scope_failure_reason
+from .source_image_cache import cached_transcription
+from .delivery import deliver_case
+from .repair_progress import approved_legacy_layout_targets, block_at, legacy_quota_stop, record_progress, stalled_saved_repair
 from .store import (CONTENT_REVIEW_VERSION, legacy_confirmation_failure, legacy_content_failure,
-                    repairable_citation_draft, saved_writer_targets, stale_selection_failure)
+                    repairable_citation_draft, resolved_renderer_failure, saved_writer_targets, stale_selection_failure)
 from .writer_patch import PATCH_GUIDANCE, WRITER_VERSION, apply_patch, repair_targets
 
 Notify = Callable[[str, dict], None]
 _DOCUMENTS = ("introduction.tex", "introduction.pdf", "preamble-v13.tex")
 _BUDGET = 18000
 _TOOL_ROUNDS = 4
+MAX_DRAFT_ROUNDS = 3
 
 
 class EvidenceState(TypedDict):
@@ -44,11 +51,22 @@ class EvidenceState(TypedDict):
 
 class PaperState(TypedDict, total=False):
     cursor: int
+    previous_failure: dict
     candidates: list[dict]
     uncertainties: list[str]
     selection_version: str
     writer_version: str
     pending_writer_review: dict
+    repair_progress: dict
+    repair_policy: str
+    repair_stalled: bool
+    draft_limit_reached: bool
+    technical_build_failure: bool
+    review_blocks: list[dict]
+    renumbered_definitions: dict
+    legacy_b2_pending: bool
+    legacy_b2_reviewed: bool
+    retained_layout_selection: str
     recheck_saved_selection: bool
     prerequisites_checked: list[str]
     attempt: int
@@ -57,6 +75,11 @@ class PaperState(TypedDict, total=False):
     issues: list[str]
     target_ids: list[str]
     result_dir: str
+    last_compiled_case: str
+    last_compiled_draft: dict
+    last_compiled_round: int
+    delivered_draft: dict
+    delivery: dict
     status: str
     reason: str
     hashes: dict[str, str]
@@ -178,7 +201,7 @@ def _private_model_errors(keys):
         raise
 
 
-def _evidence_agent(index, models, allowed_ids, notify, keys):
+def _evidence_agent(index, models, allowed_ids, notify, keys, work, settings):
     @tool
     def search_source(query: str) -> str:
         """Find relevant passages in this paper and return their source location IDs."""
@@ -200,14 +223,14 @@ def _evidence_agent(index, models, allowed_ids, notify, keys):
         locations = [str(r["id"]) for r in allowed_ids.values() if r.get("page") == page]
         if not locations:
             return "No PDF image for this page. For TeX, use read_span on a source location."
-        notify("evidence", {"tool": "read_page_image", "page": page, "region": region, "locations": locations})
         with _private_model_errors(keys):
-            transcription = models.transcribe(index.image(page, region), page)
+            transcription, reused = cached_transcription(work, settings, index.image(page, region), page, models.transcribe)
+        notify("evidence", {"tool": "read_page_image", "page": page, "region": region, "locations": locations, "reused": reused})
         return json_text({"page": page, "region": region, "source_ids": locations,
                           "transcription": transcription})
 
     tools = [search_source, read_span, read_page_image]
-    tool_model = models.text.bind_tools(tools)
+    tool_model = getattr(models, "tool_model", models.text).bind_tools(tools)
 
     def decide(state: EvidenceState):
         with _private_model_errors(keys):
@@ -231,7 +254,7 @@ def _inspect(reader, prompt: str, packet: dict) -> str:
         HumanMessage(content=json_text(packet)),
     ]}, {"max_concurrency": 2})
     # Only dynamic observations are needed; the verified source passages are supplied separately.
-    return "\n".join(str(m.content) for m in result["messages"][2:] if m.content)
+    return "\n".join(m.text for m in result["messages"][2:] if m.text)
 
 
 def _render_pages(pdf: Path):
@@ -239,17 +262,41 @@ def _render_pages(pdf: Path):
         yield page_number, render_page(pdf, page_number, scale=2)
 
 
+def _selection_ready(s):
+    version = s.get("selection_version")
+    return version == SELECTION_VERSION or bool(version and s.get("retained_layout_selection") == version)
+
+
+def _needs_legacy_b2_review(s, last=None):
+    if s.get("legacy_b2_reviewed") or any(r.get("legacy_b2_reviewed") for r in s.get("reviews", [])):
+        return False
+    if s.get("legacy_b2_pending"):
+        return True
+    if last is None:
+        reviews = s.get("reviews", [])
+        last = s.get("pending_writer_review") or (reviews[-1] if reviews else {})
+    if last.get("stage") != "review" or last.get("passed") is not False:
+        return False
+    return any(c.get("decision") == "admitted" and c.get("kind") in {"current", "application", "historical"}
+               and "b2_source_facts" not in c for c in s.get("candidates", []))
+
+
 def _record(s, stage, passed, issues, **other):
     return {"stage": stage, "attempt": s["attempt"], "passed": passed, "issues": issues, **other}
 
 
 def _public(s):
-    draft = s.get("draft", {})
+    draft = s.get("delivered_draft", s.get("draft", {}))
     links = draft.get("evidence_links", [])
     result = {"status": s.get("status", "failed"), "candidates": s.get("candidates", []),
               "selection_version": s.get("selection_version", ""),
+              "repair_policy": s.get("repair_policy", ""),
               "writer_version": s.get("writer_version", ""),
-              "reviews": s.get("reviews", []), "draft": draft, "links": links, "evidence_links": links}
+              "retained_layout_selection": s.get("retained_layout_selection", ""),
+              "reviews": s.get("reviews", []), "draft": draft, "draft_round": s.get("attempt", 0),
+              "links": links, "evidence_links": links}
+    if draft and s.get("delivery", {}).get("kind") != "readable":
+        result["profile_release"] = release_for_draft(draft)
     if result["status"] == "completed":
         location = Path(s["result_dir"])
         expected = s.get("hashes", {})
@@ -258,17 +305,71 @@ def _public(s):
             for name, digest in expected.items()
         ):
             result["result_dir"] = str(location)
+            if s.get("delivery"):
+                result["delivery"] = s["delivery"]
+                result["draft_round"] = s["delivery"].get("draft_round", result["draft_round"])
             return result
         result["status"], result["reason"] = "failed", "Completed artifacts changed or are missing"
     else:
         result["reason"] = s.get("reason", "Paper processing stopped before publication")
+        if s.get("repair_stalled"):
+            result["repair_stalled"] = True
+        if s.get("draft_limit_reached"):
+            result["draft_limit_reached"] = True
+        if s.get("technical_build_failure"):
+            result["technical_build_failure"] = True
         if s.get("resumable"):
             result["resumable"] = True
     return result
 
 
-def _make_graph(work, source, source_root, settings, notify, checkpointer, rules, index, read_api_key):
-    rubric = files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8")
+def _publish_result(work, state, notify, delivery):
+    case = Path(state["result_dir"])
+    hashes = {name: _hash_file(case / name) for name in _DOCUMENTS}
+    update = {"status": "completed", "hashes": hashes, "delivery": delivery, "reason": ""}
+    receipt = work / "published.json"
+    temporary = receipt.with_suffix(".tmp")
+    temporary.write_text(json_text({**state, **update}), encoding="utf-8")
+    temporary.replace(receipt)
+    notify("publish", {"attempt": delivery["draft_round"], "files": list(hashes), "delivery": delivery["status"]})
+    return update
+
+
+def _delivery_draft(state, index, source):
+    if state.get("draft"):
+        return state["draft"]
+    metadata = getattr(index, "citation_metadata", {})
+    short_source = next((row["text"].strip()[:2800] for row in index.catalog() if row.get("text", "").strip()), "")
+    return {"title": metadata.get("title") or source.stem, "authors": metadata.get("authors") or [],
+            "paragraph": short_source, "source_excerpt": short_source,
+            "candidates": state.get("candidates", []), "arxiv": metadata.get("arxiv", "")}
+
+
+def _deliver_current(work, source, source_root, state, index, notify):
+    round_no = state.get("attempt", 0)
+    draft = _delivery_draft(state, index, source)
+    notify("compile", {"attempt": round_no, "message": "编译交付版本"})
+    case = deliver_case(work, source, source_root, draft, previous_case=state.get("last_compiled_case"),
+                        previous_draft=state.get("last_compiled_draft"), candidates=state.get("candidates", ()))
+    delivered_round = state.get("last_compiled_round", round_no) if case.kind == "prior" else round_no
+    delivered_draft = state.get("last_compiled_draft", draft) if case.kind == "prior" else case.draft or draft
+    message = {"final": "已完成定稿编译。", "repaired": "已用原文依据一致的上一稿段落修复编译错误。",
+               "prior": "交付此前已成功编译的版本。",
+               "readable": "已有内容按简明版式编译，无法确定的公式保留为可编辑源码。"}[case.kind]
+    if not case.compiler_verified:
+        message = "本机 TeX 编译环境不可用，已生成同内容的可读 PDF，并附可编辑 TeX。"
+    delivery = {"status": "delivered", "note": message, "draft_round": delivered_round,
+                "kind": case.kind, "compiler_verified": case.compiler_verified}
+    if case.diagnostic:
+        delivery["diagnostic"] = case.diagnostic[:1200]
+    output = {"result_dir": str(case.path), "delivered_draft": delivered_draft}
+    return {**output, **_publish_result(work, {**state, **output}, notify, delivery)}
+
+
+def _make_graph(work, source, source_root, settings, notify, checkpointer, rules, index, read_api_key, save_draft, drafts_started):
+    reader_settings = reader_guidance()
+    rubric = files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8") + "\n" + reader_settings
+    writing_rules = rules + "\n" + reader_settings
     catalog = index.catalog()
     records = {str(r["id"]): r for r in catalog}
     if not records or not any(r.get("page") or r["text"].strip() for r in catalog):
@@ -279,7 +380,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
     active_key = settings.get("api_key")
     keys = {active_key} if active_key else set()
     models = Models(settings)
-    reader = _evidence_agent(index, models, records, notify, keys)
+    reader = _evidence_agent(index, models, records, notify, keys, work, settings)
 
     def at_model_boundary(node):
         @wraps(node)
@@ -293,7 +394,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                     if key != active_key:
                         keys.add(key)
                         updated = Models({**settings, "api_key": key})
-                        reader = _evidence_agent(index, updated, records, notify, keys)
+                        reader = _evidence_agent(index, updated, records, notify, keys, work, settings)
                         models, active_key = updated, key
                 return node(state)
         return run
@@ -308,10 +409,10 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         passages = []
         for r in bundle:
             if not r["text"].strip() and r.get("page"):
-                transcription = models.transcribe(index.image(r["page"]), r["page"])
+                transcription, reused = cached_transcription(work, settings, index.image(r["page"]), r["page"], models.transcribe)
                 index.save_transcription(str(r["id"]), r["page"], transcription)
                 passages.append(r)
-                notify("evidence", {"tool": "read_page_image", "page": r["page"], "locations": [r["id"]]})
+                notify("evidence", {"tool": "read_page_image", "page": r["page"], "locations": [r["id"]], "reused": reused})
             else:
                 passages.append(r)
         packet = {"passages": passages, "targeted_issue": s.get("issues", []) if pending else []}
@@ -327,7 +428,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         candidates = s["candidates"] + additions
         consumed = {str(r["id"]) for r in bundle}
         return {"cursor": cursor if pending else cursor + 1, "candidates": candidates, "selection_version": "",
-                "recheck_saved_selection": False, "pending_writer_review": {},
+                "recheck_saved_selection": False, "retained_layout_selection": "", "pending_writer_review": {},
                 "target_ids": [k for k in pending if k not in consumed],
                 "uncertainties": s["uncertainties"] + res.uncertainties}
 
@@ -403,10 +504,15 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
     def select(s):
         notify("evidence", {"tool": "select_contributions", "message": "根据整篇原文筛选主要贡献",
                             "candidate_count": len(s["candidates"])})
-        candidates = select_contributions(index.catalog(), s["candidates"], models)
-        update = {"candidates": candidates, "selection_version": SELECTION_VERSION, "recheck_saved_selection": False}
+        previous = s.get("previous_failure") or {}
+        revisit = previous.get("stage") == "select" or any(
+            issue.get("kind") in {"improper_selection", "missing_required_content"} for issue in previous.get("issues", []))
+        candidates = select_contributions(index.catalog(), s["candidates"], models,
+                                          previous if revisit else None, rules if revisit else None, unlimited_current=True)
+        update = {"candidates": candidates, "selection_version": SELECTION_VERSION, "recheck_saved_selection": False,
+                  "legacy_b2_pending": False, "legacy_b2_reviewed": False, "retained_layout_selection": ""}
         missing = _missing_categories(candidates)
-        scope_reason = scope_failure_reason(candidates)
+        scope_reason = scope_failure_reason(candidates, unlimited_current=True)
         gap = source_gap(missing) if missing and set(missing).issubset(s.get("prerequisites_checked", [])) else ""
         if scope_reason or gap:
             return {**update, "status": "failed", "reason": "\n".join(reason for reason in (scope_reason, gap) if reason)}
@@ -419,14 +525,20 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                       for c in s["candidates"] if c["decision"] == "admitted"]
         original = index.catalog()
         packet = evidence_packet(original, candidates, draft)
+        packet["renderer_context"] = renderer_context(draft, candidates)
+        if index.citation_metadata:
+            packet["source_metadata"] = index.citation_metadata
         locations = {r["id"] for r in packet["passages"]}
         for c in candidates:
             locations.update(c.get("selection_evidence_ids") or c["evidence_ids"][:1])
+            locations.update(fact["source_id"] for fact in c.get("b2_source_facts", []))
         packet["passages"] = [r for r in original if r["id"] in locations]
         return packet
 
     def write_draft(s):
-        if s.get("selection_version") != SELECTION_VERSION:
+        if drafts_started() >= MAX_DRAFT_ROUNDS:
+            return {"draft_limit_reached": True}
+        if not _selection_ready(s):
             return {}
         attempt = s["attempt"] + 1
         if _missing_categories(s["candidates"]):
@@ -438,38 +550,111 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         targets = repair_targets(previous, prior_check, records.keys())
         notify("draft", {"attempt": attempt, "mode": "patch" if targets else "full",
                          "blocks": [item["block_id"] for item in targets]})
+        instructions = writing_rules
+        if drafts_started() >= MAX_DRAFT_ROUNDS:
+            instructions += ("\nThis is the final writing round. Resolve the outstanding findings with the supplied "
+                             "evidence, retain unaffected statements, and use standard TeX with balanced "
+                             "braces, math delimiters and environments.")
         packet = selected_packet(s, previous)
+        failure = s.get("previous_failure") or {}
+        if attempt == 1 and failure.get("stage") in {"review", "compile", "visual"}:
+            attach_previous_failure(packet, failure, index.catalog())
         passages = {r["id"]: r for r in packet["passages"]}
         for defect in defects:
-            loc = defect["evidence_id"]
+            loc = defect.get("evidence_id") if isinstance(defect, dict) else None
             if loc in records:
                 passages[loc] = records[loc]
         packet.update(passages=list(passages.values()), previous_draft=packet.pop("draft", None),
                       repair_issues=s.get("issues", []), uncertainties=s.get("uncertainties", []))
+        reversals = reversed_edit_requests(s.get("reviews", []), {d.get("draft_field") for d in defects if isinstance(d, dict)})
+        if reversals:
+            packet["opposing_previous_edit_requests"] = reversals
+            packet["disputed_edit_guidance"] = "Resolve the conflicting requests using the cited original passage and the applicable v13 clause."
         if targets:
             packet["repair_targets"] = targets
-            patch = models.structured(DraftPatch, rules + "\n" + PATCH_GUIDANCE, packet)
+            patch = models.structured(DraftPatch, instructions + "\n" + PATCH_GUIDANCE, packet)
             draft = apply_patch(previous, patch, packet, records)
         else:
             packet["identified_defects"] = defects
-            draft = models.structured(Draft, rules + "\n" + DRAFT_GUIDANCE, packet).model_dump()
+            draft = models.structured(Draft, instructions + "\n" + DRAFT_GUIDANCE, packet).model_dump()
             draft = bind_formal_citations(draft, records)
+            draft = bind_source_reference(draft, index.citation_metadata)
+        # Leave saved drafts reproducible. A new draft receives the current reader settings.
+        draft["editorial_profile"] = READER_PROFILE
         unknown = sorted({k for l in draft["evidence_links"] for k in l["evidence_ids"] if k not in records})
         issues = [f"Replace unregistered evidence IDs: {unknown[:5]}"] if unknown else []
+        if save_draft:
+            save_draft(attempt, draft)
+        renumbered = {}
+        if targets and any("definitions." in row["block_id"] and not row["current_text"] for row in targets):
+            before = renderer_context(previous)["visible_headings"]
+            after = renderer_context(draft)["visible_headings"]
+            renumbered = {block: [label, after[block]] for block, label in before.items()
+                          if block in after and label != after[block]}
         return {"attempt": attempt, "draft": draft, "issues": issues, "writer_version": WRITER_VERSION,
-                "pending_writer_review": {}}
+                "renumbered_definitions": renumbered, "pending_writer_review": {}, "legacy_b2_pending": _needs_legacy_b2_review(s, prior_check),
+                "review_blocks": [{"draft_field": row["block_id"], "previous_text": row["current_text"],
+                                   **({"previous_paragraph_position": row["paragraph_position"]} if "paragraph_position" in row else {}),
+                                   "evidence_ids": list(dict.fromkeys(row["bound_evidence_ids"] + row["required_evidence_ids"]))}
+                                  for row in targets]}
 
     def review(s):
+        if save_draft:
+            save_draft(s["attempt"], s["draft"])
         notify("review", {"attempt": s["attempt"]})
         issues = list(s["issues"])
         targets = []
         defects = []
+        legacy_full = not issues and _needs_legacy_b2_review(s)
         if not issues:
-            packet = selected_packet(s, s["draft"])
-            packet["previous_model_exclusion_notes"] = exclusion_notes(s["candidates"])
-            observation = _inspect(reader, rubric, packet)
-            instructions = rubric + "\n" + REVIEW_GUIDANCE
-            verdict = models.structured(AdmissionReview, instructions, {
+            changed = [] if legacy_full else s.get("review_blocks") or []
+            read_prompt = writing_rules if legacy_full else rubric
+            if changed:
+                draft = s["draft"]
+                links = {link["block_id"]: link["evidence_ids"] for link in draft["evidence_links"]}
+                current = [{**row, "text": block_at(draft, row["draft_field"]),
+                            "evidence_ids": links.get(row["draft_field"], row.get("evidence_ids", []))} for row in changed]
+                for row in current:
+                    if "previous_paragraph_position" in row:
+                        row["paragraph_position"] = block_at(draft, row["draft_field"].rsplit(".", 1)[0] + ".paragraph_position") or "after"
+                affected_groups = {row["draft_field"].split(".")[1] for row in changed
+                                   if row["draft_field"].startswith("groups.")}
+                renumbered = s.get("renumbered_definitions") or {}
+                affected_groups.update(key.split(".")[1] for key in renumbered if key.startswith("groups."))
+                affected_numbers = {label.split()[-1] for pair in renumbered.values() for label in pair}
+                references_changed_number = {key for key in links if affected_numbers.intersection(
+                    re.findall(r"\bDefinitions?[\s~]+(\d+)\b", block_at(draft, key), re.I))}
+                number_dependent = set(references_changed_number)
+                number_dependent.update(f"groups.{key.split('.')[1]}.theorem" for key in renumbered if key.startswith("groups."))
+                context = [{"draft_field": key, "text": block_at(draft, key), "evidence_ids": ids}
+                           for key, ids in links.items() if key not in {row["draft_field"] for row in current}
+                           and (key in references_changed_number or key.startswith("shared_definitions.") or
+                                (key.startswith("groups.") and key.split(".")[1] in affected_groups))]
+                source_ids = {loc for row in current + context for loc in row["evidence_ids"]}
+                packet = {"changed_blocks": current, "context_blocks": context, "renumbered_definitions": renumbered,
+                          "number_dependent_blocks": sorted(number_dependent),
+                          "renderer_context": renderer_context(draft, s["candidates"]),
+                          "passages": [row for row in index.catalog() if row["id"] in source_ids]}
+                read_prompt += "\nchanged_blocks and number_dependent_blocks identify the review scope after the local edit. renumbered_definitions maps previous to current printed headings. context_blocks supplies adjacent material."
+            else:
+                packet = selected_packet(s, s["draft"])
+                packet["candidates"] = review_navigator(s["candidates"])
+                failure = s.get("previous_failure") or {}
+                if s["attempt"] == 1 and failure.get("stage") == "review":
+                    attach_previous_failure(packet, failure, index.catalog())
+                    read_prompt = rules
+                if legacy_full:
+                    packet["source_locations"] = [{"id": r["id"], "label": r.get("label", r["id"])}
+                                                  for r in index.catalog()]
+            reversals = reversed_edit_requests(s.get("reviews", []))
+            if reversals:
+                # Locate disputed passages without giving the independent reviewer either proposed answer.
+                packet["previously_disputed_locations"] = [{"draft_field": row["draft_field"], "source_id": row["source_id"]} for row in reversals]
+            # A local correction already supplies the changed text and bound primary passages.
+            # Reserve the exploratory source-tool pass for whole-paper or incomplete checks.
+            complete_local_evidence = bool(changed) and all(row.get("evidence_ids") for row in current)
+            observation = "" if complete_local_evidence else _inspect(reader, read_prompt, packet)
+            verdict = models.structured(AdmissionReview, read_prompt + "\n" + REVIEW_GUIDANCE, {
                 **packet, "source_observations": observation,
             })
             issues = verdict.repair_issues()
@@ -484,67 +669,114 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         if issues:
             notify("review", {"attempt": s["attempt"], "route": route, "issues": issues,
                               "locations": targets, "message": issues[0]})
-        return {"issues": issues, "target_ids": targets,
-                "reviews": s["reviews"] + [_record(s, "review", not issues, issues, route=route,
-                                                   review_version=CONTENT_REVIEW_VERSION, evidence_ids=targets,
-                                                   defects=defects, edit_contract_version=EDIT_CONTRACT_VERSION)]}
+        check = _record(s, "review", not issues, issues, route=route, review_version=CONTENT_REVIEW_VERSION,
+                        evidence_ids=targets, defects=defects, edit_contract_version=EDIT_CONTRACT_VERSION)
+        if legacy_full:
+            check["legacy_b2_reviewed"] = True
+        return {"issues": issues, "target_ids": targets, "reviews": s["reviews"] + [check],
+                "legacy_b2_pending": bool(s.get("legacy_b2_pending") and not legacy_full),
+                "legacy_b2_reviewed": bool(s.get("legacy_b2_reviewed") or legacy_full),
+                **record_progress(s, "review", [check], issues)}
 
     def compile_pdf(s):
         notify("compile", {"attempt": s["attempt"]})
         payload = {k: v for k, v in s["draft"].items() if k != "evidence_links"}
         repair_targets = []
+        technical = False
         try:
             location = build_case(work, source, source_root, payload)
+            artifact_case = location
             issues = []
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, OSError) as exc:
             location, issues = None, [str(exc)[:3000]]
-            repair_targets = exc.repair_targets if isinstance(exc, BuildFailure) else saved_build_targets(payload, [str(exc)])
+            artifact_case = getattr(exc, "case_dir", None)
+            technical = isinstance(exc, OSError) or bool(getattr(exc, "technical", False))
+            if not technical:
+                repair_targets = exc.repair_targets if isinstance(exc, BuildFailure) else saved_build_targets(payload, [str(exc)])
             notify("compile", {"attempt": s["attempt"], "issues": issues, "message": issues[0]})
-        return {"result_dir": str(location) if location else "", "issues": issues,
-                "reviews": s["reviews"] + [_record(s, "compile", not issues, issues, repair_targets=repair_targets)]}
+        if save_draft:
+            save_draft(s["attempt"], s["draft"], artifact_case)
+        check = _record(s, "compile", not issues, issues, repair_targets=repair_targets, technical=technical)
+        has_compiled = bool(location)
+        if not has_compiled and artifact_case:
+            try:
+                build_status = json.loads((Path(artifact_case) / "build-status.json").read_text("utf-8"))
+                has_compiled = bool(build_status.get("compiled") and build_status.get("compiled_pdf_sha256"))
+            except (OSError, ValueError):
+                pass
+        compiled = {"last_compiled_case": str(artifact_case), "last_compiled_draft": s["draft"],
+                    "last_compiled_round": s["attempt"]} if has_compiled else {}
+        return {**compiled, "result_dir": str(location) if location else "", "issues": issues, "target_ids": [],
+                "technical_build_failure": technical,
+                "reviews": s["reviews"] + [check], **record_progress(s, "compile", [check], issues)}
 
     def visual(s):
-        issues, reviews = [], []
+        if save_draft:
+            save_draft(s["attempt"], s["draft"], s["result_dir"])
+        issues, reviews, targets = [], [], {}
+        blocks = {link["block_id"]: block_at(s["draft"], link["block_id"]) for link in s["draft"]["evidence_links"]}
+        cached = {(check.get("page"), check.get("page_sha256")): check for check in s["reviews"]
+                  if check.get("stage") == "visual" and check.get("page_sha256")}
+        headings = renderer_context(s["draft"])["visible_headings"]
         for page, png in _render_pages(Path(s["result_dir"]) / "introduction.pdf"):
-            notify("visual", {"page": page, "attempt": s["attempt"]})
-            review = models.structured(Review, "Visually inspect this rendered math Introduction "
-                "page for clipped or overflowing glyphs/formulas, misplaced source citations, uneven "
-                "condition left alignment, broken relations columns and orphaned headings. Normal "
-                "whitespace is allowed. Report only visible defects with a location.",
-                {"page": page, "title": s["draft"]["title"]}, image=png)
+            page_hash = hashlib.sha256(png).hexdigest()
+            saved = cached.get((page, page_hash))
+            reuse = bool(saved and all(loc.get("draft_field") in blocks for loc in saved.get("locations", [])))
+            notify("visual", {"page": page, "attempt": s["attempt"], "reused": reuse})
+            if reuse:
+                review = Review(passed=saved["passed"], issues=saved["issues"], locations=saved.get("locations", []))
+            else:
+                review = models.structured(Review, rubric + "\nFor this rendered page return passed and issues. "
+                    "Report concrete defects visible on this page under E2–E5. Mathematical fidelity and "
+                    "source attribution are checked in the content stage. Flag a line break when it disrupts "
+                    "a mathematical display, its conditions, or its source citation. Pair issues with the "
+                    "affected draft_field from draft_blocks. A connecting paragraph's position is a separate field.",
+                    {"page": page, "title": s["draft"]["title"], "draft_blocks": blocks,
+                     "paragraph_positions": {f"groups.{i}.paragraph": group.get("paragraph_position", "after")
+                                             for i, group in enumerate(s["draft"]["groups"]) if group.get("paragraph")}}, image=png)
             issues.extend(f"Page {page}: {msg}" for msg in review.issues)
-            reviews.append(_record(s, "visual", review.passed, review.issues, page=page))
+            locations = [(loc.draft_field, loc.issue) for loc in review.locations
+                         if loc.draft_field in blocks and loc.issue in review.issues]
+            # A printed heading can still identify the block when a visual verdict omits the JSON field.
+            for issue in set(review.issues) - {text for _, text in locations}:
+                matches = [field for field, heading in headings.items()
+                           if field in blocks and re.search(r"\b" + re.escape(heading) + r"\b", issue, re.I)]
+                locations.extend((field, issue) for field in matches)
+            for field, issue in locations:
+                target = targets.setdefault(field, {"draft_field": field, "current_text": blocks[field], "diagnostics": []})
+                if f"Page {page}: {issue}" not in target["diagnostics"]:
+                    target["diagnostics"].append(f"Page {page}: {issue}")
+            reviews.append(_record(s, "visual", review.passed, review.issues, page=page,
+                                   page_sha256=page_hash, reused_from_round=saved["attempt"] if reuse else None,
+                                   locations=[{"draft_field": field, "issue": issue} for field, issue in locations]))
         if not reviews:
             issues.append("PDF has no rendered pages")
-        return {"issues": issues, "reviews": s["reviews"] + reviews}
+        pending = {"stage": "visual", "passed": False, "issues": issues,
+                   "repair_targets": list(targets.values()), "unlocated": not targets} if issues else {}
+        return {"issues": issues, "reviews": s["reviews"] + reviews, "target_ids": [], "pending_writer_review": pending,
+                **record_progress(s, "visual", reviews, issues)}
 
     def publish(s):
-        case = Path(s["result_dir"])
-        hashes = {name: _hash_file(case / name) for name in _DOCUMENTS}
-        receipt = work / "published.json"
-        committed = {**s, "status": "completed", "hashes": hashes}
-        temp = receipt.with_suffix(".tmp")
-        temp.write_text(json_text(committed), encoding="utf-8")
-        temp.replace(receipt)
-        notify("publish", {"attempt": s["attempt"], "files": list(hashes)})
-        return {"status": "completed", "hashes": hashes}
+        return _publish_result(work, s, notify, {"status": "reviewed", "draft_round": s["attempt"]})
 
-    def failed(s):
-        return {"status": "failed", "reason": "; ".join(s["issues"]) or "Automatic review failed"}
+    def final_delivery(s):
+        return _deliver_current(work, source, source_root, s, index, notify)
 
     def advance(next_node):
         def route(s):
             if not s["issues"]:
                 return next_node
-            if s["attempt"] >= 3:
-                return "failed"
+            if (drafts_started() >= MAX_DRAFT_ROUNDS or s.get("repair_stalled") or s.get("technical_build_failure")
+                    or s.get("pending_writer_review", {}).get("unlocated")):
+                return "final_delivery"
             return "extract" if s.get("target_ids") else "draft"
         return route
 
     graph = StateGraph(PaperState)
     for name, node in (("extract", extract), ("prerequisites", prerequisites), ("select", select),
                        ("draft", write_draft), ("review", review),
-                       ("compile", compile_pdf), ("visual", visual), ("publish", publish), ("failed", failed)):
+                       ("compile", compile_pdf), ("visual", visual), ("publish", publish),
+                       ("final_delivery", final_delivery), ("failed", final_delivery)):
         if name in {"extract", "prerequisites", "select", "draft", "review", "visual"}:
             node = at_model_boundary(node)
         graph.add_node(name, node)
@@ -559,35 +791,60 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
 
     def after_select(s):
         if s.get("status") == "failed":
-            return END
+            return "final_delivery" if s.get("draft") else END
         return "prerequisites" if _missing_categories(s["candidates"]) else "draft"
+
+    def after_draft(s):
+        if drafts_started() >= MAX_DRAFT_ROUNDS:
+            return "final_delivery"
+        return "review" if _selection_ready(s) else "select"
 
     graph.add_conditional_edges("extract", after_extract)
     graph.add_edge("prerequisites", "select")
     graph.add_conditional_edges("select", after_select)
-    graph.add_conditional_edges("draft", lambda s: "review" if s.get("selection_version") == SELECTION_VERSION else "select")
+    graph.add_conditional_edges("draft", after_draft)
     for node, next_node in (("review", "compile"), ("compile", "visual"), ("visual", "publish")):
         graph.add_conditional_edges(node, advance(next_node))
     graph.add_edge("failed", END)
+    graph.add_edge("final_delivery", END)
     graph.add_edge("publish", END)
     return graph.compile(checkpointer=checkpointer), len(batches)
 
 
 def run_paper(work: Path, source: Path, source_root: Path | None, settings: dict, notify: Notify,
-              *, retry_legacy_review: bool = False, read_api_key: Callable[[], str] | None = None) -> dict:
+              *, retry_legacy_review: bool = False, read_api_key: Callable[[], str] | None = None,
+              save_draft: Callable | None = None, previous_failure: dict | None = None,
+              pause_requested: Callable[[], bool] | None = None,
+              count_draft_starts: Callable[[], int] | None = None) -> dict:
     work = Path(work).resolve()
     work.mkdir(parents=True, exist_ok=True)
     with FileLock(work / "paper.lock"):
-        return _run_locked(work, source, source_root, settings, notify, retry_legacy_review, read_api_key)
+        return _run_locked(work, source, source_root, settings, notify, retry_legacy_review,
+                           read_api_key, save_draft, previous_failure, pause_requested, count_draft_starts)
 
 
 def _run_locked(work: Path, source: Path, source_root: Path | None, settings: dict, notify: Notify,
-                retry_legacy_review: bool, read_api_key: Callable[[], str] | None) -> dict:
+                retry_legacy_review: bool, read_api_key: Callable[[], str] | None, save_draft: Callable | None,
+                previous_failure: dict | None = None, pause_requested: Callable[[], bool] | None = None,
+                count_draft_starts: Callable[[], int] | None = None) -> dict:
     work, source = Path(work).resolve(), Path(source).resolve()
     source_root = Path(source_root).resolve() if source_root is not None else None
     work.mkdir(parents=True, exist_ok=True)
     state = {}
     resumable = False
+    index = None
+    delivering = False
+    local_starts = 0
+
+    def drafts_started():
+        return count_draft_starts() if count_draft_starts is not None else local_starts
+
+    def notify_with_budget(stage, data):
+        nonlocal local_starts
+        if stage == "draft" and data.get("mode") in {"full", "patch"}:
+            local_starts += 1
+        notify(stage, data)
+
     try:
         if source_root and (not source.is_relative_to(source_root) or work.is_relative_to(source_root)):
             raise ValueError("Source entry must be inside its declared root, and output outside it")
@@ -605,30 +862,83 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
             return _public(json.loads(receipt.read_text("utf-8")))
         with SqliteSaver.from_conn_string(os.fspath(work / "checkpoint.sqlite")) as saver:
             index = SourceIndex(source, source_root, work)
-            graph, batch_count = _make_graph(work, source, source_root, settings, notify, saver, rules, index, read_api_key)
-            config = {"configurable": {"thread_id": thread}, "recursion_limit": 3 * batch_count + 30}
+            graph, batch_count = _make_graph(work, source, source_root, settings, notify_with_budget, saver, rules, index,
+                                             read_api_key, save_draft, drafts_started)
+            config = {"configurable": {"thread_id": thread}}
             prior = graph.get_state(config)
             state = prior.values
+            if not retry_legacy_review or prior.next:
+                local_starts = state.get("attempt", 0)
             finished_scan = state.get("cursor") == batch_count
             explicit_upgrade = (retry_legacy_review and not prior.next and finished_scan and
                                 (legacy_content_failure(state) or stale_selection_failure(state)))
             old_terminal = retry_legacy_review and not prior.next and finished_scan
+            count_exception = old_terminal and saved_count_exception(state, SELECTION_VERSION)
+            cap_retry = old_terminal and state.get("draft_limit_reached") and bool(state.get("reviews"))
+            stalled_retry = old_terminal and (stalled_saved_repair(state) or cap_retry)
+            recompile = old_terminal and not stalled_retry and (state.get("technical_build_failure") or resolved_renderer_failure(state))
+            local_layout = approved_legacy_layout_targets(state, index, SELECTION_VERSION) if old_terminal and not (recompile or stalled_retry) else []
             recovered = None
-            if old_terminal:
+            if old_terminal and not (recompile or local_layout or stalled_retry):
                 from .saved_selection_recovery import saved_selection_recovery
                 recovered = saved_selection_recovery(saver, config, state, index)
-            citation_draft = repairable_citation_draft(state, index) if old_terminal else None
-            repeat_review = old_terminal and (recovered is not None or legacy_confirmation_failure(state) or citation_draft is not None)
-            saved_edits = saved_writer_targets(state, index) if old_terminal and not repeat_review else []
+            citation_draft = repairable_citation_draft(state, index) if old_terminal and not (recompile or local_layout) else None
+            repeat_review = old_terminal and not local_layout and (recovered is not None or legacy_confirmation_failure(state) or citation_draft is not None)
+            saved_edits = saved_writer_targets(state, index) if old_terminal and not (repeat_review or recompile or local_layout) else []
             pending_old_draft = (finished_scan
-                                 and state.get("selection_version") != SELECTION_VERSION
+                                 and not _selection_ready(state)
                                  and any(node in {"draft", "review", "compile", "visual", "publish", "failed"}
                                          for node in prior.next))
-            if prior.created_at and not prior.next and state.get("status") and not (explicit_upgrade or repeat_review or saved_edits):
+            legacy_stop = (not pending_old_draft and state.get("selection_version") == SELECTION_VERSION and
+                           ((old_terminal and legacy_quota_stop(state)) or
+                            (prior.next == ("failed",) and not state.get("repair_policy") and state.get("attempt", 0) >= 3)))
+            if prior.next:
+                if pause_requested is not None and pause_requested():
+                    return _public({**state, "status": "paused", "reason": "已暂停，可从当前检查点继续。"})
+                if drafts_started() >= MAX_DRAFT_ROUNDS:
+                    delivering = True
+                    return _public({**state, **_deliver_current(work, source, source_root, state, index, notify)})
+            if prior.created_at and not prior.next and state.get("status") and not (
+                    count_exception or explicit_upgrade or repeat_review or saved_edits or legacy_stop or recompile or local_layout or stalled_retry):
                 return _public(state)
             if prior.created_at:
                 _restore_scan_readings(saver, config, index)
-            if repeat_review:
+            if count_exception:
+                graph.update_state(config, {"status": "", "reason": ""}, as_node="select")
+            elif stalled_retry:
+                last = state.get("pending_writer_review") or state["reviews"][-1]
+                issues = state.get("issues") or last["issues"]
+                fields = [t["block_id"] for t in repair_targets(state["draft"], last, {r["id"] for r in index.catalog()})]
+                notify("draft", {"attempt": state["attempt"] + 1, "explicit_retry": True, "blocks": fields,
+                                 "message": "按用户重试指令，沿用保存稿和最后的检查结果再修订一次"})
+                graph.update_state(config, {"status": "", "reason": "", "repair_stalled": False, "draft_limit_reached": False,
+                    "issues": issues, "target_ids": state.get("target_ids", []) if cap_retry else [],
+                    "pending_writer_review": last}, as_node=last["stage"])
+            elif recompile:
+                graph.update_state(config, {"status": "", "reason": "", "issues": [], "target_ids": [],
+                                            "repair_stalled": False, "pending_writer_review": {}}, as_node="review")
+            elif local_layout:
+                last = state["reviews"][-1]
+                baseline = record_progress(state, "compile", [dict(last, repair_targets=[
+                    {"draft_field": t["block_id"], "current_text": t["current_text"], "diagnostics": t["diagnostics"]}
+                    for t in local_layout])], last["issues"])
+                version = state["selection_version"]
+                notify("draft", {"attempt": state["attempt"] + 1, "selection_version": version,
+                                 "blocks": [t["block_id"] for t in local_layout],
+                                 "message": "沿用本轮已通过数学核验的筛选和原稿，局部修订排版"})
+                graph.update_state(config, {"status": "", "reason": "", "issues": last["issues"], "target_ids": [],
+                                   **baseline, "repair_stalled": False, "pending_writer_review": last,
+                                   "retained_layout_selection": version}, as_node="compile")
+            elif legacy_stop and not repeat_review:
+                last = state["reviews"][-1]
+                stage = last["stage"]
+                issues = state.get("issues") or last["issues"]
+                notify("draft", {"attempt": state["attempt"] + 1, "message": "复用保存稿，继续修订已定位缺陷"})
+                prior_checks = [r for r in state["reviews"] if r["stage"] == stage and r["attempt"] == state["attempt"]]
+                baseline = record_progress(state, stage, prior_checks, issues)
+                graph.update_state(config, {"status": "", "reason": "", **baseline, "repair_stalled": False,
+                    "issues": issues}, as_node=stage)
+            elif repeat_review:
                 base = recovered or state
                 message = ("恢复上轮数学核验通过且仅待排版修订的筛选和草稿，重新核验原文" if recovered else
                            "按已绑定原文补齐定位，复核最终草稿" if citation_draft is not None else
@@ -639,6 +949,7 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
                                             "attempt": 1, "reviews": [], "result_dir": "", "hashes": {},
                                             "recheck_saved_selection": True, "pending_writer_review": {},
                                             "candidates": base["candidates"], "selection_version": base["selection_version"],
+                                            "legacy_b2_pending": _needs_legacy_b2_review(base),
                                             "draft": bind_formal_citations(base["draft"], {r["id"]: r for r in index.catalog()})},
                                    as_node="draft")
             elif saved_edits:
@@ -665,8 +976,25 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
                 graph.update_state(config, restart, as_node="extract")
             initial = None if prior.created_at else {"cursor": 0, "attempt": 0, "issues": [],
                 "candidates": [], "uncertainties": [], "reviews": []}
+            if initial is not None and previous_failure:
+                initial["previous_failure"] = previous_failure
             try:
-                state = graph.invoke(initial, config)
+                # A user pause takes effect at a durable node boundary. Resuming
+                # invokes the same thread's next node without replaying completed calls.
+                pending = graph.get_state(config).next if initial is None else ("extract",)
+                while True:
+                    if pause_requested is not None and pause_requested():
+                        return _public({**state, "status": "paused", "reason": "已暂停，可从当前检查点继续。"})
+                    # A saved third draft from an older checkpoint also goes straight to delivery.
+                    if drafts_started() >= MAX_DRAFT_ROUNDS and pending != ("final_delivery",):
+                        delivering = True
+                        return _public({**state, **_deliver_current(work, source, source_root, state, index, notify)})
+                    delivering = pending in {("final_delivery",), ("failed",), ("publish",)}
+                    state = graph.invoke(initial, config, interrupt_after="*")
+                    pending = graph.get_state(config).next
+                    if not pending:
+                        break
+                    initial = None
             except Exception:
                 interrupted = graph.get_state(config)
                 state = interrupted.values
@@ -674,6 +1002,13 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
                 raise
         return _public(state)
     except Exception as exc:
+        if index is not None and not delivering and drafts_started() >= MAX_DRAFT_ROUNDS:
+            if pause_requested is not None and pause_requested():
+                return _public({**state, "status": "paused", "reason": "已暂停，可从当前检查点继续。"})
+            try:
+                return _public({**state, **_deliver_current(work, source, source_root, state, index, notify)})
+            except Exception as delivery_error:
+                exc = delivery_error
         detail = str(exc)
         key = settings.get("api_key")
         if key:

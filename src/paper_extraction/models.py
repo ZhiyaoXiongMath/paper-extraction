@@ -1,9 +1,11 @@
-"""Typed contracts for local models and the two OpenAI-compatible providers."""
+"""Typed contracts and adapters for the workbench's model providers."""
 from __future__ import annotations
 
 import base64
 import json
+import re
 from typing import Literal, TypeVar
+from urllib.parse import urlparse
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -11,6 +13,7 @@ from openai import LengthFinishReasonError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, model_validator
 
 from .editorial import says_no_edit
+from .settings import DEFAULT_REASONING_EFFORT, chat_options
 
 Model = TypeVar("Model", bound=BaseModel)
 
@@ -36,6 +39,7 @@ class Group(BaseModel):
     definitions: list[str] = Field(max_length=2)
     theorem: str = Field(min_length=1)
     paragraph: str = ""
+    paragraph_position: Literal["before", "after"] = Field(default="after", description="Place the connecting paragraph before the group's definitions and theorem, or after the theorem")
 
 
 class Reference(BaseModel):
@@ -51,6 +55,7 @@ class EvidenceLink(BaseModel):
 class BlockReplacement(EvidenceLink):
     model_config = ConfigDict(extra="forbid")
     text: str = Field(min_length=1, description="Complete revised text of this existing block, including its citations")
+    paragraph_position: Literal["before", "after"] | None = Field(default=None, description="Optional new location for a group paragraph")
 
 
 class DraftPatch(BaseModel):
@@ -71,7 +76,10 @@ class DraftPatch(BaseModel):
         for row in self.replacements:
             target = targets[row.block_id]
             revised = " ".join(row.text.split())
-            if not revised or revised == " ".join(target["current_text"].split()):
+            if row.paragraph_position is not None and "paragraph_position" not in target:
+                raise ValueError("Only a result group's connecting paragraph can change position")
+            moved = row.paragraph_position is not None and row.paragraph_position != target.get("paragraph_position")
+            if not revised or (not moved and revised == " ".join(target["current_text"].split())):
                 raise ValueError(f"{row.block_id}: make the requested edit to the existing text")
             locations = set(row.evidence_ids)
             if not locations <= registered or not set(target["required_evidence_ids"]) <= locations:
@@ -88,7 +96,7 @@ class Draft(BaseModel):
     paragraph: str = Field(min_length=1)
     history: list[str] = Field(min_length=1, max_length=3)
     shared_definitions: list[str] = Field(max_length=2)
-    groups: list[Group] = Field(min_length=1, max_length=4)
+    groups: list[Group] = Field(min_length=1)
     references: list[Reference] = Field(min_length=1)
     evidence_links: list[EvidenceLink]
 
@@ -113,9 +121,15 @@ class Draft(BaseModel):
         return self
 
 
+class VisualLocation(BaseModel):
+    draft_field: str = Field(min_length=1)
+    issue: str = Field(min_length=1)
+
+
 class Review(BaseModel):
     passed: bool
     issues: list[str]
+    locations: list[VisualLocation] = Field(default_factory=list)
     @model_validator(mode="after")
     def require_consistency(self):
         if self.passed == bool(self.issues):
@@ -220,19 +234,46 @@ def _field_errors(exc, *, explain=True):
 
 
 
+class ReasoningChatOpenAI(ChatOpenAI):
+    """Keep provider reasoning only for replay in tool conversations."""
+
+    def _create_chat_result(self, response, generation_info=None):
+        result = super()._create_chat_result(response, generation_info)
+        raw = response if isinstance(response, dict) else response.model_dump(warnings=False)
+        for generation, choice in zip(result.generations, raw["choices"]):
+            reasoning = choice["message"].get("reasoning_content")
+            if isinstance(reasoning, str):
+                generation.message.additional_kwargs["reasoning_content"] = reasoning
+        return result
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        if payload.get("tools") and "messages" in payload:
+            for message, wire in zip(self._convert_input(input_).to_messages(), payload["messages"]):
+                if wire["role"] == "assistant" and "reasoning_content" in message.additional_kwargs:
+                    wire["reasoning_content"] = message.additional_kwargs["reasoning_content"]
+        return payload
+
+
 class Models:
     def __init__(self, settings: dict):
         if not settings.get("api_key"):
             raise ValueError("The selected provider requires an API key in the local configuration")
-        opts = {
-            "api_key": settings["api_key"], "base_url": settings["base_url"],
-            "timeout": settings.get("timeout", 120), "max_retries": 2,
-        }
+        timeout = settings.get("timeout", 120)
         self.provider = settings["provider"].lower()
-        if self.provider in {"deepseek", "zhipu", "glm"}:
-            opts["extra_body"] = {"thinking": {"type": "disabled"}}
-        self.text = ChatOpenAI(model=settings["text_model"], **opts)
-        self.vision = ChatOpenAI(model=settings["vision_model"], **opts)
+        text_options = chat_options(settings, "text", timeout=timeout, max_retries=2)
+        text_client = ReasoningChatOpenAI if "extra_body" in text_options else ChatOpenAI
+        self.text = text_client(**text_options)
+        self.vision = ChatOpenAI(**chat_options(settings, "vision", timeout=timeout, max_retries=2))
+        self.tool_model = self.text
+        if (self.provider == "openai" and urlparse(settings["base_url"]).hostname == "api.openai.com"
+                and re.match(r"^gpt-6\.2-(?:sol|astra)(?:-|$)", settings["text_model"])):
+            # Official GPT-6.2 requires Responses for function calls. Replay encrypted reasoning
+            # with the tool output instead of requiring server-side conversation state.
+            self.tool_model = self.text.model_copy(update={
+                "use_responses_api": True, "store": False, "include": ["reasoning.encrypted_content"],
+                "reasoning_effort": settings.get("text_reasoning_effort", DEFAULT_REASONING_EFFORT),
+            })
 
     def structured(self, schema: type[Model], instructions: str, payload,
                    image: bytes | None = None) -> Model:

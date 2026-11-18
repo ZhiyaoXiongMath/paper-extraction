@@ -1,3 +1,7 @@
+export type ModelMode = "text" | "vision";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max";
+export type ReasoningSettings = Partial<Record<ModelMode, { effort: ReasoningEffort | null; choices: ReasoningEffort[] }>>;
+
 export interface Provider {
   id: string;
   label: string;
@@ -5,6 +9,7 @@ export interface Provider {
   key_env: string;
   text_model: string;
   vision_model: string;
+  reasoning?: ReasoningSettings;
 }
 export interface Config {
   providers: Provider[];
@@ -27,9 +32,11 @@ export interface ImportPreview {
 }
 export interface BatchSummary {
   id: string;
+  name?: string | null;
   created_at: string;
   provider: string;
   counts: Record<string, number>;
+  batch_pause?: { pausing?: number; paused?: number };
   total: number;
 }
 export interface Candidate {
@@ -89,6 +96,7 @@ export interface DraftGroup {
   definitions: string[];
   theorem: string;
   paragraph?: string;
+  paragraph_position?: "before" | "after";
 }
 export interface Draft {
   title: string;
@@ -100,13 +108,32 @@ export interface Draft {
   references: { key: string; text: string }[];
   evidence_links?: EvidenceLink[];
 }
+export interface DraftArtifact {
+  attempt: number;
+  work_attempt: number;
+  round: number;
+  draft_sha256: string;
+  files: { tex?: { url: string; sha256: string }; pdf?: { url: string; sha256: string } };
+  restored: boolean;
+  recompiled?: boolean;
+  attempt_status?: string;
+  attempt_reason?: string;
+  current: boolean;
+}
 export interface Paper {
+  attempt?: number;
+  draft_artifacts?: DraftArtifact[];
   id: string;
   name: string;
   kind: string;
   status: string;
   stage: string;
   reason?: string;
+  delivery?: {
+    status: "reviewed" | "delivered";
+    note?: string;
+    draft_round?: number;
+  };
   draft?: Draft;
   links?: EvidenceLink[];
   candidates: Candidate[];

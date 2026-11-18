@@ -1,6 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { metrics, readBlocks, terminal, paperOutcome } from "./format.js";
+import { canDeleteBatch, metrics, readBlocks, terminal, paperOutcome } from "./format.js";
+
+test("single-batch deletion accepts paused papers and waits for active papers to pause", () => {
+  for (const counts of [{ paused: 3 }, { completed: 1, paused: 2 }, { paused: 1, failed: 1, cancelled: 1 }]) {
+    assert.equal(canDeleteBatch({ total: 3, counts }), true);
+    assert.equal(canDeleteBatch({ total: 3, counts }, false), false);
+  }
+  for (const status of ["queued", "running", "pausing"]) {
+    assert.equal(canDeleteBatch({ total: 3, counts: { paused: 2, [status]: 1 } }), false);
+  }
+  assert.equal(canDeleteBatch({ total: 3, counts: { completed: 3 } }, false), true);
+});
 
 test("counts queued, running, accepted and failed independently", () => {
   assert.deepEqual(
@@ -45,6 +56,16 @@ test("a generated draft names the check that actually stopped", () => {
   };
   assert.equal(paperOutcome(task).title, "编译与版式检查未完成");
   assert.equal(paperOutcome(task).initialTab, "checks");
+});
+test("delivered papers open the reader regardless of a previous review failure", () => {
+  const task = {
+    status: "completed",
+    draft: { paragraph: "Let X be compact." },
+    reviews: [{ stage: "review", passed: false }],
+  };
+  assert.equal(paperOutcome({ ...task, delivery: { status: "delivered" } }).title, "已交付");
+  assert.equal(paperOutcome({ ...task, delivery: { status: "delivered" } }).initialTab, "reader");
+  assert.equal(paperOutcome({ ...task, delivery: { status: "reviewed" } }).title, "已交付 · 已通过检查");
 });
 test("reader block ids preserve the source evidence links", () => {
   const blocks = readBlocks({

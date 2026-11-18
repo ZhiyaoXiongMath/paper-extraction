@@ -39,7 +39,7 @@ def _saved_editorial_state(state, locations):
         return False
     current = [c for c in selected if c.get("kind") in {"current", "application"}]
     groups = {c.get("scope_group_id") or c.get("candidate_id") or i for i, c in enumerate(current)}
-    if not 1 <= len(groups) <= 4:
+    if not groups:
         return False
     return (all(c.get("candidate_id") and c.get("evidence_ids") and set(c["evidence_ids"]) <= locations for c in selected)
             and all(set(link.evidence_ids) <= locations for link in draft.evidence_links))

@@ -2,6 +2,8 @@ const statuses = {
   queued: ["排队", "neutral"],
   pending: ["排队中", "neutral"],
   running: ["处理中", "working"],
+  pausing: ["正在暂停", "working"],
+  paused: ["已暂停", "neutral"],
   processing: ["运行中", "working"],
   passed: ["已通过", "good"],
   accepted: ["已通过", "good"],
@@ -14,11 +16,14 @@ const statuses = {
   partial: ["证据不足", "bad"],
   blocked: ["已阻断", "bad"],
   stopped: ["已停止", "bad"],
-  cancelled: ["已取消", "bad"],
+  cancelled: ["已终止", "bad"],
   canceled: ["已取消", "bad"],
 };
 const stages = {
   queued: "等待运行",
+  pausing: "正在暂停",
+  paused: "已暂停",
+  cancelled: "已终止",
   start: "启动任务",
   ingest: "建立来源索引",
   index: "建立来源索引",
@@ -42,6 +47,10 @@ export const label = (status) => statuses[status]?.[0] ?? status ?? "—";
 export const tone = (status) => statuses[status]?.[1] ?? "neutral";
 export const terminal = (status) => ["bad", "good"].includes(tone(status));
 export const stageName = (stage) => stages[stage] ?? stage ?? "—";
+export function canDeleteBatch({ counts, total }, allowPaused = true) {
+  const finished = (counts.completed ?? 0) + (counts.failed ?? 0) + (counts.cancelled ?? 0);
+  return finished + (allowPaused ? counts.paused ?? 0 : 0) === total;
+}
 export function paperOutcome(paper) {
   const hasDraft = readBlocks(paper.draft || {}).some((block) =>
     block.text?.trim(),
@@ -59,6 +68,11 @@ export function paperOutcome(paper) {
         : "reader"
       : sourceTab,
   };
+  if (paper.status === "cancelled") return { ...base, title: "已终止" };
+  if (paper.status === "completed" && paper.delivery) {
+    const reviewed = paper.delivery.status === "reviewed";
+    return { ...base, title: reviewed ? "已交付 · 已通过检查" : "已交付" };
+  }
   if (!failed) return base;
   const lastStage = [...(paper.events || [])]
     .reverse()
@@ -121,6 +135,10 @@ export function metrics(batches) {
   for (const batch of batches) {
     result.total += Number(batch.total || 0);
     for (const [status, count] of Object.entries(batch.counts || {})) {
+      if (status === "paused" || status === "cancelled") {
+        result[status] = (result[status] || 0) + Number(count || 0);
+        continue;
+      }
       if (Object.hasOwn(statuses, status))
         result[groups[tone(status)]] += Number(count || 0);
     }
@@ -179,11 +197,12 @@ export function readBlocks(draft = {}) {
   );
   (draft.groups || []).forEach((g, i) => {
     const base = "groups." + i + ".";
+    if (g.paragraph_position === "before") add(base + "paragraph", "", g.paragraph);
     (g.definitions || []).forEach((s, j) =>
       add(base + "definitions." + j, "Definition " + ++n, s),
     );
     add(base + "theorem", "Theorem " + (i + 1), g.theorem);
-    add(base + "paragraph", "", g.paragraph);
+    if (g.paragraph_position !== "before") add(base + "paragraph", "", g.paragraph);
   });
   return blocks;
 }

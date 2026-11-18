@@ -181,6 +181,14 @@ def test_full_batch_with_loopback_model_fixture(tmp_path, monkeypatch):
             assert result["file"] == "sections/criterion.tex" and r"\label{thm:criterion}" in result["text"]
             pdf = client.get(f"/api/papers/{pid}/artifacts/introduction.pdf")
             assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF")
+            assert pdf.headers["content-disposition"] == 'inline; filename="main-extraction.pdf"'
+            tex = client.get(f"/api/papers/{pid}/artifacts/introduction.tex")
+            assert tex.headers["content-disposition"] == 'inline; filename="main-extraction.tex"'
+            assert b"\\documentclass" in tex.content and b"\\input{preamble-v13.tex}" not in tex.content
+            with ZipFile(io.BytesIO(client.get(f"/api/papers/{pid}/download").content)) as archive:
+                assert set(archive.namelist()) == {"main-extraction.tex", "main-extraction.pdf"}
+                assert archive.read("main-extraction.tex") == tex.content
+                assert archive.read("main-extraction.pdf") == pdf.content
             success = next((tmp_path / "runs" / bid / pid).rglob("build-status.json"))
             status = json.loads(success.read_text(encoding="utf-8"))
             assert status["input_binding_checked"] and status["engineering_accepted"]
@@ -190,6 +198,6 @@ def test_full_batch_with_loopback_model_fixture(tmp_path, monkeypatch):
                 manifest = json.loads(archive.read("manifest.json"))
                 assert {p["status"] for p in manifest["papers"]} == {"completed", "failed"}
                 assert {Path(n).name for n in archive.namelist()} == {
-                    "manifest.json", "introduction.tex", "introduction.pdf", "preamble-v13.tex",
+                    "manifest.json", "main-extraction.tex", "main-extraction.pdf",
                 }
 

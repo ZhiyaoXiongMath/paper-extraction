@@ -8,6 +8,7 @@ export function paperOutcome(paper: Paper): {
 export function label(status?: string): string;
 export function tone(status?: string): string;
 export function terminal(status?: string): boolean;
+export function canDeleteBatch(batch: BatchSummary, allowPaused?: boolean): boolean;
 export function eventSummary(event: {
   stage: string;
   data: Record<string, unknown>;
@@ -20,6 +21,8 @@ export function metrics(batches: BatchSummary[]): {
   running: number;
   completed: number;
   failed: number;
+  paused?: number;
+  cancelled?: number;
 };
 export function formatDate(v?: string): string;
 export function shortId(s?: string): string;

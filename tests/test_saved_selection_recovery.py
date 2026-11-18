@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from paper_extraction.saved_selection_recovery import saved_selection_recovery
-from paper_extraction.selection import SELECTION_VERSION, candidate_register, exclusion_notes, selection_packet
+from paper_extraction.selection import SELECTION_VERSION, candidate_register, review_navigator, selection_packet
 from test_whole_selection import finding
 
 
@@ -91,7 +91,7 @@ def test_under_budget_selector_receives_candidate_sources_without_prior_exclusio
     assert {"p1", "p2", "p4"} <= {p["id"] for p in packet["passages"]}
     assert "original_uses" not in packet and "decision_reason" not in packet["candidate_register"][0]
     rows[0].update(decision="excluded", decision_reason="The source iterates this local step to establish Theorem 1.1.")
-    notes = exclusion_notes(rows)
-    assert len(notes) == 1 and notes[0]["reason"] == rows[0]["decision_reason"]
-    assert notes[0]["observations"][0]["label"] == "Proposition 3.1"
+    locations = review_navigator(rows)
+    assert [r["source_number"] for r in locations] == ["Proposition 3.1", "Theorem 1.1"]
+    assert all(set(r) == {"candidate_id", "source_number", "evidence_ids"} for r in locations)
 

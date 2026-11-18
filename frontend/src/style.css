@@ -531,6 +531,17 @@ td small {
   display: block;
   margin-top: 5px;
 }
+.batch-title { overflow-wrap: anywhere; }
+.batch-record-table th:first-child { width: clamp(10rem, 18%, 16rem); }
+.batch-name-cell { width: 100%; max-width: 16rem; min-height: 34px; }
+.batch-delete-action .btn { padding-inline: 10px; }
+.batch-delete-action small { text-align: center; color: var(--muted); }
+.batch-name-link { display: flex; align-items: baseline; gap: 8px; color: var(--ink); text-decoration: none; }
+.batch-name-link:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.named-batch { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.unnamed-batch { color: var(--muted); }
+.batch-code { color: #68786d; font-size: 11px; }
+.batch-heading-editor { min-height: 40px; }
 .progress {
   width: 96px;
   height: 4px;
@@ -587,7 +598,7 @@ td small {
   font: inherit;
   color: inherit;
 }
-.control select {
+.control select, .control input {
   border: 1px solid #cdd7ce;
   border-radius: 5px;
   background: white;
@@ -985,4 +996,37 @@ td small {
 }
 .timeline summary {
   cursor: pointer;
+}
+.history-actions, .row-batch-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.history-actions { flex-wrap: wrap; }
+.history-clear { min-height: 32px; padding: 6px 10px; }
+.history-delete:hover, .history-clear:hover:not(:disabled) {
+  color: #942e23;
+  border-color: #dbb5ae;
+  background: #fff7f4;
+}
+.delete-history-dialog {
+  width: min(420px, calc(100vw - 32px));
+  margin: auto;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: white;
+  color: var(--ink);
+  box-shadow: 0 18px 64px #172e232b;
+}
+.delete-history-dialog::backdrop { background: #16271f68; }
+.delete-history-dialog h2 { margin-bottom: 12px; }
+.delete-history-dialog p { overflow-wrap: anywhere; line-height: 1.65; }
+.dialog-actions { margin-top: 20px; }
+.btn.destructive { border-color: #923829; background: #923829; color: white; }
+.btn.destructive:hover { background: #782c20; }
+@media (max-width: 650px) {
+  .page-title:has(.history-actions) { flex-wrap: wrap; }
+  .panel-head:has(.history-clear) { flex-wrap: wrap; }
 }

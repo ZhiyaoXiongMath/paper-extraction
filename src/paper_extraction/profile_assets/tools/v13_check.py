@@ -23,6 +23,15 @@ from pathlib import Path
 from typing import Any
 
 RELEASE = 'intro-v13.0.0-rc1-20261023'
+UNLIMITED_CURRENT_RELEASE = RELEASE + '-unlimited-current'
+EXPANDED_RELEASE = RELEASE + '-reader'
+EXPANDED_GROUP_HEIGHT = 32
+EXPANDED_PROSE_HEIGHT = 40
+EXPANDED_SHARED_HEIGHT = 20
+EXPANDED_BODY_PAGES = 5
+# Windows TeX and local filesystem helpers need room for the per-build artifact receipt.
+WINDOWS_FILE_PATH_LIMIT = 259
+CASE_ARTIFACT_PATH_LENGTH = len('/draft-artifacts/' + ('0' * 32) + '/introduction.tex')
 FILES = ('intro-rules-v13.txt', 'preamble-v13.tex', 'template-v13.tex', 'prompt-v13.txt')
 TOOL = 'tools/v13_check.py'
 HASH = re.compile(r'^[0-9a-f]{64}$')
@@ -59,7 +68,7 @@ def atomic_json(path: Path, value: dict[str, Any]) -> None:
     tmp: str | None = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
-                                         prefix='.' + path.name + '-', delete=False) as f:
+                                         prefix='.', delete=False) as f:
             tmp = f.name
             json.dump(value, f, ensure_ascii=False, indent=2, allow_nan=False)
             f.write('\n')
@@ -116,13 +125,18 @@ def verify(root: Path) -> dict[str, Any]:
         require(digest(path) == h, f'Hash mismatch: {name}')
         expected[name] = h
     require(set(FILES + (TOOL,)).issubset(expected), 'Manifest must bind four companions and checker')
+    release = None
     for name in FILES:
         text = (root / name).read_text(encoding='utf-8')
-        require(RELEASE in text, f'Release identity missing: {name}')
+        header = re.search(r'^%? ?Release: ([a-z0-9.-]+)\s*$', text, re.M)
+        require(header is not None and header[1] in {RELEASE, UNLIMITED_CURRENT_RELEASE, EXPANDED_RELEASE},
+                f'Release identity missing: {name}')
+        release = release or header[1]
+        require(header[1] == release, f'Mixed releases: {name}')
         require(re.search(r'(?:preamble|intro-rules|template|prompt)-v(?:9|10|11|12)\.', text) is None,
                 f'Old companion reference: {name}')
     require(digest(Path(__file__)) == expected[TOOL], 'Executed checker differs from release checker')
-    return {'release': RELEASE, 'rules_root': str(root),
+    return {'release': release, 'rules_root': str(root),
             'sha256': {name: expected[name] for name in FILES},
             'checker_sha256': expected[TOOL], 'verified_release_files': len(expected)}
 
@@ -174,7 +188,16 @@ def allocate(root: Path, source: Path, output_root: Path, case_id: str | None = 
     if source_root is not None:
         require(not output_root.is_relative_to(Path(snap['root'])),
                 'Output root must not be inside the frozen source package')
-    stem = f'{slug(case_id or source.stem)}--{snap["sha256"][:12]}'
+    name = slug(case_id or source.stem)
+    suffix = f'--{snap["sha256"][:12]}'
+    if os.name == 'nt':
+        # Python may allow longer paths than the toolchain. Count UTF-16 units,
+        # retaining the source fingerprint and room for atomic run-name collisions.
+        root_length = len(os.fspath(output_root).encode('utf-16-le')) // 2
+        available = WINDOWS_FILE_PATH_LIMIT - root_length - 1 - len(suffix) - len('--run-000') - CASE_ARTIFACT_PATH_LENGTH
+        require(available > 0, 'Windows build path is too long. Shorten PAPER_EXTRACTION_HOME.')
+        name = name[:available].rstrip('.-_')
+    stem = name + suffix
     output_root.mkdir(parents=True, exist_ok=True)
     run = 1
     while True:
@@ -186,7 +209,7 @@ def allocate(root: Path, source: Path, output_root: Path, case_id: str | None = 
             run += 1
     try:
         shutil.copy2(root / 'preamble-v13.tex', out / 'preamble-v13.tex')
-        binding = {'schema_version': 2, 'release': RELEASE, 'source': str(source),
+        binding = {'schema_version': 2, 'release': info['release'], 'source': str(source),
                    'source_sha256': digest(source), 'snapshot': snap,
                    'rules_sha256': info['sha256'], 'checker_sha256': info['checker_sha256'],
                    'case_id': case_id or source.stem, 'output_directory': str(out),
@@ -240,7 +263,7 @@ def check_binding(root_info: dict[str, Any], case: Path) -> dict[str, Any]:
     path = case / 'input-manifest.json'
     require(path.is_file(), 'Regression build requires input-manifest.json; allocate or explicitly use compile-only')
     binding = validate_binding_schema(json.loads(path.read_text(encoding='utf-8')))
-    require(binding['release'] == RELEASE, 'Bound release mismatch')
+    require(binding['release'] == root_info['release'], 'Bound release mismatch')
     require(Path(binding['output_directory']).resolve() == case, 'Binding belongs to a different output directory')
     require(binding['rules_sha256'] == root_info['sha256'], 'Bound companion files changed')
     require(binding['checker_sha256'] == root_info['checker_sha256'], 'Bound checker changed')
@@ -315,7 +338,7 @@ def aux_page(aux: str, name: str) -> int | None:
     return int(matches[0]) if len(matches) == 1 else None
 
 
-def inspect_pdf(pdf: Path, aux: str, tex: str) -> dict[str, Any]:
+def inspect_pdf(pdf: Path, aux: str, tex: str, *, max_body_pages: int = 3) -> dict[str, Any]:
     import pypdfium2 as pdfium
     import pypdfium2.raw as raw
     start = aux_page(aux, 'intro:references-start')
@@ -393,8 +416,9 @@ def inspect_pdf(pdf: Path, aux: str, tex: str) -> dict[str, Any]:
                 'reference_headings': headings, 'bibliography_located': bool(located),
                 'references_separate': separate, 'body_before_references': before,
                 'graphics_before_references': graphics_before,
-                'main_text_pages': body_pages,
-                'three_page_limit': body_pages is not None and 1 <= body_pages <= 3}
+                'main_text_pages': body_pages, 'max_body_pages': max_body_pages,
+                'three_page_limit': body_pages is not None and 1 <= body_pages <= 3,
+                'body_page_limit': body_pages is not None and 1 <= body_pages <= max_body_pages}
 
 
 
@@ -405,6 +429,12 @@ BLOCK_LIMITS = {
     'theorem': {'kind': 'T', 'words': 100, 'units': 12, 'displays': 2, 'rows': 3},
     'definition': {'kind': 'D', 'words': 65, 'units': 7, 'displays': 2, 'rows': 3},
     'introparagraph': {'kind': 'P', 'words': 45, 'units': 4, 'displays': 0, 'rows': 0},
+}
+EXPANDED_BLOCK_LIMITS = {
+    'historical': {'kind': 'H', 'words': 100, 'units': 11, 'displays': 1, 'rows': 3},
+    'theorem': {'kind': 'T', 'words': 140, 'units': 16, 'displays': 2, 'rows': 4},
+    'definition': {'kind': 'D', 'words': 90, 'units': 10, 'displays': 2, 'rows': 4},
+    'introparagraph': {'kind': 'P', 'words': 100, 'units': 8, 'displays': 0, 'rows': 0},
 }
 
 
@@ -495,16 +525,24 @@ def source_rows(body: str) -> list[str]:
     return [row.strip() for row in rows if row.strip()]
 
 
-def format_contract(tex: str, log: str, pdf: Path) -> dict[str, Any]:
+def format_contract(tex: str, log: str, pdf: Path, *, max_current: int | None = 4,
+                    release: str = RELEASE) -> dict[str, Any]:
+    expanded = release == EXPANDED_RELEASE
+    block_limits = EXPANDED_BLOCK_LIMITS if expanded else BLOCK_LIMITS
+    max_display_rows = 4 if expanded else 3
+    group_height = EXPANDED_GROUP_HEIGHT if expanded else 22
+    if release in {UNLIMITED_CURRENT_RELEASE, EXPANDED_RELEASE}:
+        max_current = None
     text = active_tex(tex)
     errors: list[str] = []
+    advisories: list[str] = []
     match = re.search(r'\\begin\{document\}(.*?)\\begin\{thebibliography\}', text, re.S)
     if not match:
         return {'accepted': False, 'errors': ['body_or_bibliography_missing']}
     body = match.group(1)
     nodes, parse_errors = environment_nodes(body)
     errors.extend(parse_errors)
-    allowed = set(BLOCK_LIMITS) | {'resultgroup', 'conditions', 'relations', 'aligned', 'cases', 'enumerate', 'matrix', 'pmatrix', 'bmatrix'}
+    allowed = set(block_limits) | {'resultgroup', 'conditions', 'relations', 'aligned', 'cases', 'enumerate', 'matrix', 'pmatrix', 'bmatrix'}
     for node in nodes:
         if node['name'] not in allowed:
             errors.append('unsupported_environment:' + node['name'])
@@ -542,7 +580,7 @@ def format_contract(tex: str, log: str, pdf: Path) -> dict[str, Any]:
     if stray(remaining):
         errors.append('unmeasured_body_text')
     blocks = []
-    counts = {name: 0 for name in BLOCK_LIMITS}
+    counts = {name: 0 for name in block_limits}
     first_current = min((n['start'] for n in nodes if n['name'] == 'theorem'), default=None)
     for node in nodes:
         name = node['name']
@@ -560,7 +598,7 @@ def format_contract(tex: str, log: str, pdf: Path) -> dict[str, Any]:
                 errors.append('resultgroup_requires_exactly_one_theorem')
             if sum(n['name'] == 'definition' for n in children) > 2:
                 errors.append('too_many_dedicated_definitions')
-        if name not in BLOCK_LIMITS:
+        if name not in block_limits:
             continue
         if node['parent'] is not None and node['parent']['name'] != 'resultgroup':
             errors.append('nested_measured_block:' + name)
@@ -580,9 +618,12 @@ def format_contract(tex: str, log: str, pdf: Path) -> dict[str, Any]:
         nw = prose_words(payload)
         displays = display_bodies(payload)
         nr = sum(len(source_rows(x)) for _, x in displays)
-        cap = BLOCK_LIMITS[name]
+        cap = block_limits[name]
         if nw > cap['words']:
-            errors.append(f'{name}_{counts[name]}_word_limit:{nw}>{cap["words"]}')
+            if expanded:
+                advisories.append(f'{name}_{counts[name]}_word_target:{nw}>{cap["words"]}')
+            else:
+                errors.append(f'{name}_{counts[name]}_word_limit:{nw}>{cap["words"]}')
         if len(displays) > cap['displays'] or nr > cap['rows']:
             errors.append(f'{name}_{counts[name]}_display_budget')
         if prose_words(caption) > 12:
@@ -591,8 +632,8 @@ def format_contract(tex: str, log: str, pdf: Path) -> dict[str, Any]:
         if name != 'introparagraph' and not re.search(r'\\cite\b', caption + payload):
             errors.append(f'{name}_{counts[name]}_missing_source_locator')
         for display_kind, formula in displays:
-            if len(source_rows(formula)) > 3:
-                errors.append('display_more_than_three_source_rows')
+            if len(source_rows(formula)) > max_display_rows:
+                errors.append('display_more_than_four_source_rows' if expanded else 'display_more_than_three_source_rows')
             if display_kind == 'conditions':
                 if any(not row.startswith('&') or len(re.findall(r'(?<!\\)&', row)) != 1 for row in source_rows(formula)):
                     errors.append('independent_conditions_must_share_left_edge')
@@ -601,14 +642,16 @@ def format_contract(tex: str, log: str, pdf: Path) -> dict[str, Any]:
                     errors.append('relation_chain_requires_one_anchor_per_row')
             elif re.search(r'\\begin\{aligned\}', formula):
                 errors.append('use_conditions_or_relations_for_multiline')
-            if re.search(r'\\(?:hfill|hspace|quad|qquad)\b.*\\(?:quad|qquad|hfill|hspace)\b', formula, re.S):
-                errors.append('manually_stretched_formula')
+            if (re.search(r'\\(?:hfill|hspace)\b', formula)
+                    or re.search(r'\\q(?:uad|quad)\b(?:\s|\{\})*\\q(?:uad|quad)\b', formula)):
+                # A connective or hypothesis may have ordinary math spacing on both sides.
+                errors.append(f'{name}_{counts[name]}_manual_spacing')
         blocks.append({'environment': name, 'number': counts[name], 'prose_words': nw,
                        'display_groups': len(displays), 'display_source_rows': nr})
     if not 1 <= counts['historical'] <= 3:
         errors.append('historical_count_must_be_1_to_3')
-    if not 1 <= counts['theorem'] <= 4:
-        errors.append('current_count_must_be_1_to_4')
+    if counts['theorem'] < 1 or (max_current is not None and counts['theorem'] > max_current):
+        errors.append('current_count_must_be_at_least_1' if max_current is None else f'current_count_must_be_1_to_{max_current}')
     if counts['definition'] > 6:
         errors.append('definition_count_exceeds_6')
     telemetry = []
@@ -622,19 +665,26 @@ def format_contract(tex: str, log: str, pdf: Path) -> dict[str, Any]:
         errors.append('missing_or_inconsistent_measurement_telemetry')
     else:
         for block, measure in zip(blocks, telemetry):
-            cap = BLOCK_LIMITS[block['environment']]
+            cap = block_limits[block['environment']]
             if measure['kind'] != cap['kind'] or measure['limit_sp'] != unit * cap['units']:
                 errors.append('measurement_identity_or_limit_mismatch')
             if measure['height_sp'] > measure['limit_sp']:
                 errors.append('rendered_block_height_exceeded')
             block['height_units'] = round(measure['height_sp'] / unit, 3)
             block['height_limit_units'] = cap['units']
+        if expanded:
+            prose_height = sum(m['height_sp'] for m in telemetry if m['kind'] == 'P')
+            shared_height = sum(m['height_sp'] for m in telemetry if m['kind'] == 'D' and m['group'] == 0)
+            if prose_height > EXPANDED_PROSE_HEIGHT * unit:
+                errors.append('rendered_total_prose_height_exceeded')
+            if shared_height > EXPANDED_SHARED_HEIGHT * unit:
+                errors.append('rendered_shared_definitions_height_exceeded')
     groups = []
     for m in re.finditer(r'^INTRO-GROUP\|(\d+)\|(\d+)\|(\d+)\|(\d+)\|(\d+)\s*$', log, re.M):
         index, height, limit, theorems, definitions = map(int, m.groups())
         groups.append({'group': index, 'height_units': round(height/unit, 3) if unit else None,
-                       'height_limit_units': 22, 'theorems': theorems, 'definitions': definitions})
-        if not unit or limit != 22 * unit or height > limit or theorems != 1 or definitions > 2:
+                       'height_limit_units': group_height, 'theorems': theorems, 'definitions': definitions})
+        if not unit or limit != group_height * unit or height > limit or theorems != 1 or definitions > 2:
             errors.append('resultgroup_measurement_failed')
     if len(groups) != counts['theorem']:
         errors.append('resultgroup_telemetry_missing')
@@ -650,14 +700,16 @@ def format_contract(tex: str, log: str, pdf: Path) -> dict[str, Any]:
                 page.close()
         visible = '\n'.join(chunks)
         for i in range(1, counts['theorem'] + 1):
-            if not re.search(r'Theorem\s+' + str(i) + r'(?![\d.])', visible):
+            # A theorem without a caption prints "Theorem 1.". Reject decimal
+            # prefixes such as "Theorem 1.2", not a heading's final period.
+            if not re.search(r'Theorem\s+' + str(i) + r'(?!\d|\.\d)', visible):
                 errors.append('flat_current_heading_missing:' + str(i))
         for i in range(counts['historical']):
             if not re.search(r'Theorem\s+' + chr(65 + i) + r'\b', visible):
                 errors.append('historical_heading_missing:' + chr(65+i))
     except Exception as exc:
         errors.append('heading_inspection_unavailable:' + type(exc).__name__)
-    return {'accepted': not errors, 'errors': list(dict.fromkeys(errors)), 'counts': counts,
+    return {'accepted': not errors, 'errors': list(dict.fromkeys(errors)), 'advisories': advisories, 'counts': counts,
             'unit_tex_pt': unit/65536 if unit else None, 'blocks': blocks, 'groups': groups,
             'meaning_and_tier_judgment': 'not_automatically_certified'}
 
@@ -669,6 +721,9 @@ def run_compiler(command: list[str], case: Path, timeout: float) -> subprocess.C
 
 def _build(root: Path, case: Path, mode: str, timeout: float, state: dict[str, Any]) -> None:
     info = verify(root)
+    state['release'] = info['release']
+    expanded = info['release'] == EXPANDED_RELEASE
+    state['current_theorem_limit'] = 4 if info['release'] == RELEASE else None
     src, local = case / 'introduction.tex', case / 'preamble-v13.tex'
     require(src.is_file(), f'Missing generated source: {src}')
     require(local.is_file() and digest(local) == info['sha256']['preamble-v13.tex'],
@@ -718,11 +773,11 @@ def _build(root: Path, case: Path, mode: str, timeout: float, state: dict[str, A
     profiles = recorded_profiles(fls, case)
     state['recorded_preambles'] = profiles
     state['release_assertion_match'] = bool(re.search(r'^INTRO-RELEASE-CHECK: MATCH\s*$', log, re.M))
-    state['profile_identity_match'] = f'INTRO-PROFILE-RELEASE: {RELEASE}' in log
+    state['profile_identity_match'] = bool(re.search(rf'^INTRO-PROFILE-RELEASE: {re.escape(info["release"])}\s*$', log, re.M))
     state['local_profile_used'] = profiles == [str(local.resolve())]
     state['placeholder_hits'] = [p for p in PLACEHOLDERS if p in active_tex(tex)]
     aux = (case / 'introduction.aux').read_text(errors='replace')
-    page_info = inspect_pdf(pdf, aux, tex)
+    page_info = inspect_pdf(pdf, aux, tex, max_body_pages=EXPANDED_BODY_PAGES if expanded else 3)
     state.update(page_info)
     checks = {'release_assertion_match': state['release_assertion_match'],
               'profile_identity_match': state['profile_identity_match'],
@@ -731,9 +786,9 @@ def _build(root: Path, case: Path, mode: str, timeout: float, state: dict[str, A
               'no_scaffold_placeholders': not state['placeholder_hits'],
               'a4': state['a4'], 'bibliography_located': state['bibliography_located'],
               'references_separate': state['references_separate'],
-              'three_page_limit': state['three_page_limit'],
+              ('body_page_limit' if expanded else 'three_page_limit'): state['body_page_limit'],
               'input_binding_required_and_valid': mode == 'compile-only' or state['input_binding_checked']}
-    state['format_contract'] = format_contract(tex, log, pdf)
+    state['format_contract'] = format_contract(tex, log, pdf, max_current=state['current_theorem_limit'], release=info['release'])
     checks['v13_reader_format_contract'] = state['format_contract']['accepted']
     state['checks'] = checks
     failed = [name for name, ok in checks.items() if not ok]
@@ -749,6 +804,48 @@ def clear_pdf(case: Path) -> None:
     pdf = case / 'introduction.pdf'
     if pdf.exists() or pdf.is_symlink():
         pdf.unlink()
+
+
+def save_diagnostic_artifacts(case: Path, state: dict[str, Any]) -> dict | None:
+    """Keep this compiler invocation's exact inputs and readable output independent of its verdict."""
+    import pypdfium2 as pdfium
+    expected = {
+        'introduction.tex': state.get('tex_sha256'),
+        'preamble-v13.tex': state.get('rules_sha256', {}).get('preamble-v13.tex'),
+    }
+    if not all(expected.values()):
+        return None
+    for name, sha in expected.items():
+        file = case / name
+        if file.is_symlink() or not file.is_file() or digest(file) != sha:
+            return None
+    pdf, pages = case / 'introduction.pdf', 0
+    if state.get('command') and pdf.is_file() and not pdf.is_symlink():
+        try:
+            with pdfium.PdfDocument(pdf) as document:
+                for page in document:
+                    try:
+                        bitmap = page.render(scale=0.25)
+                        bitmap.close()
+                    finally:
+                        page.close()
+                pages = len(document)
+        except (pdfium.PdfiumError, ValueError, OSError, RuntimeError):
+            pass  # Unreadable compiler output can never be registered as a PDF.
+        if pages:
+            expected['introduction.pdf'] = digest(pdf)
+    parent = case / 'draft-artifacts'
+    require(not parent.is_symlink(), 'Diagnostic output directory cannot be a symlink')
+    target = parent / state['run_id']
+    target.mkdir(parents=True, exist_ok=False)
+    for name, sha in expected.items():
+        shutil.copyfile(case / name, target / name)
+        require(digest(target / name) == sha, f'Diagnostic copy changed: {name}')
+    artifact = {'run_id': state['run_id'], 'directory': target.relative_to(case).as_posix(),
+                'files': expected, 'pages': pages,
+                'input_manifest_sha256': state.get('input_binding', {}).get('manifest_sha256')}
+    atomic_json(target / 'receipt.json', artifact)
+    return artifact
 
 
 def build(root: Path, case: Path, mode: str = 'regression', timeout: float = 60) -> dict[str, Any]:
@@ -800,6 +897,12 @@ def build(root: Path, case: Path, mode: str = 'regression', timeout: float = 60)
         code = 2
         state.update(state='failed', error=str(exc), error_type=type(exc).__name__)
     finally:
+        try:
+            artifacts = save_diagnostic_artifacts(case, state)
+            if artifacts is not None:
+                state['diagnostic_artifacts'] = artifacts
+        except (OSError, ValidationError) as exc:
+            state['artifact_capture_error'] = str(exc)
         if code:
             state['engineering_accepted'] = False
             state['regression_eligible'] = False
@@ -817,13 +920,16 @@ def build(root: Path, case: Path, mode: str = 'regression', timeout: float = 60)
             atomic_json(case / 'build-status.json', state)
         except Exception as exc:
             # Persistence itself can fail. Never return an accepted PDF in that case.
-            state = {'schema_version': 2, 'release': RELEASE, 'run_id': state['run_id'],
+            preserved_artifacts = state.get('diagnostic_artifacts')
+            state = {'schema_version': 2, 'release': state['release'], 'run_id': state['run_id'],
                      'case_directory': str(case), 'mode': mode, 'state': 'failed',
                      'compiled': bool(state.get('compiled')), 'engineering_accepted': False,
                      'regression_eligible': False, 'input_binding_checked': False,
                      'content_check': 'not_assessed_by_this_tool',
                      'visual_check': 'not_performed_by_this_tool', 'exit_code': 2,
                      'pdf_sha256': None, 'state_write_error': str(exc), 'finished_utc': utc()}
+            if preserved_artifacts is not None:
+                state['diagnostic_artifacts'] = preserved_artifacts
             try:
                 clear_pdf(case)
             except OSError as clean_error:

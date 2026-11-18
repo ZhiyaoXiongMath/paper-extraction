@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pypdfium2 as pdfium
 
+from .tex_citations import arxiv_id, bind_tex_locations
+
 _PDF_LOCK = threading.RLock()
 _RESOURCE = re.compile(
     r"\\(?P<cmd>input|include|subfile|bibliography|addbibresource|bibliographystyle|"
@@ -130,6 +132,7 @@ class SourceIndex:
         self.root = Path(source_root or self.source.parent).resolve()
         self.cache = Path(work) / "source-index.json"
         self._items = None
+        self.citation_metadata = {}
 
     def _pdf_entries(self):
         with _PDF_LOCK, pdfium.PdfDocument(self.source) as doc:
@@ -197,6 +200,11 @@ class SourceIndex:
                         reading = json.loads(sidecar.read_text("utf8"))
                         if reading.get("page") == item["page"] and reading.get("transcribed_from_image"):
                             item.update(reading)
+            if self.source.suffix.lower() == ".tex":
+                sources = ((path, uncomment(text)) for path, text in tex_documents(self.source, self.root))
+                self.citation_metadata = bind_tex_locations(self._items, self.source, self.root, sources)
+            elif identifier := arxiv_id(self.source.name):
+                self.citation_metadata = {"arxiv": identifier}
         return self._items
 
     def save_transcription(self, location: str, page: int, text: str):
