@@ -70,6 +70,8 @@ def test_old_empty_draft_recovers_scan_and_targets_history(tmp_path, monkeypatch
                 return WholePaperSelection.model_validate(selection_reply(
                     payload["candidate_register"], single_current=True))
             if schema is Findings:
+                rubric = agent.files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8")
+                assert instructions.startswith(rubric + "\n") and instructions.count(rubric) == 1
                 assert payload["missing_categories"] == ["historical"]
                 assert payload["passages"][0]["text"] == prior_page_reading
                 assert payload["passages"][0]["evidence_type"] == "machine_transcription"

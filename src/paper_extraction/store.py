@@ -52,14 +52,13 @@ def stale_selection_failure(result):
 
 def _selected_terminal(result):
     if (result.get("status") != "failed" or result.get("resumable") or not isinstance(result.get("draft"), dict)
-            or not result.get("reviews") or result.get("selection_version") not in {
-                SELECTION_VERSION, "v13-whole-paper-1"}):
+            or not result.get("reviews") or result.get("selection_version") != SELECTION_VERSION):
         return False
-    admitted = [c["kind"] for c in result.get("candidates", []) if c.get("decision") == "admitted"]
-    # Several attributable comparisons may be available. C1 allows the
-    # completed draft to choose among them, even if the register retains four.
-    return "historical" in admitted and 1 <= len(result["draft"].get("history", [])) <= 3 and 1 <= sum(
-        k in {"current", "application"} for k in admitted) <= 4
+    admitted = [c for c in result.get("candidates", []) if c.get("decision") == "admitted"]
+    current_groups = {c.get("scope_group_id") or c.get("candidate_id") or index
+                      for index, c in enumerate(admitted) if c["kind"] in {"current", "application"}}
+    return (any(c["kind"] == "historical" for c in admitted)
+            and 1 <= len(result["draft"].get("history", [])) <= 3 and 1 <= len(current_groups) <= 4)
 
 
 def legacy_confirmation_failure(result):

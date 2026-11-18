@@ -34,100 +34,27 @@ def confirmation_only(text: str) -> bool:
         not p or _NO_EDIT.fullmatch(p) or _CONFIRMATION_CLAUSE.fullmatch(p) for p in clauses)
 
 
-EXTRACTION_GUIDANCE = """Read the original as a mathematical editor. Identify the
-setting, exact title and ordered authors, substantive historical comparisons, and
-the paper's independent contributions and major applications. For each candidate
-separate its core assertion, necessary assumptions and definitions from proof
-devices and refinements. Admission requires a substantial solution of a central
-problem, a substantial independent theorem or an important independent consequence.
-Record the original label, attribution and location. A
-historical result may be stated indirectly in a comparison ("known when ..."):
-recover its objects, assumptions and conclusion from the surrounding source.
-Questions, predictions and statements that a question was emphasized belong to
-the motivation. Cite them as such. If the earlier theorem itself is missing, say
-which evidence is missing. Treat repeated formulations and proof restatements as
-evidence for the same candidate. Judge a separately sourced important consequence
-on its own mathematical content."""
+EXTRACTION_GUIDANCE = (
+    "For each entry in candidates, fill kind, source_number, claim, assumptions, dependencies, "
+    "significance, decision, decision_reason and evidence_ids. Copy evidence_ids from the supplied "
+    "source records. Use null for an unnumbered source statement. Record source uncertainties in uncertainties."
+)
 
-DRAFT_GUIDANCE = """Use the original v13 profile and write a selective English
-Introduction. State each selected core with exactly the hypotheses, parameter
-ranges, quantifiers, objects and strength it needs. Use the paper's exact title and
-all authors. Attribute historical statements as reported in this manuscript
-unless another source was supplied. A named problem is useful setting; a formal
-historical theorem needs a sourced mathematical assertion. Retain major
-independent applications, including the full parameter range of a selected
-existence consequence. A proof's witness, representative, computation of a
-constant or construction detail belongs in the statement only when the selected
-assertion depends on its specification. Use numbered definitions for genuine
-concepts, local TeX displays for essential formulas, and the original v13 block
-and page budgets. Give the source theorem, section or page supporting each formal
-block. A source theorem's own statement is an appropriate location. Use
-source-supported standard TeX expressions for paper-specific shorthand.
+DRAFT_GUIDANCE = (
+    "Populate the Draft fields title, authors, paragraph, history, shared_definitions, groups, "
+    "references and evidence_links. Use TeX fragments for block text. Use the key source for the "
+    "supplied paper. For each block, pair its block_id with registered evidence_ids. "
+    "The renderer supplies environments, numbering and bibliography items."
+)
 
-On repair, edit the affected JSON fields and their dependent citations or links.
-Preserve the other supported statements and their qualifiers. For a history
-block, give an earlier result with hypotheses and conclusion, and attribute it
-as reported in the supplied paper. Place a conjecture motivating the paper in
-the setting paragraph. References are key/text objects and history and groups
-are content fields. The renderer supplies their environments, headings, item
-commands, numbering and page breaks."""
+REVIEW_GUIDANCE = (
+    "Populate route, issues and evidence_ids. route names the next graph edge: pass, extract or draft. "
+    "For each reported issue, identify its draft_field and source evidence_id. Use current_excerpt and "
+    "source_excerpt for the corresponding passages, and required_change for the edit, referring to the "
+    "applicable v13 clause. Use operation and replacement_text to encode the proposed edit. "
+    "For pass, return empty issues and evidence_ids."
+)
 
-REVIEW_GUIDANCE = """Make one editorial decision on this whole draft using v13,
-especially A2–A3, B3–B6, C1, D5 and F2. Consult original passages for the title,
-authors, historical comparisons, main statements and independent applications.
-For a proposed omission, identify the independent question it resolves and the
-source evidence of its significance before requesting its inclusion. The
-extraction model's admission label alone does not establish editorial importance.
-Use additional read-only source tools when the relevant text crosses a passage
-boundary or a symbol, attribution or important hypothesis remains unclear.
-The candidate register is a reading aid. Decide what was actually established
-from the cited manuscript, including historical assertions it explicitly reports.
-
-Judge the selected assertion on its own terms. Check whether its scope is stated
-accurately, indispensable assumptions and definitions are present, and its
-conclusion preserves the paper's quantifiers, topology, parameters, normalization
-and strength. Accept a self-contained supported existence or dimension
-consequence without reconstructing the proof's representative, coefficient
-formula or witness. The location of the original statement suffices when it
-supports the selected claim. An alternative valid historical choice, a paraphrase
-or a different ordering within the profile can pass. Keep questions and earlier
-authors' emphasis distinct from theorems. A report of a manuscript, or earlier
-work described by the original, needs the corresponding attribution.
-
-Return one verdict on the CURRENT JSON draft. The history array already denotes
-formal historical blocks. References already denote bibliography items. TeX
-wrappers, headings, numbering and page breaks belong to the renderer. Review
-their mathematical content, citations and attribution here. A locator to the
-supplied paper which reports an earlier result is valid for indirect attribution.
-
-For each issue quote the decisive original wording at its registered location
-and the affected draft words, using an empty draft excerpt only for a genuine
-omission. Compare the whole current assertion, including its definitions and
-citations, with the selected source assertion. State exactly how the two differ
-and the smallest edit that repairs the difference. For a changed hypothesis or
-quantifier identify a case the two assertions treat differently, accounting for
-implications of the other hypotheses. If you cannot substantiate a discrepancy,
-leave it out of issues. An existing qualifier or locator needs no reminder.
-
-For a missing result, explain the independent question it resolves and the
-source evidence for its importance. If all four slots are occupied, identify
-a proof-only or lower-tier item to replace, or a genuine B6 scope conflict.
-For a missing detail, show why the selected assertion as written actually
-requires it. A possible strengthening, a proof of the consequence, an optional
-quantitative refinement of an earlier comparison, or a conjecture proposed for
-a history slot does not meet that test. Conversely, correct a conjecture actually
-presented as proved or a proof-only result taking an independent theorem slot.
-
-Pass when there are no substantiated defects. Route draft when existing evidence
-suffices to fix the affected fields. Route extract for a substantive missing or
-misclassified result needing further targeted source extraction, and supply the
-original location IDs. Read-only observations, candidate decisions and repair
-suggestions from earlier attempts are leads; the current draft and original are
-the evidence for this verdict. For a local correction, identify the operation
-and give the exact short replacement or insertion. Removal needs the precise
-existing excerpt. Use recover for a missing assertion whose original evidence
-still needs reading. A verified equivalent formulation belongs to the pass
-decision, with no defect entry."""
 
 _HISTORY = re.compile(
     r"\b(?:previously|earlier|formerly|classical|was known|known (?:when|under|for|in)|"

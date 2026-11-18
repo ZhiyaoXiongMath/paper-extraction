@@ -9,14 +9,8 @@ from .profile import bind_formal_citations, saved_build_targets
 
 WRITER_VERSION = "block-patch-v1"
 PATCH_GUIDANCE = (
-    "Revise only the blocks listed in repair_targets. Return their complete replacement text. "
-    "Resolve every listed edit against its quoted original passage, including exact mathematical "
-    "hypotheses and attribution. A proposed replacement_text can refer to a short excerpt rather "
-    "than the entire block. Retain the surrounding correct content, citations and original TeX "
-    "notation. Submit block content without environment wrappers or document commands. For layout "
-    "diagnostics preserve the mathematical statement while fitting the stated v13 limit. "
-    "Keep the original IDs supporting preserved claims, include each required correction ID, "
-    "and take any additional evidence from the supplied original passages."
+    "For each block_id in repair_targets, return one replacement with its complete revised text "
+    "and registered evidence_ids. Use TeX fragments in text. Return replacements in the DraftPatch schema."
 )
 _BLOCK_PATH = re.compile(r"paragraph|history\.\d+|shared_definitions\.\d+|"
                          r"groups\.\d+\.(?:theorem|paragraph|definitions\.\d+)")

@@ -10,6 +10,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import ValidationError
 
 from .models import Draft
+from .selection import SELECTION_VERSION
 
 
 def _pending(state):
@@ -17,7 +18,7 @@ def _pending(state):
 
 
 def _saved_editorial_state(state, locations):
-    if not state.get("recheck_saved_selection") or not state.get("selection_version"):
+    if not state.get("recheck_saved_selection") or state.get("selection_version") != SELECTION_VERSION:
         return False
     reviews = state.get("reviews", [])
     if not reviews or not state.get("issues") or state.get("target_ids"):
@@ -37,7 +38,8 @@ def _saved_editorial_state(state, locations):
     if not any(c.get("kind") == "historical" for c in selected):
         return False
     current = [c for c in selected if c.get("kind") in {"current", "application"}]
-    if not 1 <= len(current) <= 4:
+    groups = {c.get("scope_group_id") or c.get("candidate_id") or i for i, c in enumerate(current)}
+    if not 1 <= len(groups) <= 4:
         return False
     return (all(c.get("candidate_id") and c.get("evidence_ids") and set(c["evidence_ids"]) <= locations for c in selected)
             and all(set(link.evidence_ids) <= locations for link in draft.evidence_links))

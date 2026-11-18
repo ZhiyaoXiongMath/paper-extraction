@@ -21,7 +21,7 @@ class Candidate(BaseModel):
     assumptions: str
     significance: str
     source_number: str | None = Field(description="Original theorem/definition label, null if unnumbered")
-    dependencies: list[str] = Field(description="Names and meanings of definitions needed by the claim")
+    dependencies: list[str] = Field(description="Definition names and meanings for this entry")
     decision: Literal["admitted", "excluded", "unresolved"]
     decision_reason: str = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
@@ -121,20 +121,19 @@ class Review(BaseModel):
         if self.passed == bool(self.issues):
             raise ValueError("A passing review has no issues. A failing review identifies the defects.")
         if any(says_no_edit(issue) for issue in self.issues):
-            raise ValueError("This failed visual review explicitly reports no defect. Return only "
-                             "visible issues which require correction. Pass when none remains.")
+            raise ValueError("A no-issue entry is inconsistent with passed=false")
         return self
 
 
 class EditorialDefect(BaseModel):
     kind: Literal["incorrect_claim", "missing_required_content", "incorrect_attribution_or_locator", "improper_selection"]
     draft_field: str = Field(min_length=1, description="Affected Draft JSON path, e.g. groups.0.theorem or history for a missing block")
-    current_excerpt: str = Field(description="Exact short passage from the current draft. Empty only for genuinely absent required content.")
-    evidence_id: str = Field(min_length=1, description="Original source location supporting the correction")
-    source_excerpt: str = Field(min_length=1, description="Short quotation of the decisive original wording, read at evidence_id")
-    required_change: str = Field(min_length=1, description="Actual difference in meaning, coverage or attribution and the specific edit that fixes it")
+    current_excerpt: str = Field(description="Corresponding text in draft_field, or an empty string for absent text")
+    evidence_id: str = Field(min_length=1, description="Registered original source location")
+    source_excerpt: str = Field(min_length=1, description="Original passage at evidence_id")
+    required_change: str = Field(min_length=1, description="Requested edit and applicable v13 clause")
     operation: Literal["replace", "insert", "remove", "recover"] = Field(
-        description="Concrete edit to this draft. Use recover only to reread evidence for a missing result on the extract route.")
+        description="Edit operation. recover requests the extract route.")
     replacement_text: str = Field(default="", description=(
         "Exact revised wording for replace, or exact new wording for insert. Empty for remove or recover."))
 
@@ -143,8 +142,7 @@ class EditorialDefect(BaseModel):
         if self.kind != "missing_required_content" and not self.current_excerpt.strip():
             raise ValueError("Quote the affected current draft passage for this defect")
         if says_no_edit(self.required_change):
-            raise ValueError("This recommendation explicitly says no edit is needed. Return only actual "
-                             "edits, preserving any other genuine issue. Use pass if none remains.")
+            raise ValueError("A required_change saying no edit is needed is inconsistent with an edit operation")
         new = " ".join(self.replacement_text.split())
         if self.operation in {"insert", "replace"}:
             if not new or new.casefold() in {"unchanged", "none", "n/a", "no change"}:
@@ -156,13 +154,13 @@ class EditorialDefect(BaseModel):
         if self.operation in {"remove", "replace"} and not self.current_excerpt.strip():
             raise ValueError("Quote the existing text to remove or replace")
         if self.operation == "recover" and self.kind != "missing_required_content":
-            raise ValueError("recover requires a missing source-supported contribution")
+            raise ValueError("recover requires kind=missing_required_content")
         return self
 
 
 class AdmissionReview(BaseModel):
     route: Literal["pass", "extract", "draft"]
-    issues: list[EditorialDefect] = Field(description="Only substantiated defects requiring a change in this draft. Empty for pass.")
+    issues: list[EditorialDefect] = Field(description="Edit records; empty on the pass route")
     evidence_ids: list[str] = Field(description="Original locations to reread on the extract route; otherwise use []")
 
     def repair_issues(self) -> list[str]:
@@ -209,14 +207,15 @@ def _correctable_candidates(document, errors):
     return sorted(indexes)
 
 
-def _field_errors(exc):
+def _field_errors(exc, *, explain=True):
     # Pydantic's ordinary repr includes input values. Only expose field names and
     # schema expectations, never paper passages or a raw provider response.
     errors = exc.errors(include_url=False, include_input=False, include_context=False)
     details = []
     for error in errors[:16]:
         location = ".".join(map(str, error["loc"])) or "document"
-        details.append(f"{location}: {error['type']} ({error['msg']})")
+        message = f"{location}: {error['type']}"
+        details.append(f"{message} ({error['msg']})" if explain else message)
     return errors, "; ".join(details)
 
 
@@ -239,15 +238,12 @@ class Models:
                    image: bytes | None = None) -> Model:
         model = self.vision if image is not None else self.text
         contract = schema.model_json_schema()
-        system = SystemMessage(content=(
-            instructions + "\nProduce a single complete JSON object. Escape all TeX backslashes "
-            r'in JSON strings (write "\\alpha" for the TeX command). Use the exact field names, '
-            "enum values and data types. An unnumbered source label is null; a numbered label is "
-            "a string. Use [] for empty arrays.\nReturn JSON matching this schema:\n" + json_text(contract)
-        ))
+        system = SystemMessage(content=instructions + "\nReturn one JSON object matching the supplied "
+                               "schema; escape TeX backslashes in JSON strings.\n" + json_text(contract))
         original = png_message(json_text(payload), image) if image is not None else HumanMessage(content=json_text(payload))
         next_messages = [system, original]
         original_findings, repair_indexes = None, []
+        keep_previous = schema in (Findings, Draft, DraftPatch, AdmissionReview, Review)
         history = []
         for attempt in range(3):
             runner = model.with_structured_output(schema, method="json_mode", include_raw=True)
@@ -295,22 +291,15 @@ class Models:
                         try:
                             return schema.model_validate(document, context=payload if schema is DraftPatch else None)
                         except ValidationError as exc:
-                            errors, details = _field_errors(exc)
+                            errors, details = _field_errors(exc, explain=keep_previous)
                             if schema is Findings:
                                 indexes = _correctable_candidates(document, errors)
                                 if indexes:
                                     original_findings, repair_indexes = document, indexes
-                    if not repair_indexes and details:
+                    if not repair_indexes and details and keep_previous:
                         next_messages.append(HumanMessage(content=json_text({
                             "previous_complete_json": document, "correction": details,
-                            "preserve": ("Keep only evidenced changes the current draft needs. "
-                                         "If no actionable defect remains, return pass with empty issues."
-                                         if schema is AdmissionReview else
-                                         "Keep all actually visible defects. If none remains, return passed=true with empty issues."
-                                         if schema is Review else
-                                         "Return one complete actual correction for each requested block, with its original evidence."
-                                         if schema is DraftPatch else
-                                         "Keep every valid candidate, claim, and original evidence ID.")
+                            "return": "Correct the reported fields and return JSON matching the schema in the system message."
                         })))
             history.append(f"{attempt+1}: finish={finish}, output_tokens={out}, {details}")
             if repair_indexes:
@@ -318,11 +307,11 @@ class Models:
                     "correction": details,
                     "rows_to_fix_in_order": [{"original_index": i, "value": original_findings["candidates"][i]}
                                              for i in repair_indexes],
-                    "return": "Use the Findings schema. Return only these corrected candidates in the "
-                              "same order. Keep the original claim and evidence for each. Use [] for uncertainties."
+                    "return": "Use the Findings schema. Return only these corrected rows in their original "
+                              "order. Preserve valid field values. Use [] for uncertainties."
                 })))
             elif len(next_messages) == 2:
-                next_messages.append(HumanMessage(content=details + " Use the JSON schema in the system message."))
+                next_messages.append(HumanMessage(content=details + " Return JSON matching the schema in the system message."))
         raise ValueError(f"Invalid {schema.__name__} response after three attempts: " + " | ".join(history))
 
 

@@ -8,17 +8,17 @@ import re
 from pydantic import BaseModel, Field
 
 from .editorial import evidence_packet
-from .scope_reconciliation import organization_context, primary_uses, reconcile_scope
+from .scope_reconciliation import reconcile_scope
 
-SELECTION_VERSION = "v13-whole-paper-2"
+SELECTION_VERSION = "v13-whole-paper-3"
 
 
 class CoreChoice(BaseModel):
     candidate_id: str
     role: Literal["historical", "current", "application"] | None = None
-    independent_question: str = Field(min_length=1)
-    source_reason: str = Field(min_length=1, description="For a current core, state positive ORIGINAL evidence of an independent substantial question or consequence beyond its use in this proof.")
-    evidence_ids: list[str] = Field(min_length=1, description="Original locations supporting the assertion and the stated independent significance.")
+    independent_question: str | None = None
+    source_reason: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(min_length=1)
     definition_ids: list[str] = Field(default_factory=list)
     variant_ids: list[str] = Field(default_factory=list)
 
@@ -38,39 +38,19 @@ class WholePaperSelection(BaseModel):
     unresolved: list[OpenChoice] = Field(default_factory=list)
     exclusions: list[Exclusion] = Field(default_factory=list)
     metadata_ids: list[str] = Field(default_factory=list)
+    central_open_ids: list[str] = Field(default_factory=list)
 
 
-GUIDANCE = """Make the final editorial selection for ONE whole original paper, using v13 B1–B5 and C1–C4.
-The register is a list of local observations. Treat every local importance judgment as provisional.
-Read the original passages FIRST. Identify the paper's stated questions, comparisons, main assertions and
-important consequences before consulting the register of local observations. Consider where the author uses each
-candidate. Turning a lemma into a yes/no question or listing its assumptions does not establish significance.
-For a result that supplies estimates, an intermediate representation, an inverse, or a construction used by
-another result, seek a positive source indication of a separate substantial problem, comparison or important
-independent consequence. A proof's organization and the author's use of a result are evidence of its role.
-Read original_organization and original_uses to distinguish where claims are announced and where they are used.
-Separately named, stated and proved is not an independence argument. A local step whose iteration, correction or
-combination yields the main theorem remains a proof ingredient when that is the only positive role the source gives.
-Do not manufacture independence by restating the step as a local existence question. Record its specific role among
-the exclusions. Conversely, retain a result that also settles an independently significant problem outside that role,
-with positive original evidence for that independent conclusion. There is no quota of main results or applications.
-For each current choice give the independently answerable mathematical question and cite the source facts
-showing its importance. Check whether the claim still answers a recognizable question when the author's
-proof construction is removed. A method's tuning parameters, intermediate estimates, witnesses, auxiliary
-sequence properties, construction choices and restatements do not earn new slots by themselves.
-Choose only substantial independent results and important consequences. Choose historical comparisons whose
-hypotheses, conclusion and attribution the supplied original actually supports. Use role only to correct a
-misclassified result according to that source. State the actual historical comparison in independent_question.
-Do not strengthen source claims or demote a substantial independent application for length. If more genuinely
-admitted contributions than the standard profile allows are unavoidable, retain them; the program reports scope.
-For competing extractions of the same assertion choose ONE faithfully scoped representative; variant_ids hold
-equivalent formulations only. Distinct clauses are separate only if they answer genuinely independent questions.
-Give necessary defined concepts via definition_ids. Use metadata_ids for exact paper identity, authors and necessary
-shared setting. Historical attributions and genuine scope limitations must survive. List unresolved IDs explicitly.
-Group routine/proof-only/explanatory observations in exclusions, by a source-specific reason. In an exclusion
-group you may compress consecutive IDs as c7..c23. Individually selected and unresolved rows take priority. Cover the register,
-avoiding repeated IDs. Use only the supplied candidate IDs and original evidence IDs. Omitted observations are
-recorded as unresolved; a compact output lists IDs and reasons, without copying long statements a second time."""
+SELECTION_FIELDS = """candidate_id, definition_ids, variant_ids and metadata_ids refer to candidate_register IDs.
+evidence_ids refer to source_locations IDs. For an exclusion group, c7..c23 denotes the inclusive ID range.
+central_open_ids refers to unresolved candidate IDs for the B4 central-admission status."""
+CORRECTION_FIELDS = """Return replacements only for affected_selected_ids. replacement rows use the same
+candidate and source ID namespaces. Omit an affected row to remove that row; other rows remain in place."""
+
+
+def _source_row(row):
+    return {k: row[k] for k in ("candidate_id", "source_number", "claim", "assumptions",
+                                 "dependencies", "local_kind", "local_evidence_ids") if k in row}
 
 
 def candidate_register(candidates):
@@ -94,7 +74,8 @@ def candidate_register(candidates):
                "evidence_ids": list(original_ids), "local_evidence_ids": list(original_ids),
                "dependencies": list(c.get("dependencies", []))}
         for prior in ("represented_by", "independent_question", "selection_evidence_ids", "needed_by", "context_for",
-                      "scope_evidence_id", "scope_excerpt", "scope_role", "scope_evidence_version", "scope_reason_type"):
+                      "scope_evidence_id", "scope_excerpt", "scope_role", "scope_group_id", "scope_central_open",
+                      "scope_evidence_version", "scope_reason_type"):
             row.pop(prior, None)
         by_signature[signature] = row
         rows.append(row)
@@ -102,9 +83,11 @@ def candidate_register(candidates):
 
 
 def selection_packet(catalog, register):
-    # Sample original passages by editorial function, independently of local admission labels.
-    neutral = [{**r, "decision": "unresolved"} for r in register]
-    passages = evidence_packet(catalog, neutral)["passages"]
+    # Source excerpts and locations are data, without previous candidates' decisions.
+    overview = evidence_packet(catalog, [])["passages"]
+    exposed = {r["id"] for r in overview}
+    exposed.update(loc for row in register for loc in row["local_evidence_ids"])
+    passages = [r for r in catalog if r["id"] in exposed]
     count = max(len(register), 1)
     claim_budget = max(180, min(1100, 100_000 // count))
     navigators = []
@@ -116,8 +99,9 @@ def selection_packet(catalog, register):
                            "source_number": row.get("source_number"), "claim": claim,
                            "assumptions": row["assumptions"][:claim_budget//2],
                            "dependencies": row.get("dependencies", []), "evidence_ids": row["evidence_ids"]})
-    return {"passages": passages, "original_organization": organization_context(catalog),
-            "original_uses": primary_uses(catalog, register), "candidate_register": navigators}
+    return {"passages": passages,
+            "source_locations": [{"id": r["id"], "label": r.get("label", r["id"])} for r in catalog],
+            "candidate_register": navigators}
 
 
 def exclusion_notes(candidates):
@@ -241,31 +225,33 @@ def apply_selection(register, choice: WholePaperSelection, catalog):
                 if key in rows and key not in assigned:
                     rows[key].update(decision="excluded", decision_reason=group.source_reason)
                     assigned.add(key)
+    for key in choice.central_open_ids:
+        row = rows.get(key)
+        if row and row["kind"] in {"current", "application"} and row["decision"] == "unresolved":
+            loc = next((loc for loc in row["evidence_ids"] if loc in source_ids), None)
+            if loc is not None:
+                row.update(scope_central_open=True, scope_evidence_id=loc)
     return list(rows.values())
 
 
-def _repair_choice(conflict, choice, register, catalog, models):
+def _repair_choice(conflict, choice, register, catalog, models, rubric):
     affected = [p for p in choice.selected if p.candidate_id in conflict.owners]
     related = set(conflict.owners)
     for item in affected:
         related.update(item.variant_ids)
         related.update(item.definition_ids)
-    exact = [row for row in register if row["candidate_id"] in related]
-    locations = {loc for row in exact for loc in row["evidence_ids"]}
+    exact = [_source_row(row) for row in register if row["candidate_id"] in related]
+    locations = {loc for row in exact for loc in row["local_evidence_ids"]}
+    bindings = {"candidate_id", "role", "evidence_ids", "definition_ids", "variant_ids"}
     payload = {"conflict": str(conflict), "affected_selected_ids": sorted(conflict.owners),
-               "previous_selection": choice.model_dump(), "candidate_rows": exact,
+               "previous_bindings": [p.model_dump(include=bindings) for p in affected],
+               "candidate_rows": exact,
                "original_passages": [r for r in catalog if r["id"] in locations]}
     if any(key not in {row["candidate_id"] for row in exact} for key in conflict.owners):
         payload["registered_candidates"] = [{"candidate_id": row["candidate_id"], "source_number": row["source_number"],
                                              "claim": row["claim"][:160], "evidence_ids": row["evidence_ids"]}
                                             for row in register]
-    repair = models.structured(SelectionCorrection,
-        "Repair ONLY the positive rows in affected_selected_ids using the exact register and original source. "
-        "Return their replacement selections. Omit a row to withdraw it. Keep distinct substantial assertions, "
-        "or one representative for a real equivalence. For an incorrectly typed local observation, give an "
-        "explicit source-supported role. A definition with a matching number is supporting context, not a "
-        "theorem. State a valid evidence_id for each core. Do not return unaffected rows or reclassify the register.",
-        payload)
+    repair = models.structured(SelectionCorrection, rubric + "\n" + CORRECTION_FIELDS, payload)
     replacements = [p for p in repair.selected if p.candidate_id in conflict.owners or
                     p.candidate_id not in {q.candidate_id for q in choice.selected}]
     retained = [p for p in choice.selected if p.candidate_id not in conflict.owners]
@@ -278,7 +264,7 @@ def select_contributions(catalog, candidates, models):
         return []
     packet = selection_packet(catalog, register)
     rubric = files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8")
-    instructions = rubric[rubric.index("B1."):rubric.index("C3.")] + "\n" + GUIDANCE
+    instructions = rubric + "\n" + SELECTION_FIELDS
     choice = models.structured(WholePaperSelection, instructions, packet)
     for attempt in range(3):
         try:
@@ -287,5 +273,5 @@ def select_contributions(catalog, candidates, models):
         except SelectionConflict as exc:
             if attempt == 2:
                 raise
-            choice = _repair_choice(exc, choice, register, catalog, models)
-    return reconcile_scope(catalog, rows, models, rubric[rubric.index("B1."):rubric.index("C1.")])
+            choice = _repair_choice(exc, choice, register, catalog, models, rubric)
+    return reconcile_scope(catalog, rows, models, rubric)

@@ -19,7 +19,7 @@ def sample():
     return catalog, rows
 
 
-def reply(key, outcome="ingredient", **kwargs):
+def reply(key, outcome="excluded", **kwargs):
     loc = "p" + key[1:]
     return dict(candidate_id=key, outcome=outcome, source_id=loc, source_reason="The source describes this use.",
                 **kwargs)
@@ -34,7 +34,7 @@ def test_model_paraphrases_and_ocr_mismatches_do_not_require_quote_repair():
         def structured(self, typ, prompt, packet):
             self.calls += 1
             assert typ is ScopeReconciliation
-            return typ(assessments=[reply("c1", "independent", independent_question="Does a global solution exist?",
+            return typ(assessments=[reply("c1", "admitted", independent_question="Does a global solution exist?",
                                           source_excerpt="Original wording on issue 1."),
                                     reply("c2", source_excerpt="Words the author never wrote."),
                                     reply("c3", source_excerpt="Original  wording on issue 3."),
@@ -58,13 +58,13 @@ def test_unresolved_equivalence_without_any_central_admission_reports_b4():
         def structured(self, typ, prompt, packet):
             self.calls.append(packet["requested_ids"])
             return typ(assessments=[reply(k, "equivalent", retained_id="c2") if k == "c1" else reply(k)
-                                    for k in packet["requested_ids"]])
+                                    for k in packet["requested_ids"]], central_open_ids=["c1"])
 
     model = Model()
     final = reconcile_scope(catalog, rows, model, "")
     assert model.calls == [["c1", "c2", "c3", "c4", "c5"], ["c1"]]
     assert final[0]["decision"] == "unresolved" and "represented_by" not in final[0]
-    assert "not a retained independent representative" in final[0]["decision_reason"]
+    assert "does not reference a distinct admitted row" in final[0]["decision_reason"]
     reason = scope_failure_reason(final)
     assert "B4" in reason and "Theorem 1 [p1]" in reason
 
@@ -77,16 +77,18 @@ def test_unknown_scope_evidence_remains_actionable_after_targeted_repair():
             return typ(assessments=[{**reply(k), "source_id": "unregistered" if k == "c3" else "p" + k[1:]}
                                     for k in packet["requested_ids"]])
 
-    with pytest.raises(ValueError, match="c3: ingredient: source ID 'unregistered' was not supplied"):
+    with pytest.raises(ValueError, match="c3: excluded: source ID 'unregistered' was not supplied"):
         reconcile_scope(catalog, rows, Model(), "")
 
 
-def test_selector_receives_downstream_uses_not_just_the_source_announcement():
+def test_scope_receives_original_bindings_and_keeps_legacy_scope_provenance():
     catalog, rows = sample()
     rows[0]["source_number"] = "characterization.of.operator"
     catalog.append({"id": "later", "text": r"Use Proposition \ref{characterization.of.operator} to check the hypothesis of Theorem B."})
     packet = _source_packet(catalog, rows)
-    assert {"candidate_id": "c1", **catalog[-1]} in packet["original_uses"]
+    assert "original_uses" not in packet
+    assert all("decision_reason" not in c and "independent_question" not in c for c in packet["candidate_rows"])
+    assert {r["id"] for r in packet["original_overview"] + packet["original_statements_and_context"]} >= {"p1", "p5"}
     for row in rows:
         row["scope_role"] = "independent"
     result = {"selection_version": SELECTION_VERSION, "status": "failed", "candidates": rows}

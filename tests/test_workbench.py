@@ -77,7 +77,8 @@ def test_missing_key_explicit_and_ambiguous_root(tmp_path,monkeypatch):
                               ("project/x.tex",b"an included chapter")])
         assert len(pack["papers"]) == 1 and pack["papers"][0]["entry"] == ""
         config = client.get("/api/config").json()
-        assert not config["providers"][0]["configured"]
+        deepseek = next(provider for provider in config["providers"] if provider["id"] == "deepseek")
+        assert not deepseek["configured"]
         res = client.post("/api/batches",json={"import_id":pack["id"],"provider":"deepseek",
                           "papers":[{"id":pack["papers"][0]["id"],"entry":"project/main.tex"}]})
         assert res.status_code == 400 and "DEEPSEEK_API_KEY" in res.text

@@ -36,23 +36,23 @@ def test_proof_ingredients_do_not_trigger_a_paper_size_exception():
         def structured(self, schema, prompt, packet):
             self.schemas.append(schema)
             if schema is WholePaperSelection:
-                assert list(packet)[0] == "passages" and "positive source indication" in prompt
+                assert list(packet)[0] == "passages" and "HARD STANDARD-PROFILE BUDGETS" in prompt and "F4." in prompt
                 return schema(selected=[pick("c1", "prior"), pick("c2", "state"), pick("c3", "state", definition_ids=["c8"]),
                                         pick("c4", "proof", definition_ids=["c7"]), pick("c5", "proof"), pick("c6", "app")])
             assert schema is ScopeReconciliation and "B6." in prompt
             assert {p["id"] for p in packet["original_overview"]}.issuperset({"intro", "app"})
-            assert {x["candidate_id"] for x in packet["provisional_contributions"]} == {"c2", "c3", "c4", "c5", "c6"}
-            assert all("independent_question" in x and "selection_evidence_ids" in x for x in packet["provisional_contributions"])
+            assert {x["candidate_id"] for x in packet["candidate_rows"]} == {"c2", "c3", "c4", "c5", "c6"}
+            assert all("independent_question" not in x and "decision_reason" not in x and "selection_evidence_ids" in x for x in packet["candidate_rows"])
             assert {r["id"] for f in ("original_overview", "original_statements_and_context") for r in packet[f]} >= {"proof", "app"}
             return schema(assessments=[
-                {"candidate_id": "c2", "outcome": "independent", "source_id": "intro",
+                {"candidate_id": "c2", "outcome": "admitted", "source_id": "intro",
                  "source_excerpt": "We settle existence for compact objects", "source_reason": "This answers the existence problem posed in the introduction.",
                  "independent_question": "Which compact objects admit a solution?"},
                 {"candidate_id": "c3", "outcome": "equivalent", "source_id": "state",
                  "source_excerpt": "Equivalently all compact objects have a resolving section", "source_reason": "The source states this as an equivalent formulation.", "retained_id": "c2"},
-                *[{"candidate_id": c, "outcome": "ingredient", "source_id": "proof", "source_excerpt": "used only in the proof of Theorem A",
+                *[{"candidate_id": c, "outcome": "excluded", "source_id": "proof", "source_excerpt": "used only in the proof of Theorem A",
                    "source_reason": "The text uses this assertion solely to construct the object in Theorem A.", "retained_id": "c2"} for c in ("c4", "c5")],
-                {"candidate_id": "c6", "outcome": "independent", "source_id": "app", "source_excerpt": "classifies all connected pairs",
+                {"candidate_id": "c6", "outcome": "admitted", "source_id": "app", "source_excerpt": "classifies all connected pairs",
                  "source_reason": "It resolves the classification problem for pairs.", "independent_question": "Which connected pairs are equivalent?"},
             ])
     model = Model()
@@ -80,7 +80,7 @@ def test_genuine_independent_results_have_no_arbitrary_cutoff(count):
             if schema is WholePaperSelection:
                 return schema(selected=[pick(f"c{i+1}", f"p{i}") for i in range(count)])
             self.reconciled += 1
-            return schema(assessments=[{"candidate_id": f"c{i+1}", "outcome": "independent", "source_id": f"p{i}",
+            return schema(assessments=[{"candidate_id": f"c{i+1}", "outcome": "admitted", "source_id": f"p{i}",
                                         "source_excerpt": f"independently settles {q}", "source_reason": f"The source gives a separate {q} conclusion.",
                                         "independent_question": f"Does the stated class satisfy {q}?"} for i, q in enumerate(questions)])
 

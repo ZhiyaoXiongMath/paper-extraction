@@ -53,7 +53,8 @@ def test_review_schema_feedback_allows_withdrawing_a_reminder():
         "passages": [{"id": "p9-1", "text": "Complete noncompact manifolds with nonnegative Ricci curvature have infinite volume."}],
     })
     assert review.route == "pass" and review.repair_issues() == []
-    assert "If no actionable defect remains" in requests[1]["messages"][-1]["content"]
+    retry = json.loads(requests[1]["messages"][-1]["content"])
+    assert "issues.0" in retry["correction"] and "schema" in retry["return"]
 
 
 def test_model_corrects_a_confirmed_claim_and_retains_a_real_edit():
@@ -70,7 +71,7 @@ def test_model_corrects_a_confirmed_claim_and_retains_a_real_edit():
         AdmissionReview, "Review these assertions.", {})
     assert len(requests) == 2 and [i.draft_field for i in result.issues] == ["groups.0.theorem"]
     assert "every complete metric" in result.repair_issues()[0]
-    assert "explicitly says no edit is needed" in requests[1]["messages"][-1]["content"]
+    assert "inconsistent with an edit operation" in requests[1]["messages"][-1]["content"]
 
 
 def test_failed_visual_confirmation_is_reasked_instead_of_assumed_to_pass():

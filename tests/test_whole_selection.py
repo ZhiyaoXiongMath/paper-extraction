@@ -13,6 +13,7 @@ from paper_extraction.selection import (
 from paper_extraction.store import CONTENT_REVIEW_VERSION, Store, stale_selection_failure
 from test_agent import OfflineModels, paper  # noqa: F401
 from test_agent_review_retry import old_result
+from test_saved_draft_review import old_terminal
 
 
 def finding(kind, label, text, loc):
@@ -78,7 +79,7 @@ def test_selection_repairs_invalid_ids_using_register_and_original_evidence():
                 return schema(selected=[pick("c1", "wrong-id")])
             assert schema is SelectionCorrection
             assert "requires registered source IDs" in payload["conflict"]
-            assert payload["previous_selection"]["selected"][0]["evidence_ids"] == ["wrong-id"]
+            assert payload["previous_bindings"][0]["evidence_ids"] == ["wrong-id"]
             assert payload["original_passages"] == records and payload["affected_selected_ids"] == ["c1"]
             return schema(selected=[pick("c1", "intro")])
 
@@ -87,8 +88,11 @@ def test_selection_repairs_invalid_ids_using_register_and_original_evidence():
     assert model.calls == 2
 
 
-@pytest.mark.parametrize("pending", [False, True])
-def test_old_compile_failure_and_pending_publish_reselect_before_delivery(tmp_path, monkeypatch, pending):
+@pytest.mark.parametrize("pending, prior_verdict", [
+    (False, None), (True, None), (False, "confirmation"), (False, "citation"),
+    (False, "patch"), (False, "layout"), (True, "patch"),
+])
+def test_old_compile_failure_and_pending_publish_reselect_before_delivery(tmp_path, monkeypatch, pending, prior_verdict):
     source = tmp_path / "source.tex"
     source.write_text("The source claim is a statement on compact objects.", encoding="utf-8")
     settings = {"provider": "offline", "text_model": "mock", "vision_model": "mock", "base_url": "http://localhost"}
@@ -97,9 +101,12 @@ def test_old_compile_failure_and_pending_publish_reselect_before_delivery(tmp_pa
     prior = store.paper("id")
     work = store.work(prior)
     work.mkdir(parents=True)
-    state = old_result()
-    state["reviews"].append({"stage": "compile", "passed": False, "issues": ["Outdated layout"], "attempt": 3})
-    state["reviews"][-2]["review_version"] = CONTENT_REVIEW_VERSION
+    if prior_verdict:
+        state = {**old_terminal(prior_verdict), "selection_version": "v13-whole-paper-2", "recheck_saved_selection": True}
+    else:
+        state = old_result()
+        state["reviews"].append({"stage": "compile", "passed": False, "issues": ["Outdated layout"], "attempt": 3})
+        state["reviews"][-2]["review_version"] = CONTENT_REVIEW_VERSION
     config = {"configurable": {"thread_id": agent._thread_id(source, None, settings, agent._rules())}}
     with SqliteSaver.from_conn_string(str(work / "checkpoint.sqlite")) as saver:
         old = StateGraph(agent.PaperState)
@@ -198,7 +205,7 @@ def test_true_conflicting_positive_choices_repair_only_affected_source_rows():
             assert schema is SelectionCorrection
             assert packet["affected_selected_ids"] == ["c1", "c2"]
             assert {p["id"] for p in packet["original_passages"]} == {"p1", "p2"}
-            assert len(packet["previous_selection"]["selected"]) == 3
+            assert {row["candidate_id"] for row in packet["previous_bindings"]} == {"c1", "c2"}
             return schema(selected=[pick("c1", "p1", variant_ids=["c2"])])
 
     rows = select_contributions(catalog, candidates, Model())

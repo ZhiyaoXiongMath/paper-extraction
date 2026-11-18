@@ -135,10 +135,27 @@ def test_direct_publish_uses_tools_and_survives_refresh(paper):
     assert run()["status"] == "failed"
 
 
-def test_source_defect_returns_to_writer_without_rescanning(paper):
+def test_source_defect_returns_to_writer_without_rescanning(paper, monkeypatch):
     model, run, builds, events = paper
     model.defect_once = True
+    rules = agent.files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8")
+    four_files = agent._rules()
+    calls = []
+    original = model.structured
+
+    def observe(schema, instructions, payload, image=None):
+        if schema in (Findings, Draft, DraftPatch, AdmissionReview):
+            calls.append(schema)
+            prefix = four_files if schema in (Draft, DraftPatch) else rules
+            assert instructions.startswith(prefix + "\n")
+            assert instructions.count(rules) == 1
+            if schema is AdmissionReview:
+                assert "previous_model_exclusion_notes" in payload
+                assert "Reopen an excluded" not in instructions[len(prefix):]
+        return original(schema, instructions, payload, image)
+    monkeypatch.setattr(model, "structured", observe)
     result = run()
+    assert calls == [Findings, Draft, AdmissionReview, DraftPatch, AdmissionReview]
     assert result["status"] == "completed", result
     assert model.drafts == model.patches == model.extracts == len(builds) == 1
     assert [(d["mode"], d["blocks"]) for n, d in events if n == "draft"] == [

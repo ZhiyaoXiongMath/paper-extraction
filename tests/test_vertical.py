@@ -45,6 +45,8 @@ def provider_answer(request, visual_pages):
         data = json.loads(payload)
 
     if request.get("tools"):
+        rules = (Path(__file__).parents[1] / "src/paper_extraction/profile_assets/intro-rules-v13.txt").read_text("utf-8")
+        assert sys_msg.startswith(rules + "\n") and "Return the original location IDs" in sys_msg[len(rules):]
         spans = data.get("passages") or data.get("original_abstract_intro_results_and_applications")
         if spans and not any(m["role"] == "tool" for m in request["messages"]):
             args = json.dumps({"location": spans[0]["id"]})
@@ -54,7 +56,7 @@ def provider_answer(request, visual_pages):
         return {"role": "assistant", "content": "Read the supplied evidence locations."}
 
     # The adapter supplies the live Pydantic schema in its system message.
-    schema = json.loads(sys_msg.rsplit("Return JSON matching this schema:\n", 1)[1])["title"]
+    schema = json.loads(sys_msg.rsplit("\n", 1)[1])["title"]
     if schema == "Findings":
         spans = data["passages"]
         results = []

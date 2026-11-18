@@ -8,6 +8,7 @@ from langgraph.graph import END, START, StateGraph
 from paper_extraction import agent
 from paper_extraction.editorial import EDIT_CONTRACT_VERSION
 from paper_extraction.models import AdmissionReview, DraftPatch, Review
+from paper_extraction.selection import SELECTION_VERSION
 from paper_extraction.store import CONTENT_REVIEW_VERSION, Store, legacy_confirmation_failure
 from test_agent import OfflineModels
 
@@ -57,7 +58,7 @@ def old_terminal(mode):
     else:
         last = {"stage": "compile", "passed": False, "attempt": 3, "issues": [
             r"group 1 theorem needs a citation identifying its source location, e.g. \cite[p. 1]{source}."]}
-    return {"status": "failed", "selection_version": "v13-whole-paper-1", "draft": draft, "candidates": rows,
+    return {"status": "failed", "selection_version": SELECTION_VERSION, "draft": draft, "candidates": rows,
             "reason": "; ".join(last["issues"]), "reviews": [last]}
 
 

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from paper_extraction.saved_selection_recovery import saved_selection_recovery
-from paper_extraction.selection import candidate_register, exclusion_notes, selection_packet
+from paper_extraction.selection import SELECTION_VERSION, candidate_register, exclusion_notes, selection_packet
 from test_whole_selection import finding
 
 
@@ -18,7 +18,7 @@ def history():
                  evidence_links=[dict(block_id=k, evidence_ids=["p1"]) for k in ("paragraph", "history.0", "groups.0.theorem")])
     reviews = [dict(stage="review", passed=True, route="pass", attempt=1, issues=[]),
                dict(stage="compile", passed=False, attempt=1, issues=["Block needs a locator."])]
-    prior = dict(cursor=4, attempt=1, selection_version="old-selection", recheck_saved_selection=True,
+    prior = dict(cursor=4, attempt=1, selection_version=SELECTION_VERSION, recheck_saved_selection=True,
                  status="", draft=draft, candidates=selected, issues=reviews[-1]["issues"], reviews=reviews, target_ids=[])
     skipped = {**prior, "recheck_saved_selection": False}
     drift = {**skipped, "selection_version": "new-selection",
@@ -46,13 +46,13 @@ def recover(states, terminal, locations=("p1", "p2")):
 def test_only_source_bound_accepted_draft_on_unrelated_reselection_is_recovered():
     states = history()
     saved = recover(states, states[-1][0])
-    assert saved["recovery_checkpoint_id"] == 0 and saved["selection_version"] == "old-selection"
+    assert saved["recovery_checkpoint_id"] == 0 and saved["selection_version"] == SELECTION_VERSION
     assert saved["draft"]["paragraph"] == "Setting." and len(saved["candidates"]) == 2
     assert saved["reviews"][-2]["passed"] is True and saved["issues"] == ["Block needs a locator."]
 
 
 @pytest.mark.parametrize("case", ["new_evidence", "changed_draft", "no_accepted_review", "missing_source",
-                                  "completed", "new_writer", "different_head", "wanted_select"])
+                                  "completed", "new_writer", "different_head", "wanted_select", "prior_policy"])
 def test_recovery_rejects_unrelated_or_updated_lineages(case):
     states = deepcopy(history())
     terminal = deepcopy(states[-1][0])
@@ -70,11 +70,14 @@ def test_recovery_rejects_unrelated_or_updated_lineages(case):
         terminal["draft"]["paragraph"] = "A draft from another branch."
     if case == "wanted_select":
         states[0][0]["recheck_saved_selection"] = False
+    if case == "prior_policy":
+        for state, _ in states[:2]:
+            state["selection_version"] = "v13-whole-paper-2"
     locations = ["p2"] if case == "missing_source" else ["p1", "p2"]
     assert recover(states, terminal, locations) is None
 
 
-def test_under_budget_selector_reads_how_numbered_step_is_used_and_review_receives_exclusion():
+def test_under_budget_selector_receives_candidate_sources_without_prior_exclusion_notes():
     catalogue = [
         {"id": "p1", "text": "The paper is organized as follows. We iterate a local construction to prove the main theorem."},
         {"id": "p2", "text": "Proposition 3.1. A perturbation on a small domain solves the auxiliary system."},
@@ -85,9 +88,8 @@ def test_under_budget_selector_reads_how_numbered_step_is_used_and_review_receiv
                   finding("current", "Theorem 1.1", "A global solution exists.", "p4")]
     rows = candidate_register(candidates)
     packet = selection_packet(catalogue, rows)
-    assert any("paper is organized" in p["text"] for p in packet["original_organization"])
-    uses = [p for p in packet["original_uses"] if "c1" in p["candidate_ids"]]
-    assert len(uses) == 1 and uses[0]["id"] == "p3" and "iterating Proposition 3.1" in uses[0]["text"]
+    assert {"p1", "p2", "p4"} <= {p["id"] for p in packet["passages"]}
+    assert "original_uses" not in packet and "decision_reason" not in packet["candidate_register"][0]
     rows[0].update(decision="excluded", decision_reason="The source iterates this local step to establish Theorem 1.1.")
     notes = exclusion_notes(rows)
     assert len(notes) == 1 and notes[0]["reason"] == rows[0]["decision_reason"]
