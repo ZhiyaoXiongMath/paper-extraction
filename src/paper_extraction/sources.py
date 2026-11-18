@@ -190,7 +190,30 @@ class SourceIndex:
                     json.dump(items, file, ensure_ascii=False)
                 Path(file.name).replace(self.cache)
                 self._items = items
+            for item in self._items:
+                if item.get("page") and not item["text"].strip():
+                    sidecar = self.cache.parent / "page-readings" / (item["id"] + ".json")
+                    if sidecar.is_file():
+                        reading = json.loads(sidecar.read_text("utf8"))
+                        if reading.get("page") == item["page"] and reading.get("transcribed_from_image"):
+                            item.update(reading)
         return self._items
+
+    def save_transcription(self, location: str, page: int, text: str):
+        """Save a machine reading alongside the immutable source page and location."""
+        item = next((r for r in self.catalog() if r["id"] == location and r.get("page") == page), None)
+        if item is None or item["text"].strip() or not isinstance(text, str) or not text.strip():
+            return
+        folder = self.cache.parent / "page-readings"
+        folder.mkdir(exist_ok=True)
+        record = {"page": page, "text": text, "transcribed_from_image": True,
+                  "evidence_type": "machine_transcription"}
+        from tempfile import NamedTemporaryFile
+        with NamedTemporaryFile(mode="w", encoding="utf8", dir=folder, delete=False) as stream:
+            json.dump(record, stream, ensure_ascii=False)
+        Path(stream.name).replace(folder / (location + ".json"))
+        item.update(record)
+
 
     def read(self, location: str) -> dict:
         for item in self.catalog():

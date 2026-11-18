@@ -5,7 +5,7 @@ import httpx
 import pytest
 from langchain_openai import ChatOpenAI
 
-from paper_extraction.models import Findings, Models
+from paper_extraction.models import AdmissionReview, Findings, Models, Review
 
 
 def candidate(kind="current"):
@@ -23,6 +23,7 @@ def adapter(replies, requests):
                                          "finish_reason": finish}],
             "usage": {"prompt_tokens": 128, "completion_tokens": output, "total_tokens": output+128}})
     instance = Models.__new__(Models)
+    instance.provider = "deepseek"
     instance.text = ChatOpenAI(api_key="offline-fixture", model="mock", base_url="http://offline.invalid",
                                http_client=httpx.Client(transport=httpx.MockTransport(server)),
                                extra_body={"thinking": {"type": "disabled"}})
@@ -39,6 +40,47 @@ def test_length_increases_provider_budget_and_discards_partial_text():
     assert requests[1]["max_tokens"] == 16384 and requests[1]["thinking"]["type"] == "disabled"
     assert "TRUNCATED_MARKER" not in str(requests[1]["messages"])
     assert requests[1]["response_format"] == {"type": "json_object"}
+
+
+def test_review_schema_feedback_allows_withdrawing_a_reminder():
+    legacy = {"route": "draft", "issues": ["The draft already says noncompact; keep that qualifier."],
+              "evidence_ids": []}
+    correct = {"route": "pass", "issues": [], "evidence_ids": []}
+    requests = []
+    model = adapter([(json.dumps(reply), "stop", 128) for reply in (legacy, correct)], requests)
+    review = model.structured(AdmissionReview, "Review the current introduction.", {
+        "draft": {"groups": [{"theorem": "Complete noncompact manifolds with nonnegative Ricci curvature have infinite volume."}]},
+        "passages": [{"id": "p9-1", "text": "Complete noncompact manifolds with nonnegative Ricci curvature have infinite volume."}],
+    })
+    assert review.route == "pass" and review.repair_issues() == []
+    assert "If no actionable defect remains" in requests[1]["messages"][-1]["content"]
+
+
+def test_model_corrects_a_confirmed_claim_and_retains_a_real_edit():
+    real = {"kind": "incorrect_claim", "draft_field": "groups.0.theorem", "current_excerpt": "every metric",
+            "evidence_id": "p3-1", "source_excerpt": "every complete metric",
+            "required_change": "Restore the hypothesis of completeness.", "operation": "replace",
+            "replacement_text": "every complete metric"}
+    no_change = {**real, "draft_field": "history.0", "required_change": "Equivalent; no defect.",
+                 "replacement_text": "every closed metric"}
+    wrong = {"route": "draft", "issues": [no_change, real], "evidence_ids": []}
+    correction = {**wrong, "issues": [real]}
+    requests = []
+    result = adapter([(json.dumps(x), "stop", 200) for x in (wrong, correction)], requests).structured(
+        AdmissionReview, "Review these assertions.", {})
+    assert len(requests) == 2 and [i.draft_field for i in result.issues] == ["groups.0.theorem"]
+    assert "every complete metric" in result.repair_issues()[0]
+    assert "explicitly says no edit is needed" in requests[1]["messages"][-1]["content"]
+
+
+def test_failed_visual_confirmation_is_reasked_instead_of_assumed_to_pass():
+    failed = {"passed": False, "issues": ["Page 1: No visible defect."]}
+    real = {"passed": False, "issues": ["The last symbol on line 3 is clipped at the right margin."]}
+    requests = []
+    model = adapter([(json.dumps(x), "stop", 80) for x in (failed, real)], requests)
+    model.vision = model.text
+    verdict = model.structured(Review, "Inspect this fixture page.", {"page": 1}, image=b"fixture")
+    assert len(requests) == 2 and not verdict.passed and verdict.issues == real["issues"]
 
 
 def test_repair_invalid_rows_preserves_unaffected_findings():

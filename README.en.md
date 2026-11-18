@@ -27,10 +27,10 @@ uv sync --locked --python 3.12
 uv run paper-extraction doctor
 ```
 
-Copy `.env.example` to `.env` in your **launch directory** and set your own `DEEPSEEK_API_KEY` or `ZAI_API_KEY`. Environment variables are also supported. Use `paper-extraction --env-file path/to/config serve` to select another file. Source passages and page images used in the workflow are sent to the selected model provider.
+For a new installation, copy [.env.example](.env.example) to `.env` in your **launch directory** and set your `OPENAI_API_KEY`. For an existing installation, add this key to the existing file and set `PAPER_EXTRACTION_PROVIDER=openai`. The model settings page also supports DeepSeek and GLM. Environment variables are supported. Use `paper-extraction --env-file path/to/config serve` to select another file. Source passages and page images are sent to the selected provider.
 
 ```shell
-paper-extraction doctor --live --provider deepseek
+paper-extraction doctor --live --provider openai
 paper-extraction serve
 ```
 
@@ -63,13 +63,15 @@ The profile allows up to three body pages followed by a separate bibliography, 1
 
 | Setting | Purpose |
 |---|---|
-| `PAPER_EXTRACTION_PROVIDER` | Default provider: `deepseek` or `zhipu` |
-| `DEEPSEEK_API_KEY` / `ZAI_API_KEY` | Your independent model API key |
+| `PAPER_EXTRACTION_PROVIDER` | Defaults to `openai`. Also accepts `deepseek` and `zhipu` |
+| `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` / `ZAI_API_KEY` | Your selected provider's API key |
+| `OPENAI_TEXT_MODEL` / `OPENAI_VISION_MODEL` | OpenAI text and vision models, both default to `gpt-5.4-mini` |
 | `DEEPSEEK_TEXT_MODEL` / `DEEPSEEK_VISION_MODEL` | DeepSeek text and image models, default `deepseek-flash` |
 | `ZHIPU_TEXT_MODEL` / `ZHIPU_VISION_MODEL` | GLM text and image models, default `glm-5.3` / `glm-4.6v` |
-| `DEEPSEEK_BASE_URL` / `ZHIPU_BASE_URL` | Optional provider endpoint override |
+| `OPENAI_BASE_URL` / `DEEPSEEK_BASE_URL` / `ZHIPU_BASE_URL` | Optional provider endpoint override |
 | `PAPER_EXTRACTION_HOME` | Local data directory for source snapshots, checkpoints and artifacts. Defaults to the platform user-data directory |
-| `PAPER_EXTRACTION_CONCURRENCY` | Number of active papers, default 2 |
+| `PAPER_EXTRACTION_CONCURRENCY` | Number of papers processed concurrently. Defaults to 2 and accepts positive integers. A concurrency setting saved in the workbench takes precedence and applies immediately |
+| `PAPER_EXTRACTION_MAX_IMPORT_FILES` | Files per upload, default 1000. Set to 0 for unlimited file count. Restart the service after changing it. Each PDF, TeX entry file, chapter or asset counts as one file |
 
 Run `uv run pytest -q` and `npm --prefix frontend test`. To package, build the frontend and run `uv build --wheel`. The local FastAPI service serves API documentation at `/docs`. Offline model fixtures exercise execution paths; live model validation uses a separately configured account.
 

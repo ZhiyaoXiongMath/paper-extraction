@@ -191,9 +191,11 @@ small {
   color: #fff;
   line-height: 0.99;
 }
-.brand b {
-  display: block;
+.brand-name {
   font-weight: 650;
+  font-size: 16px;
+  line-height: 1.2;
+  letter-spacing: -0.3px;
 }
 .mark {
   display: grid;
@@ -385,6 +387,17 @@ main {
 .config-help a {
   text-decoration: underline;
 }
+.diagnostic {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.diagnostic summary {
+  cursor: pointer;
+}
+.diagnostic p {
+  white-space: pre-wrap;
+}
 .notice.error {
   background: #fdf2ee;
   color: #8d352c;
@@ -562,6 +575,17 @@ td small {
   gap: 8px;
   font-size: 13px;
   font-weight: 600;
+}
+.concurrency-panel { margin-bottom: 20px; }
+.concurrency-panel .config-help { margin: 10px 0 0; }
+.concurrency-input { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.concurrency-input input {
+  width: 7em;
+  padding: 8px 10px;
+  border: 1px solid var(--line, #cfd8d0);
+  border-radius: 6px;
+  font: inherit;
+  color: inherit;
 }
 .control select {
   border: 1px solid #cdd7ce;

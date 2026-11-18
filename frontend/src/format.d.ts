@@ -1,4 +1,10 @@
-import type { BatchSummary, Draft, ReadBlock } from "./contracts";
+import type { BatchSummary, Draft, Paper, ReadBlock } from "./contracts";
+export function paperOutcome(paper: Paper): {
+  hasDraft: boolean;
+  title: string;
+  summary: string;
+  initialTab: string;
+};
 export function label(status?: string): string;
 export function tone(status?: string): string;
 export function terminal(status?: string): boolean;

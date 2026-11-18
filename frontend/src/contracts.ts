@@ -2,12 +2,15 @@ export interface Provider {
   id: string;
   label: string;
   configured: boolean;
+  key_env: string;
   text_model: string;
   vision_model: string;
 }
 export interface Config {
   providers: Provider[];
   default_provider?: string;
+  max_import_files?: number;
+  concurrency?: number;
 }
 export interface SourcePaper {
   id: string;
@@ -85,6 +88,8 @@ export interface BatchDetail extends BatchSummary {
   papers: Paper[];
 }
 export interface Evidence {
+  transcribed_from_image?: boolean;
+  evidence_type?: string;
   id: string;
   label: string;
   text: string;

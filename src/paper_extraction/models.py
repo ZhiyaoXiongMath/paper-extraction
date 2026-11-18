@@ -8,7 +8,9 @@ from typing import Literal, TypeVar
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from openai import LengthFinishReasonError
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, model_validator
+
+from .editorial import says_no_edit
 
 Model = TypeVar("Model", bound=BaseModel)
 
@@ -38,12 +40,46 @@ class Group(BaseModel):
 
 class Reference(BaseModel):
     key: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_.-]*$")
-    text: str = Field(min_length=1)
+    text: str = Field(min_length=1, description="Bibliographic entry content only; the renderer supplies the TeX item and environment")
 
 
 class EvidenceLink(BaseModel):
     block_id: str
     evidence_ids: list[str] = Field(min_length=1)
+
+
+class BlockReplacement(EvidenceLink):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(min_length=1, description="Complete revised text of this existing block, including its citations")
+
+
+class DraftPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    replacements: list[BlockReplacement] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def match_requested_edits(self, info: ValidationInfo):
+        ids = [row.block_id for row in self.replacements]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Return one complete replacement per target, combining all its corrections")
+        if info.context is None:
+            return self
+        targets = {row["block_id"]: row for row in info.context["repair_targets"]}
+        if set(ids) != set(targets):
+            raise ValueError(f"Replace exactly these existing blocks: {list(targets)}")
+        registered = {row["id"] for row in info.context["passages"]}
+        for row in self.replacements:
+            target = targets[row.block_id]
+            revised = " ".join(row.text.split())
+            if not revised or revised == " ".join(target["current_text"].split()):
+                raise ValueError(f"{row.block_id}: make the requested edit to the existing text")
+            locations = set(row.evidence_ids)
+            if not locations <= registered or not set(target["required_evidence_ids"]) <= locations:
+                raise ValueError(f"{row.block_id}: cite only supplied original passages and include "
+                                 f"all required locations {target['required_evidence_ids']}")
+            if len(locations) != len(row.evidence_ids):
+                raise ValueError(f"{row.block_id}: list each source ID once")
+        return self
 
 
 class Draft(BaseModel):
@@ -84,13 +120,58 @@ class Review(BaseModel):
     def require_consistency(self):
         if self.passed == bool(self.issues):
             raise ValueError("A passing review has no issues. A failing review identifies the defects.")
+        if any(says_no_edit(issue) for issue in self.issues):
+            raise ValueError("This failed visual review explicitly reports no defect. Return only "
+                             "visible issues which require correction. Pass when none remains.")
+        return self
+
+
+class EditorialDefect(BaseModel):
+    kind: Literal["incorrect_claim", "missing_required_content", "incorrect_attribution_or_locator", "improper_selection"]
+    draft_field: str = Field(min_length=1, description="Affected Draft JSON path, e.g. groups.0.theorem or history for a missing block")
+    current_excerpt: str = Field(description="Exact short passage from the current draft. Empty only for genuinely absent required content.")
+    evidence_id: str = Field(min_length=1, description="Original source location supporting the correction")
+    source_excerpt: str = Field(min_length=1, description="Short quotation of the decisive original wording, read at evidence_id")
+    required_change: str = Field(min_length=1, description="Actual difference in meaning, coverage or attribution and the specific edit that fixes it")
+    operation: Literal["replace", "insert", "remove", "recover"] = Field(
+        description="Concrete edit to this draft. Use recover only to reread evidence for a missing result on the extract route.")
+    replacement_text: str = Field(default="", description=(
+        "Exact revised wording for replace, or exact new wording for insert. Empty for remove or recover."))
+
+    @model_validator(mode="after")
+    def require_current_excerpt(self):
+        if self.kind != "missing_required_content" and not self.current_excerpt.strip():
+            raise ValueError("Quote the affected current draft passage for this defect")
+        if says_no_edit(self.required_change):
+            raise ValueError("This recommendation explicitly says no edit is needed. Return only actual "
+                             "edits, preserving any other genuine issue. Use pass if none remains.")
+        new = " ".join(self.replacement_text.split())
+        if self.operation in {"insert", "replace"}:
+            if not new or new.casefold() in {"unchanged", "none", "n/a", "no change"}:
+                raise ValueError("Supply the actual new wording for this edit")
+            if new == " ".join(self.current_excerpt.split()):
+                raise ValueError("The proposed wording is identical to the existing passage")
+        elif new:
+            raise ValueError("remove or recover must leave replacement_text empty")
+        if self.operation in {"remove", "replace"} and not self.current_excerpt.strip():
+            raise ValueError("Quote the existing text to remove or replace")
+        if self.operation == "recover" and self.kind != "missing_required_content":
+            raise ValueError("recover requires a missing source-supported contribution")
         return self
 
 
 class AdmissionReview(BaseModel):
     route: Literal["pass", "extract", "draft"]
-    issues: list[str]
-    evidence_ids: list[str]
+    issues: list[EditorialDefect] = Field(description="Only substantiated defects requiring a change in this draft. Empty for pass.")
+    evidence_ids: list[str] = Field(description="Original locations to reread on the extract route; otherwise use []")
+
+    def repair_issues(self) -> list[str]:
+        return list(dict.fromkeys(
+            f'{issue.draft_field}: {issue.required_change} '
+            + (f'[{issue.operation}: {issue.replacement_text}] ' if issue.replacement_text else "")
+            + f'(draft: {issue.current_excerpt or "[missing]"}; original {issue.evidence_id}: {issue.source_excerpt})'
+            for issue in self.issues
+        ))
 
     @model_validator(mode="after")
     def validate_route(self):
@@ -98,6 +179,8 @@ class AdmissionReview(BaseModel):
             raise ValueError("A pass has no issues; a repair identifies a source-specific issue")
         if self.route == "extract" and not self.evidence_ids:
             raise ValueError("Target missing claims by their original source IDs")
+        if any(item.operation == "recover" for item in self.issues) and self.route != "extract":
+            raise ValueError("Route evidence recovery to extract")
         return self
 
 
@@ -146,7 +229,8 @@ class Models:
             "api_key": settings["api_key"], "base_url": settings["base_url"],
             "timeout": settings.get("timeout", 120), "max_retries": 2,
         }
-        if settings["provider"].lower() in {"deepseek", "zhipu", "glm"}:
+        self.provider = settings["provider"].lower()
+        if self.provider in {"deepseek", "zhipu", "glm"}:
             opts["extra_body"] = {"thinking": {"type": "disabled"}}
         self.text = ChatOpenAI(model=settings["text_model"], **opts)
         self.vision = ChatOpenAI(model=settings["vision_model"], **opts)
@@ -184,8 +268,11 @@ class Models:
                 # ChatOpenAI aliases max_tokens to max_completion_tokens. These providers
                 # accept max_tokens in the JSON wire body, so supply the provider field.
                 budget = min(65536, max(16384, 2 * out))
-                model = model.model_copy(update={"extra_body": {**(model.extra_body or {}),
-                                                               "max_tokens": budget}})
+                if self.provider == "openai":
+                    model = model.model_copy(update={"max_tokens": budget})
+                else:
+                    model = model.model_copy(update={"extra_body": {**(model.extra_body or {}),
+                                                                   "max_tokens": budget}})
                 details = "Truncated output. Regenerate a complete JSON object from the original evidence."
             elif not text.strip():
                 details = "Blank JSON output. Produce a complete JSON object using the schema."
@@ -206,7 +293,7 @@ class Models:
                             document = {**original_findings, "candidates": merged}
                     if not details:
                         try:
-                            return schema.model_validate(document)
+                            return schema.model_validate(document, context=payload if schema is DraftPatch else None)
                         except ValidationError as exc:
                             errors, details = _field_errors(exc)
                             if schema is Findings:
@@ -216,7 +303,14 @@ class Models:
                     if not repair_indexes and details:
                         next_messages.append(HumanMessage(content=json_text({
                             "previous_complete_json": document, "correction": details,
-                            "preserve": "Keep every valid candidate, claim, and original evidence ID."
+                            "preserve": ("Keep only evidenced changes the current draft needs. "
+                                         "If no actionable defect remains, return pass with empty issues."
+                                         if schema is AdmissionReview else
+                                         "Keep all actually visible defects. If none remains, return passed=true with empty issues."
+                                         if schema is Review else
+                                         "Return one complete actual correction for each requested block, with its original evidence."
+                                         if schema is DraftPatch else
+                                         "Keep every valid candidate, claim, and original evidence ID.")
                         })))
             history.append(f"{attempt+1}: finish={finish}, output_tokens={out}, {details}")
             if repair_indexes:

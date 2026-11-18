@@ -5,7 +5,7 @@ import { request, paperUrl, errorMessage } from "./api";
 import {
   shortId,
   formatDate,
-  label,
+  paperOutcome,
   tone,
   stageName,
   kindName,
@@ -13,9 +13,11 @@ import {
 } from "./format.js";
 import Icon from "./Icon.vue";
 import MathText from "./MathText.vue";
-const props = defineProps<{ paper: Paper; back: string; retrying: boolean }>();
+const props = defineProps<{ paper: Paper; back: string; retrying: boolean; retryProvider: string }>();
 const emit = defineEmits(["retry"]);
-const tab = ref(props.paper.draft ? "reader" : "checks"),
+const outcome = computed(() => paperOutcome(props.paper));
+const tabSelected = ref(false);
+const tab = ref(outcome.value.initialTab),
   evidence = ref<Evidence | null>(null),
   evidenceKey = ref(""),
   evError = ref(""),
@@ -82,13 +84,14 @@ function closeEvidence() {
   evError.value = "";
 }
 function changeTab(t: string) {
+  tabSelected.value = true;
   tab.value = t;
   closeEvidence();
 }
 watch(
-  () => props.paper.draft,
-  (next, old) => {
-    if (next && !old) tab.value = "reader";
+  () => outcome.value.initialTab,
+  (next) => {
+    if (!tabSelected.value) tab.value = next;
   },
 );
 watch(
@@ -113,9 +116,7 @@ watch(
         {{ paper.draft.authors.join(" · ") }}
       </p>
     </div>
-    <span class="pill" :class="tone(paper.status)">{{
-      label(paper.status)
-    }}</span>
+    <span class="pill" :class="tone(paper.status)">{{ outcome.title }}</span>
   </section>
   <div class="file-actions">
     <a
@@ -144,15 +145,18 @@ watch(
       @click="emit('retry')"
     >
       <Icon name="refresh" :size="15" />{{
-        retrying ? "正在提交…" : "重新提取"
+        retrying ? "正在提交…" : "用 " + retryProvider + " 重新提取"
       }}
     </button>
   </div>
   <div v-if="paper.reason" class="notice error" role="status">
     <Icon name="fail" />
     <div>
-      <b>检查未通过</b>
-      <p>{{ paper.reason }}</p>
+      <p>{{ outcome.summary }}</p>
+      <details class="diagnostic">
+        <summary>查看技术诊断</summary>
+        <p>{{ paper.reason }}</p>
+      </details>
     </div>
   </div>
   <div class="tabs" aria-label="论文详情栏目">
@@ -347,6 +351,15 @@ watch(
               · 第 {{ evidence.line }} 行</template
             ></small
           >
+          <p
+            v-if="
+              evidence.transcribed_from_image ||
+              evidence.evidence_type === 'machine_transcription'
+            "
+            class="source-label"
+          >
+            机器转写 · 可对照原页
+          </p>
           <pre class="source-text">{{ evidence.text }}</pre>
           <a
             v-if="paper.kind === 'pdf'"

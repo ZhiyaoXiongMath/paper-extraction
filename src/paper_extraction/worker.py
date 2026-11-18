@@ -17,7 +17,7 @@ def process(home, pid):
         paper = store.paper(pid)
         if paper["status"] not in {"queued","running"}:
             return
-        settings = store.settings(paper["batch_id"])
+        settings = store.paper_settings(paper)
         private = provider_settings(settings["provider"], with_key=True)
         settings["api_key"] = private["api_key"]
         def notify(stage, data):
@@ -25,10 +25,11 @@ def process(home, pid):
         try:
             if not settings["api_key"]:
                 raise ValueError("缺少独立模型 API Key，请在模型设置查看变量名")
-            notify("start", {"message": "读取论文快照并恢复执行图"})
+            notify("start", {"message": "读取论文快照并恢复执行图", "provider": settings["provider"],
+                             "text_model": settings.get("text_model"), "vision_model": settings.get("vision_model")})
             result = run_paper(store.work(paper), Path(paper["source"]),
                                Path(paper["root"]) if paper["root"] else None,
-                               settings, notify)
+                               settings, notify, retry_legacy_review=paper["result"].get("retry_legacy_review", False))
             store.finish(paper, result)
         except Exception as exc:
             reason = str(exc).replace(settings["api_key"], "[redacted]") if settings["api_key"] else str(exc)

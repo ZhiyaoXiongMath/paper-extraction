@@ -9,6 +9,7 @@ from PIL import Image, ImageDraw
 from platformdirs import user_data_path
 
 PROVIDERS = {
+    "openai": ("OpenAI", "OPENAI_API_KEY", "OPENAI", "https://api.openai.com/v1", "gpt-5.4-mini", "gpt-5.4-mini"),
     "deepseek": ("DeepSeek", "DEEPSEEK_API_KEY", "DEEPSEEK", "https://api.deepseek.com", "deepseek-flash", "deepseek-flash"),
     "zhipu": ("智谱 GLM", "ZAI_API_KEY", "ZHIPU", "https://open.bigmodel.cn/api/paas/v4", "glm-5.3", "glm-4.6v"),
 }
@@ -16,6 +17,24 @@ PROVIDERS = {
 
 def env():
     return {**dotenv_values(Path(os.environ.get("PAPER_EXTRACTION_ENV_FILE", ".env"))), **os.environ}
+
+
+def workbench_limits(*, concurrency=None):
+    settings = env()
+
+    def integer(name, default, minimum):
+        try:
+            value = int(settings.get(name) or str(default))
+        except ValueError:
+            value = minimum - 1
+        if value < minimum:
+            raise ValueError(f"{name} 应为大于或等于 {minimum} 的整数。")
+        return value
+
+    return {
+        "concurrency": concurrency if concurrency is not None else integer("PAPER_EXTRACTION_CONCURRENCY", 2, 1),
+        "max_import_files": integer("PAPER_EXTRACTION_MAX_IMPORT_FILES", 1000, 0),
+    }
 
 
 def data_home():
@@ -43,8 +62,8 @@ def public_config():
         options.append(dict(id=id, label=label, configured=bool(config["api_key"]),
                             text_model=config["text_model"], vision_model=config["vision_model"],
                             key_env=key))
-    default = env().get("PAPER_EXTRACTION_PROVIDER") or "deepseek"
-    return dict(providers=options, default_provider=default if default in PROVIDERS else "deepseek")
+    default = env().get("PAPER_EXTRACTION_PROVIDER") or "openai"
+    return dict(providers=options, default_provider=default if default in PROVIDERS else "openai")
 
 
 def probe(provider: str, mode: str):

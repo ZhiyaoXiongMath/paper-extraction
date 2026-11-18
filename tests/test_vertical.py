@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from paper_extraction.api import create_app
+from fixture_selection import selection_reply
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "compactness"
 TITLE = "Compactness for Equicontinuous Families on an Interval"
@@ -69,6 +70,8 @@ def provider_answer(request, visual_pages):
                                 "decision_reason": "Fixed candidate from the teaching sample.",
                                 "evidence_ids": [match["id"]]})
         answer = {"candidates": results, "uncertainties": []}
+    elif schema == "WholePaperSelection":
+        answer = selection_reply(data["candidate_register"])
     elif schema == "Draft":
         ids = {c["kind"]: c["evidence_ids"] for c in data["candidates"]}
         answer = {
@@ -165,7 +168,7 @@ def test_full_batch_with_loopback_model_fixture(tmp_path, monkeypatch):
             assert not errors
             assert completed["status"] == "completed", completed["reason"]
             assert failed["status"] == "failed"
-            assert "history" in failed["reason"].lower(), failed["reason"]
+            assert "历史定理" in failed["reason"] and "当前核心结果" in failed["reason"], failed["reason"]
             assert sorted(images) == [1, 2]
             assert [r["page"] for r in completed["reviews"] if r["stage"] == "visual"] == [1, 2]
             assert any(e["data"].get("tool") == "read_span" for e in completed["events"])

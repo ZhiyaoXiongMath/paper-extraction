@@ -1,8 +1,10 @@
 import io
+import json
 import time
 import zipfile
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from paper_extraction.api import create_app
@@ -12,7 +14,6 @@ from paper_extraction import worker
 
 
 def upload(client, pairs):
-    import json
     files = [("files",(name.split("/")[-1],contents)) for name,contents in pairs]
     response = client.post("/api/imports",files=files,data={"paths":json.dumps([p[0] for p in pairs])})
     assert response.status_code == 200,response.text
@@ -111,3 +112,54 @@ def test_pasted_paths_cannot_leave_staging(tmp_path):
     with TestClient(create_app(tmp_path)) as client:
         res=client.post("/api/imports",files=[("files",("a.tex",b"A"))],data={"paths":'["../a.tex"]'})
         assert res.status_code == 400
+
+
+def test_configured_import_file_limit_counts_files_in_one_tex_project(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPER_EXTRACTION_MAX_IMPORT_FILES", "2")
+    with TestClient(create_app(tmp_path)) as client:
+        assert client.get("/api/config").json()["max_import_files"] == 2
+        schema = client.get("/openapi.json").json()
+        multipart = schema["paths"]["/api/imports"]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]
+        form = schema["components"]["schemas"][multipart["$ref"].split("/")[-1]]
+        assert set(form["required"]) == {"files", "paths"}
+        assert form["properties"]["files"]["type"] == "array" and form["properties"]["paths"]["type"] == "string"
+        papers = upload(client, [("main.tex", rb"\documentclass{article}\input{chapter}"), ("chapter.tex", b"chapter")])
+        assert len(papers["papers"]) == 1
+        parts = [("files", (name, b"data")) for name in ("main.tex", "chapter.tex", "image.png")]
+        result = client.post("/api/imports", files=parts, data={"paths": '["main.tex","chapter.tex","image.png"]'})
+        assert result.status_code == 400 and "最多允许 2 个文件" in result.json()["detail"]
+
+
+@pytest.mark.parametrize(("limit", "expected"), [(None, 400), ("1001", 200), ("0", 200)])
+def test_large_multipart_folder_and_paths_metadata(tmp_path, monkeypatch, limit, expected):
+    monkeypatch.setenv("PAPER_EXTRACTION_ENV_FILE", str(tmp_path / "isolated.env"))
+    monkeypatch.delenv("PAPER_EXTRACTION_MAX_IMPORT_FILES", raising=False)
+    if limit is not None:
+        monkeypatch.setenv("PAPER_EXTRACTION_MAX_IMPORT_FILES", limit)
+    handles = []
+    def stage(home, files, paths):
+        assert len(files) == len(paths) == 1001 and paths[0].endswith("0.pdf")
+        handles.extend(item.file for item in files)
+        assert not any(handle.closed for handle in handles)
+        return {"papers": []}
+    monkeypatch.setattr("paper_extraction.api.stage", stage)
+    parts = [("files", (f"{i}.pdf", b"x")) for i in range(1001)]
+    # Long nested source-folder paths together exceed Starlette's default 1 MiB text-field limit.
+    prefix = ("long-section-name/" * 60)
+    paths = json.dumps([f"{prefix}{i}.pdf" for i in range(len(parts))])
+    assert len(paths.encode()) > 1024 * 1024
+    with TestClient(create_app(tmp_path)) as client:
+        assert client.get("/api/config").json()["max_import_files"] == (int(limit) if limit else 1000)
+        response = client.post("/api/imports", files=parts, data={"paths": paths})
+    assert response.status_code == expected, response.text
+    if expected == 200:
+        assert all(handle.closed for handle in handles)
+    else:
+        assert not handles and "最多允许 1000 个文件" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("invalid", ["-1", "2.5", "none"])
+def test_invalid_import_limit_reports_key_at_startup(tmp_path, monkeypatch, invalid):
+    monkeypatch.setenv("PAPER_EXTRACTION_MAX_IMPORT_FILES", invalid)
+    with pytest.raises(ValueError, match="PAPER_EXTRACTION_MAX_IMPORT_FILES"):
+        create_app(tmp_path)

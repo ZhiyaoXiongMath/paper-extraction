@@ -5,7 +5,9 @@ import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from paper_extraction import agent
-from paper_extraction.models import AdmissionReview, Draft, Findings, Review
+from paper_extraction.models import AdmissionReview, Draft, DraftPatch, Findings, Review
+from paper_extraction.selection import WholePaperSelection
+from fixture_selection import selection_reply
 
 
 class ToolChat:
@@ -28,12 +30,15 @@ class OfflineModels:
         self.text = ToolChat(self)
         self.extracts = 0
         self.drafts = 0
+        self.patches = 0
         self.visual_passes = True
         self.defect_once = False
         self.interrupt_review = False
         self.missing_application = False
 
     def structured(self, schema, instructions, payload, image=None):
+        if schema is WholePaperSelection:
+            return WholePaperSelection.model_validate(selection_reply(payload["candidate_register"]))
         if schema is Findings:
             self.extracts += 1
             items = [{"kind": kind, "claim": "source claim", "assumptions": "compact",
@@ -44,26 +49,42 @@ class OfflineModels:
                 items.append({**items[0], "kind": "application", "claim": "for every dimension n >= 10",
                               "source_number": "Corollary 2"})
             return Findings(candidates=items, uncertainties=[])
+        if schema is DraftPatch:
+            self.patches += 1
+            return DraftPatch(replacements=[
+                {"block_id": item["block_id"], "text": item["current_text"].replace("all objects", "compact objects"),
+                 "evidence_ids": item["required_evidence_ids"]}
+                for item in payload["repair_targets"]])
         if schema is Draft:
             self.drafts += 1
+            object_class = "all objects" if self.defect_once else "compact objects"
             return Draft(title="Test", authors=["Author"], paragraph="Scope.",
                 history=[r"Historical claim \cite[p. 1]{source}."], shared_definitions=[],
-                groups=[{"definitions": [], "theorem": r"Source claim \cite[p. 1]{source}."}],
+                groups=[{"definitions": [], "theorem": rf"Source claim for {object_class} \cite[p. 1]{{source}}."}],
                 references=[{"key": "source", "text": "Author. Test."}],
                 evidence_links=[{"block_id": k, "evidence_ids": ["t1-1"]}
                                 for k in ("paragraph", "history.0", "groups.0.theorem")])
         if schema is AdmissionReview:
-            if self.missing_application and not any(c["kind"] == "application" for c in payload["known_candidates"]):
-                return AdmissionReview(route="extract", issues=["Missing independent application for every n >= 10"],
-                                       evidence_ids=["t1-1"])
+            if self.interrupt_review:
+                self.interrupt_review = False
+                raise ConnectionError("transient interruption")
+            if self.defect_once:
+                self.defect_once = False
+                return AdmissionReview(route="draft", issues=[{
+                    "kind": "incorrect_claim", "draft_field": "groups.0.theorem", "current_excerpt": "all objects",
+                    "evidence_id": "t1-1", "source_excerpt": "compact objects",
+                    "required_change": "Restrict the claim to compact objects. The draft also admits noncompact ones.",
+                    "operation": "replace", "replacement_text": "compact objects",
+                }], evidence_ids=[])
+            if self.missing_application and not any(c["kind"] == "application" for c in payload["candidates"]):
+                return AdmissionReview(route="extract", issues=[{
+                    "kind": "missing_required_content", "draft_field": "groups", "current_excerpt": "",
+                    "evidence_id": "t1-1", "source_excerpt": "an example exists for every dimension n >= 10",
+                    "required_change": "Recover the independent dimension-range existence application in Corollary 2.",
+                    "operation": "recover",
+                }], evidence_ids=["t1-1"])
             return AdmissionReview(route="pass", issues=[], evidence_ids=[])
         assert schema is Review
-        if self.interrupt_review and image is None:
-            self.interrupt_review = False
-            raise ConnectionError("transient interruption")
-        if self.defect_once and image is None:
-            self.defect_once = False
-            return Review(passed=False, issues=["Theorem 1 must say every dimension n >= 10, not some dimension."])
         if image is not None and not self.visual_passes:
             return Review(passed=False, issues=["Formula clipping."])
         return Review(passed=True, issues=[])
@@ -74,7 +95,8 @@ def paper(tmp_path, monkeypatch):
     models = OfflineModels()
     monkeypatch.setattr(agent, "Models", lambda _: models)
     source = tmp_path / "source.tex"
-    source.write_text("The source claim is a statement on compact objects.", encoding="utf-8")
+    source.write_text("The source claim is a statement on compact objects. Corollary 2: "
+                      "an example exists for every dimension n >= 10.", encoding="utf-8")
     work = tmp_path / "case"
     builds = []
 
@@ -118,9 +140,13 @@ def test_source_defect_returns_to_writer_without_rescanning(paper):
     model.defect_once = True
     result = run()
     assert result["status"] == "completed", result
-    assert model.drafts == 2 and model.extracts == 1 and len(builds) == 1
+    assert model.drafts == model.patches == model.extracts == len(builds) == 1
+    assert [(d["mode"], d["blocks"]) for n, d in events if n == "draft"] == [
+        ("full", []), ("patch", ["groups.0.theorem"])]
     assert result["reviews"][0]["passed"] is False
     assert result["reviews"][0]["route"] == "draft"
+    assert "compact objects" in result["reviews"][0]["issues"][0]
+    assert "compact objects" in result["draft"]["groups"][0]["theorem"]
     assert not any(data.get("targeted") for stage, data in events if stage == "extract")
 
 

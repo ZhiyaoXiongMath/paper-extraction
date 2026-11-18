@@ -4,7 +4,12 @@ import { ref, computed } from "vue";
 import { request, post, errorMessage } from "./api";
 import Icon from "./Icon.vue";
 import { droppedFiles, pickedFiles, type UploadFile } from "./files";
-const props = defineProps<{ providers: Provider[]; provider: string }>();
+const props = defineProps<{
+  providers: Provider[];
+  provider: string;
+  maxImportFiles?: number;
+  concurrency?: number;
+}>();
 const emit = defineEmits(["created", "provider"]);
 const picker = ref<HTMLInputElement>(),
   folder = ref<HTMLInputElement>(),
@@ -196,9 +201,15 @@ function choose(e: Event) {
           </select></label
         >
         <div class="config-pair">
-          <span>提取规范</span><b>Introduction v13</b>
+          <span>提取规范</span><b>paper-extraction-v13</b>
         </div>
         <div class="config-pair"><span>检查方式</span><b>全自动</b></div>
+        <div v-if="maxImportFiles !== undefined" class="config-pair">
+          <span>单次导入文件数</span><b>{{ maxImportFiles === 0 ? "不限" : "最多 " + maxImportFiles + " 个" }}</b>
+        </div>
+        <div v-if="concurrency !== undefined" class="config-pair">
+          <span>同时处理论文</span><b>{{ concurrency }} 篇 · <a href="#/settings">调整</a></b>
+        </div>
         <div v-if="chosen && !chosen.configured" class="notice">
           <span
             >此服务尚未配置 API Key。<a href="#/settings">查看模型设置</a></span

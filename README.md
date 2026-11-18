@@ -27,10 +27,10 @@ uv sync --locked --python 3.12
 uv run paper-extraction doctor
 ```
 
-复制仓库中的 `.env.example` 为 **启动目录**中的 `.env`，填入自己的 `DEEPSEEK_API_KEY` 或智谱 `ZAI_API_KEY`。也可以直接在环境中设置变量。若配置文件在其他位置，请用 `paper-extraction --env-file 配置路径 serve`。输入论文的文本和用于识别的页面图像会发送给选定的模型服务。
+首次运行时，把 [.env.example](.env.example) 复制到**启动目录**并命名为 `.env`。默认使用 OpenAI，填写自己的 `OPENAI_API_KEY`。已有配置文件时，在原文件中添加该变量并设置 `PAPER_EXTRACTION_PROVIDER=openai`。DeepSeek 和智谱也可在网页的模型设置中选择。环境变量同样有效。若配置文件在其他位置，请用 `paper-extraction --env-file 配置路径 serve`。论文片段和需要识别的页图会发送给选定的模型服务。
 
 ```shell
-paper-extraction doctor --live --provider deepseek
+paper-extraction doctor --live --provider openai
 paper-extraction serve
 ```
 
@@ -63,13 +63,15 @@ LangGraph 为每篇论文保存独立的 SQLite 检查点。LangChain 的模型�
 
 | 配置 | 作用 |
 |---|---|
-| `PAPER_EXTRACTION_PROVIDER` | 默认服务商，`deepseek` 或 `zhipu` |
-| `DEEPSEEK_API_KEY` / `ZAI_API_KEY` | 独立模型密钥 |
+| `PAPER_EXTRACTION_PROVIDER` | 默认 `openai`，可选 `deepseek`、`zhipu` |
+| `OPENAI_API_KEY` / `DEEPSEEK_API_KEY` / `ZAI_API_KEY` | 所选服务商的独立 API 密钥 |
+| `OPENAI_TEXT_MODEL` / `OPENAI_VISION_MODEL` | OpenAI 文本与看图模型，均默认 `gpt-5.4-mini` |
 | `DEEPSEEK_TEXT_MODEL` / `DEEPSEEK_VISION_MODEL` | DeepSeek 文本及图像模型，默认 `deepseek-flash` |
 | `ZHIPU_TEXT_MODEL` / `ZHIPU_VISION_MODEL` | 智谱文本及图像模型，默认 `glm-5.3` / `glm-4.6v` |
-| `DEEPSEEK_BASE_URL` / `ZHIPU_BASE_URL` | 对应模型服务的 API 地址 |
+| `OPENAI_BASE_URL` / `DEEPSEEK_BASE_URL` / `ZHIPU_BASE_URL` | 对应模型服务的 API 地址 |
 | `PAPER_EXTRACTION_HOME` | 本机论文快照、成品和任务数据库目录，默认使用平台用户数据目录 |
-| `PAPER_EXTRACTION_CONCURRENCY` | 同时处理的论文数量，默认 2 |
+| `PAPER_EXTRACTION_CONCURRENCY` | 同时处理的论文数量，默认 2，可填正整数。工作台保存的并发设置优先，并立即生效 |
+| `PAPER_EXTRACTION_MAX_IMPORT_FILES` | 单次上传的文件数，默认 1000，填 0 表示不限文件数。修改后重启服务。每个 PDF、TeX 主文件、章节和附件各计一个文件 |
 
 测试运行 `uv run pytest -q` 和 `npm --prefix frontend test`。生成安装包先构建网页，再运行 `uv build --wheel`。FastAPI 接口说明位于本地服务的 `/docs`。测试中的模型回放用于验证执行路径，真实模型验收使用独立配置。
 

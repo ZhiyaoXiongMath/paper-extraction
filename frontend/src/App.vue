@@ -10,7 +10,7 @@ import {
   metrics,
   formatDate,
   shortId,
-  label,
+  paperOutcome,
   tone,
   terminal,
   stageName,
@@ -122,7 +122,13 @@ async function fetchConfig() {
     config.value = await request<Config>("/config");
     let stored: string | null = null;
     try {
-      stored = localStorage.getItem("paper-extraction.provider");
+      const configuredDefault = config.value.default_provider || "";
+      if (localStorage.getItem("paper-extraction.default-provider") === configuredDefault) {
+        stored = localStorage.getItem("paper-extraction.provider");
+      } else {
+        localStorage.setItem("paper-extraction.default-provider", configuredDefault);
+        localStorage.removeItem("paper-extraction.provider");
+      }
     } catch {}
     const sources = config.value.providers;
     provider.value =
@@ -221,7 +227,7 @@ async function retry() {
   retrying.value = true;
   error.value = "";
   try {
-    await post("/papers/" + encodeURIComponent(paper.id) + "/retry", {});
+    await post("/papers/" + encodeURIComponent(paper.id) + "/retry", { provider: provider.value });
     await fetchDetail();
   } catch (e) {
     error.value = errorMessage(e);
@@ -268,7 +274,7 @@ onBeforeUnmount(() => {
     <aside class="sidebar">
       <a class="brand" href="#/"
         ><span class="mark"><Icon name="book" :size="25" /></span
-        ><span>Paper <b>Extraction</b></span></a
+        ><span class="brand-name">paper-extraction-v13</span></a
       >
       <nav aria-label="主导航">
         <a
@@ -302,7 +308,7 @@ onBeforeUnmount(() => {
             }}</span></template
           >
         </div>
-        <span class="profile"><i></i> Introduction v13</span>
+        <span class="profile"><i></i> paper-extraction-v13</span>
       </header>
       <main id="main" tabindex="-1">
         <div v-if="error" class="notice error" role="alert">
@@ -416,6 +422,8 @@ onBeforeUnmount(() => {
         <ImportPanel
           v-else-if="route.view === 'import'"
           :providers="config.providers"
+          :max-import-files="config.max_import_files"
+          :concurrency="config.concurrency"
           :provider="provider"
           @provider="setProvider"
           @created="openBatch"
@@ -424,12 +432,15 @@ onBeforeUnmount(() => {
           v-else-if="route.view === 'settings'"
           :providers="config.providers"
           :provider="provider"
+          :concurrency="config.concurrency"
           @provider="setProvider"
+          @concurrency="config.concurrency = $event"
         />
         <template v-else>
           <div v-if="loading && !detail" class="empty">正在读取批次…</div>
           <template v-else-if="detail">
             <PaperDetail
+              :retry-provider="providerName(provider)"
               v-if="selectedPaper"
               :key="selectedPaper.id"
               :paper="selectedPaper"
@@ -505,7 +516,7 @@ onBeforeUnmount(() => {
                   </div>
                   <span class="stage">{{ stageName(p.stage) }}</span
                   ><span class="pill" :class="tone(p.status)">{{
-                    label(p.status)
+                    paperOutcome(p).title
                   }}</span
                   ><a
                     class="icon-link"
