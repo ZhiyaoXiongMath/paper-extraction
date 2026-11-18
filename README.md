@@ -6,7 +6,7 @@
 
 ## 安装和启动
 
-需要 Python 3.11–3.14 及可运行 `pdflatex`、`kpsewhich` 的 TeX Live。完整的 TeX Live 安装包含所需宏包。精简安装须包含 newtx、amsmath、amsthm、mathrsfs、enumitem、needspace、microtype、etoolbox、hyperref、titlesec 及依赖。
+需要 Python 3.11–3.14 及可运行 `pdflatex`、`kpsewhich` 的 TeX Live。完整的 TeX Live 安装包含所需宏包。精简安装须包含 newtx、txfonts、amsmath、amsthm、mathrsfs、enumitem、needspace、microtype、etoolbox、hyperref、titlesec 及依赖。
 
 发行 wheel 内置网页。下载 wheel 后，在 Python 虚拟环境中运行：
 

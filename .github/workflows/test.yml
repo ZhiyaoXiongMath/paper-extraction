@@ -38,7 +38,7 @@ jobs:
             --no-doc-install --no-src-install --repository="$repo"
           "$tlroot/bin/x86_64-linux/tlmgr" --repository "$repo" --verify-repo=main install \
             amscls amsfonts enumitem etoolbox figureversions fontaxes fontname geometry hyperref \
-            jknapltx microtype mweights needspace newtx rsfs titlesec xcolor xkeyval xpatch xstring
+            jknapltx microtype mweights needspace newtx rsfs titlesec txfonts xcolor xkeyval xpatch xstring
       - name: Activate pdfLaTeX on Linux
         if: runner.os == 'Linux'
         run: echo "$RUNNER_TEMP/paper-texlive/bin/x86_64-linux" >> "$GITHUB_PATH"

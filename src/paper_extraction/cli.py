@@ -15,7 +15,7 @@ def doctor(args):
         print(f"{program}: {present or 'missing'}")
         ok = ok and bool(present)
     if shutil.which("kpsewhich"):
-        for package in ("newtxtext.sty","newtxmath.sty","needspace.sty","microtype.sty",
+        for package in ("newtxtext.sty","newtxmath.sty","t1xtt.tfm","needspace.sty","microtype.sty",
                         "mathrsfs.sty","enumitem.sty","titlesec.sty","hyperref.sty","etoolbox.sty"):
             found = subprocess.run(["kpsewhich",package],capture_output=True).returncode == 0
             print(f"{package}: {'ok' if found else 'missing'}")
