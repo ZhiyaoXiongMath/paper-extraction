@@ -160,6 +160,48 @@ def nomination_heading_label(value):
     return headings[0].group(0) if len(headings) == 1 else value
 
 
+def scoped_image_readings(active, preserved, records):
+    """Find a saved page reading for the same formal statement in this paper's catalog."""
+    # A scoped selector may receive a second observation of an already photographed
+    # result. A shared page number alone identifies neither the claim nor the crop.
+    wanted = set()
+    for row in active:
+        statement = current_statement(row, records)
+        if not statement or not statement["number"]:
+            continue
+        crops = {(r["source_id"], r["page"], tuple(r.get("region") or ()))
+                 for r in row.get("source_readings", [])}
+        for loc in row["evidence_ids"]:
+            page = records.get(loc, {}).get("page")
+            if page and statement["id"].startswith(loc + ".l"):
+                bound = [crop for crop in crops if crop[:2] == (loc, page)]
+                wanted.update((statement["id"], *crop) for crop in bound or [(loc, page, ())])
+    if not wanted:
+        return []
+    result = []
+    for row in preserved:
+        if not row.get("source_readings"):
+            continue
+        statement = current_statement(row, records)
+        if not statement:
+            continue
+        for reading in row["source_readings"]:
+            key = (statement["id"], reading["source_id"], reading["page"], tuple(reading.get("region") or ()))
+            if key not in wanted:
+                continue
+            # Legacy candidates sometimes carry every observation on their page.
+            # Require the reading itself to identify the same numbered source heading.
+            lines = [line.strip().lstrip("# ").replace("**", "") for line in reading["transcription"].splitlines()
+                     if line.strip()]
+            if not lines or not _CITATION_HEADING.match(_normalized(lines[0])):
+                continue
+            captions = {(printed_statement_kind(hit["title"]), hit["number"].replace("·", "."))
+                        for line in lines if (hit := _CITATION_HEADING.match(_normalized(line)))}
+            if captions == {(statement["kind"], statement["number"])} and reading not in result:
+                result.append(reading)
+    return result
+
+
 def damaged_heading_page(row, records):
     """Find a unique possible OCR-damaged heading for an image lookup, never for admission."""
     kind, number, _ = _candidate_locator(row.get("source_number"))

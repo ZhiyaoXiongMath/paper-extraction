@@ -18,7 +18,7 @@ from .direct_response import (EvidenceCoverageError, direct_retry_packet, direct
                               prepare_evidence_patch, provisional_direct_answer, safe_direct_errors, unfence,
                               with_evidence_links)
 from .profile_inputs import (is_optimized_workflow, is_reliable_workflow, uses_block_workflow,
-                             uses_evidence_link_patch, uses_grounded_revision)
+                             uses_evidence_link_patch, uses_grounded_revision, uses_scope_revision)
 from .settings import DEFAULT_REASONING_EFFORT, chat_options
 from .usage import invoke_tracked, observe_http
 
@@ -402,6 +402,8 @@ class Models:
         from .profile_inputs import uses_targeted_revision
         self.targeted_revision = uses_targeted_revision(settings)
         self.grounded_revision = uses_grounded_revision(settings)
+        self.scope_revision = uses_scope_revision(settings)
+        self.on_direct_format_repair = None
         text_options = chat_options(settings, "text", timeout=timeout, max_retries=2)
         text_client = ReasoningChatOpenAI if "extra_body" in text_options else ChatOpenAI
         self.text = text_client(**text_options)
@@ -424,7 +426,7 @@ class Models:
         wire_schema = schema
         local_blocks = getattr(self, "block_workflow", False) and schema.__name__ == "DirectResult"
         if local_blocks:
-            from .block_response import BlockDirectResult, expand_direct_blocks
+            from .block_response import BlockDirectResult, expand_direct_blocks, place_paragraph_positions
             wire_schema = BlockDirectResult
         targeted = getattr(self, "targeted_revision", False)
         review_form = targeted and schema.__name__ in {"EvidenceReview", "AdmissionReview"}
@@ -520,6 +522,9 @@ class Models:
                             retry_diagnostics = invalid[:16]
                             details = "; ".join(f"{d['field']}: {d['code']}" for d in retry_diagnostics)
                     if local_blocks and not details:
+                        moved = []
+                        if getattr(self, "scope_revision", False):
+                            document, moved = place_paragraph_positions(document)
                         try:
                             document = expand_direct_blocks(document)
                         except ValidationError as exc:
@@ -527,6 +532,22 @@ class Models:
                             for error in retry_diagnostics:
                                 error["field"] = "draft." + error["field"]
                             details = "; ".join(f"{d['field']}: {d['code']}" for d in retry_diagnostics)
+                        if moved:
+                            # Count a saved resend only after the complete canonical draft,
+                            # including every source binding, passes on the first attempt.
+                            verified = None
+                            if not details:
+                                try:
+                                    verified = schema.model_validate(document, context=payload)
+                                except ValidationError:
+                                    pass  # The usual correction path below handles the remaining defect.
+                            observer = getattr(self, "on_direct_format_repair", None)
+                            if observer:
+                                observer({"fields": moved, "schema_attempt": attempt + 1,
+                                          "validated": verified is not None,
+                                          "avoided_retry": verified is not None and attempt == 0})
+                            if verified is not None:
+                                return verified
                     if repair_indexes:
                         corrections = document.get("candidates") if isinstance(document, dict) else None
                         if not isinstance(corrections, list) or len(corrections) != len(repair_indexes):

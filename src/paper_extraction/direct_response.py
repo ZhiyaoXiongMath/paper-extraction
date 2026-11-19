@@ -129,6 +129,10 @@ def direct_retry_packet(payload, document, diagnostics):
     if document.get("source_checks"):
         previous["source_checks"] = document["source_checks"]
     locations = payload.get("source_locations") or payload.get("passages", [])
+    # A finish packet can represent locations already sent with full text by ID.
+    # The correction will drop unrelated passages; restore their directory entries.
+    by_id = {row["id"]: row for row in payload.get("passages", [])}
+    locations = [by_id.get(row["id"], row) if set(row) == {"id"} else row for row in locations]
     used = set()
 
     def find_ids(value):

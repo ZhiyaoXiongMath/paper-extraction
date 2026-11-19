@@ -16,6 +16,7 @@ from filelock import FileLock
 
 from .citation_layout import bibliography_targets, reader_draft_view, reading_blocks
 from .pdfops import page_count, render_page
+from .profile_inputs import uses_scope_revision
 from .profile_assets.tools import v13_check
 from .profile_variants import (
     checker_for_bundle, checker_for_release, companion_text, current_check, is_core_release,
@@ -28,6 +29,50 @@ _VALID_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]*")
 _CONTROL = re.compile(r"\\([A-Za-z]+|.)", re.DOTALL)
 _ENVIRONMENT = re.compile(r"\s*\{([a-zA-Z]+)\}")
 _ENVIRONMENTS = {"conditions", "relations", "aligned", "cases", "matrix", "pmatrix", "bmatrix", "enumerate"}
+_DISPLAY_TOKENS = re.compile(r"\\(?P<edge>begin|end)\s*\{(?P<env>[A-Za-z*]+)\}|"
+                             r"\\[A-Za-z]+|\\.|%[^\n]*|\$\$|[$}{]")
+
+
+def _unwrap_display_blocks(text: str) -> str:
+    """The profile's conditions and relations environments already open display math."""
+    if r"\begin" not in text or (r"\[" not in text and "$$" not in text):
+        return text
+    closers = []
+    outer = block = None
+    pieces, cursor = [], 0
+    for match in _DISPLAY_TOKENS.finditer(text):
+        token, edge, env = match[0], match["edge"], match["env"]
+        if token in {r"\verb", r"\detokenize", r"\lstinline"} or env in {"verbatim", "verbatim*", "lstlisting"}:
+            return text
+        marker = (edge, env) if edge else token
+        if closers and marker == closers[-1]:
+            closers.pop()
+            if outer and block and block[1] is None and len(closers) == 1 and edge == "end":
+                block = (block[0], match.end())
+            elif outer and not closers:
+                if block and block[1] and not text[block[1]:match.start()].strip():
+                    pieces.extend((text[cursor:outer[0]], text[block[0]:block[1]]))
+                    cursor = match.end()
+                outer = block = None
+            continue
+        if edge == "begin":
+            if env in {"conditions", "relations"} and outer:
+                if len(closers) == 1 and not text[outer[1]:match.start()].strip():
+                    block = (match.start(), None)
+                else:
+                    # Two self-displays or one nested inside another are ambiguous.
+                    block = None
+            closers.append(("end", env))
+        elif token in (r"\[", r"\(", "$$", "$", "{"):
+            if not closers and token in (r"\[", "$$"):
+                outer = (match.start(), match.end())
+            elif outer and token in (r"\[", "$$"):
+                block = None
+            closers.append({r"\[": r"\]", r"\(": r"\)", "{":"}"}.get(token, token))
+        elif edge == "end" or token in (r"\]", r"\)", "}"):
+            # Do not interpret a malformed outer group as proof of display ownership.
+            return text
+    return "".join([*pieces, text[cursor:]]) if pieces else text
 _COMMANDS = frozenset("""
 cite text mbox emph textit textbf textrm textnormal mathbb mathbf mathcal mathfrak mathrm mathsf
 mathit mathscr mathop operatorname boldsymbol pmod bmod mod frac dfrac tfrac binom sqrt
@@ -386,7 +431,7 @@ def renderer_context(draft: dict | None, candidates=()) -> dict:
 
 
 def render_tex(draft: dict, *, block_map: list | None = None, _legacy_citations: bool = False,
-               allow_empty_history: bool = False) -> str:
+               allow_empty_history: bool = False, _original_display_wrappers: bool = False) -> str:
     if not isinstance(draft, dict):
         raise ValueError("The model draft must be an object.")
     refs = _list(draft.get("references"), "references", 1)
@@ -404,6 +449,8 @@ def render_tex(draft: dict, *, block_map: list | None = None, _legacy_citations:
                for a in _list(draft.get("authors"), "authors", 1)]
     release = release_for_draft(draft)
     canonical = is_core_release(release)
+    normalize_displays = not _original_display_wrappers and uses_scope_revision(
+        {"workflow_revision": draft.get("workflow_revision"), "extraction_profile": draft.get("editorial_profile")})
     if canonical and (missing := bibliography_targets(draft, keys)):
         raise BuildFailure(" ".join(issue for row in missing for issue in row["diagnostics"]), missing)
     projected = {row["id"]: row for row in reading_blocks(draft, strict=True)} if canonical else {}
@@ -415,7 +462,8 @@ def render_tex(draft: dict, *, block_map: list | None = None, _legacy_citations:
         original = val
         if canonical:
             row = projected[draft_field]
-            body = _fragment(row["text"], field, keys)
+            text = _unwrap_display_blocks(row["text"]) if normalize_displays else row["text"]
+            body = _fragment(text, field, keys)
             opening = rf"\begin{{{env}}}"
             if env != "introparagraph":
                 caption = _fragment(row["caption"], field + " source", keys, formal=True, allow_blocks=False)
@@ -775,6 +823,9 @@ def recover_draft_case(work: Path, source: Path, source_root: Path | None, draft
         if historical_text != tex:
             if legacy_tex is None:
                 legacy_tex = [render_tex(draft, _legacy_citations=mode) for mode in (True, "copy-inline")]
+                # An immutable receipt may refer to an earlier rendering of the
+                # same JSON. Recover exactly those stored bytes and their verdict.
+                legacy_tex.append(render_tex(draft, _original_display_wrappers=True))
             if historical_text not in legacy_tex:
                 continue
         matches.append((case, old))

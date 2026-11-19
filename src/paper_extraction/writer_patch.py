@@ -98,7 +98,8 @@ def _unused_reference(draft, field, excerpt):
     return True
 
 
-def repair_targets(draft, verdict, registered, *, allow_collection_edits=False, resolve_fields=False):
+def repair_targets(draft, verdict, registered, *, allow_collection_edits=False, resolve_fields=False,
+                   pair_definition_sources=False):
     """Plan a patch only when every unresolved issue maps to an existing writable block."""
     if not draft or verdict.get("passed") is not False or not verdict.get("issues"):
         return []
@@ -106,7 +107,7 @@ def repair_targets(draft, verdict, registered, *, allow_collection_edits=False, 
         merged = {}
         for check in verdict["checks"]:
             rows = repair_targets(draft, check, registered, allow_collection_edits=allow_collection_edits,
-                                  resolve_fields=resolve_fields)
+                                  resolve_fields=resolve_fields, pair_definition_sources=pair_definition_sources)
             if not rows:
                 return []
             for row in rows:
@@ -169,11 +170,27 @@ def repair_targets(draft, verdict, registered, *, allow_collection_edits=False, 
         if review.repair_issues() != verdict["issues"] or verdict.get("evidence_ids"):
             return []
         lean = bool(draft.get("core_bindings"))
+        # A new definition and its heading may arrive as two JSON edits in either
+        # order. The heading alone never authorizes creating a definition.
+        inserting = set()
+        if pair_definition_sources and lean and allow_collection_edits:
+            for edit in review.issues:
+                if edit.operation == "insert" and not edit.current_excerpt.strip():
+                    path, _ = source_address(draft, edit.draft_field)
+                    if re.fullmatch(r"(?:shared_definitions|groups\.\d+\.definitions)\.\d+", path):
+                        inserting.add(path)
         for defect in review.issues:
             field = defect.draft_field
             attr = None
+            new_heading = False
             if resolve_fields:
                 field, attr = source_address(draft, field)
+                if inserting and not attr and defect.operation == "insert" and not defect.current_excerpt.strip():
+                    for owner in inserting:
+                        if field in (f"formal_sources.{owner}.source", f'formal_sources["{owner}"].source',
+                                     f"formal_sources['{owner}'].source"):
+                            field, new_heading = owner, True
+                            break
                 if attr:
                     value = draft["formal_sources"][field].get(attr, "as reported in" if attr == "reporting" else "")
                     if (defect.operation not in {"replace", "insert", "remove"}
@@ -210,7 +227,9 @@ def repair_targets(draft, verdict, registered, *, allow_collection_edits=False, 
             if extended and field in additions:
                 row["requires_formal_source"] = True
             edit = defect.model_dump()
-            if attr:
+            if new_heading:
+                edit["draft_field"] = f"formal_sources.{field}.source"
+            elif attr:
                 row.setdefault("attribution_fields", {})[attr] = value
             elif resolve_fields:
                 edit["draft_field"] = field
@@ -373,3 +392,10 @@ def apply_patch(draft, patch, packet, records):
     if any(key not in records for link in result["evidence_links"] for key in link["evidence_ids"]):
         raise ValueError("The repaired draft contains unregistered original evidence")
     return result
+
+
+def preview_exact_patch(draft, target, replacement, packet, records):
+    """Preview a local edit on a private copy, using the same renderer as publication."""
+    single = {**packet, "repair_targets": [target]}
+    preview = apply_patch(draft, DraftPatch(replacements=[replacement]), single, records)
+    render_tex(preview)

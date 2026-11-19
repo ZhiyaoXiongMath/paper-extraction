@@ -75,6 +75,24 @@ def test_grounded_request_preserves_verbatim_math_and_matches_budget(monkeypatch
     assert len(new[0]) + len(new[1]) < len(old[0]) + len(old[1])
 
 
+def test_new_scope_contract_does_not_reinterpret_saved_batch_settings():
+    from paper_extraction.profile_inputs import (
+        GROUNDED_WORKFLOW, TARGETED_WORKFLOW, WORKFLOW_REVISION, new_batch_profile,
+        uses_block_workflow, uses_grounded_revision, uses_scope_revision, uses_targeted_revision,
+    )
+
+    new = new_batch_profile()
+    previous = {**new, "workflow_revision": GROUNDED_WORKFLOW}
+    older = {**new, "workflow_revision": TARGETED_WORKFLOW}
+    assert new["workflow_revision"] == WORKFLOW_REVISION
+    assert uses_scope_revision(new) and uses_grounded_revision(new)
+    assert not uses_scope_revision(previous) and uses_grounded_revision(previous)
+    assert uses_targeted_revision(older) and not uses_grounded_revision(older)
+    assert all(uses_block_workflow(item) for item in (new, previous, older))
+    assert not uses_scope_revision({**new, "extraction_profile": "historical"})
+    assert not uses_scope_revision({"extraction_profile": new["extraction_profile"]})
+
+
 class ProviderError(Exception):
     def __init__(self, status, code):
         super().__init__(code)

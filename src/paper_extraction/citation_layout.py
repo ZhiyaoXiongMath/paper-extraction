@@ -42,6 +42,48 @@ def citation_keys(text):
     return {key.strip() for _, _, _, keys, _ in tex_citations(text) for key in keys.split(",")}
 
 
+_PREREQUISITE = re.compile(
+    r"(?:Hypothes(?:is|es)|Assumptions?|Axioms?|Definitions?|Conditions?)[ ~]+"
+    r"\d+(?:\.\d+)*(?:\([a-z0-9]+\))?"
+    r"(?:(?:--|–|[ ~]+and[ ~]+)\d+(?:\.\d+)*(?:\([a-z0-9]+\))?)*", re.I)
+
+
+def named_prerequisite_citations(body, attribution):
+    """Keep the named auxiliary locator in prose; its work is identified by the theorem heading."""
+    primary = list(tex_citations(attribution["source"]))
+    if (len(primary) != 1 or "," in primary[0][3] or attribution.get("prior")
+            or attribution.get("comparison")):
+        return body
+    # Limit the conversion to a grammatical apposition citing the same work.
+    # e.g. “the boundary conditions [1, Hypotheses 2–3]” has both a readable
+    # locator and an unambiguous owner. A citation of another work needs the writer.
+    for start, end, _, key, locator in reversed(list(tex_citations(body))):
+        if (key == primary[0][3] and _PREREQUISITE.fullmatch(locator)
+                and re.search(r"\b(?:conditions?|assumptions?|hypotheses|axioms?|definitions?|requirements?)[ ~]+$",
+                              body[:start], re.I) and _in_prose(body[:start])):
+            body = body[:start] + "(" + locator + " of the cited source)" + body[end:]
+    return body
+
+
+def _in_prose(prefix):
+    """Exclude math, macro arguments and nested text where the citation's role may differ."""
+    closers = {"{": "}", "(": ")", "[": "]", r"\[": r"\]", r"\(": r"\)"}
+    end = []
+    for match in re.finditer(r"\\begin\{[^{}]+\}|\\end\{[^{}]+\}|\\[A-Za-z]+|\\.|%[^\n]*|\$\$|[$(){}\[\]]", prefix):
+        token = match[0]
+        if token.startswith("%") and match.end() == len(prefix):
+            return False
+        if end and token == end[-1]:
+            end.pop()
+        elif token in closers:
+            end.append(closers[token])
+        elif token in ("$", "$$"):
+            end.append(token)
+        elif token.startswith(r"\begin{"):
+            end.append(token.replace(r"\begin", r"\end", 1))
+    return not end
+
+
 def bibliography_targets(draft, keys):
     """Locate missing keys before a paragraph's comparison is moved to a printed heading."""
     targets = []

@@ -107,6 +107,27 @@ function braceEnd(text, start) {
 const accents = { '"':"\u0308", "'":"\u0301", "\x60":"\u0300", "^":"\u0302", "~":"\u0303", "=":"\u0304", ".":"\u0307", c:"\u0327" };
 const delimiters = [["$$","$$",true], ["\\[","\\]",true], ["\\(","\\)",false], ["$","$",false]];
 
+// The shared TeX preamble defines both environments as one displayed aligned array.
+// Keep the rows, alignment points and mathematical content exactly as supplied.
+const profileOpening = /^\\begin\s*\{(conditions|relations)\}/;
+function profileDisplayAt(source) {
+  const start = profileOpening.exec(source);
+  if (!start) return null;
+  const endTag = new RegExp("\\\\end\\s*\\{" + start[1] + "\\}", "g");
+  endTag.lastIndex = start[0].length;
+  const end = endTag.exec(source);
+  if (!end) return null;
+  return { length: endTag.lastIndex, tex: "\\begin{aligned}" + source.slice(start[0].length, end.index) + "\\end{aligned}" };
+}
+
+function formula(raw, inner, display) {
+  // Older manuscripts can explicitly wrap a profile display in \[...\] or $$...$$.
+  const trimmed = inner.trim();
+  const profile = display && profileDisplayAt(trimmed);
+  const tex = profile && profile.length === trimmed.length ? profile.tex : inner;
+  return { type: "formula", raw, tex: unicodeMathToTex(tex), display };
+}
+
 function pieces(text) {
   const spans = [];
   for (let i = 0; i < text.length;) {
@@ -118,14 +139,17 @@ function pieces(text) {
       while (end !== -1 && right === "$" && text[end-1] === "\\") end = text.indexOf(right, end + 1);
       if (end > i + left.length) {
         const finish = end + right.length;
-        part = {start:i, end:finish, type:"formula", raw:text.slice(i,finish),
-          tex:unicodeMathToTex(text.slice(i + left.length,end)), display};
+        part = {start:i, end:finish, ...formula(text.slice(i,finish), text.slice(i + left.length,end), display)};
       }
     }
     if (!part && text[i] === "\\") {
+      const profile = profileDisplayAt(text.slice(i));
       const markup = /^\\(emph|textit|textbf)\{/.exec(text.slice(i));
       const accent = /^\\(["'\x60^~=.](?!\s)|c(?=\{|\s))(?:\{([A-Za-z])\}|\s*([A-Za-z]))/.exec(text.slice(i));
-      if (markup) {
+      if (profile) {
+        const end = i + profile.length;
+        part = {start:i, end, ...formula(text.slice(i,end), profile.tex, true)};
+      } else if (markup) {
         const from = i + markup[0].length, end = braceEnd(text, from);
         if (end >= 0) part = {start:i,end:end+1,type:markup[1] === "textbf" ? "strong" : "em",content:text.slice(from,end)};
       } else if (accent) {
@@ -192,8 +216,9 @@ export function renderMarkdown(text, candidateIds) {
 md.block.ruler.before("fence", "paper_display", (state, first, last, silent) => {
   const line = n => state.src.slice(state.bMarks[n] + state.tShift[n], state.eMarks[n]);
   const opening = line(first).trim();
-  if (opening !== "$$" && opening !== "\\[") return false;
-  const closing = opening === "$$" ? "$$" : "\\]";
+  const profile = profileOpening.exec(opening);
+  if (opening !== "$$" && opening !== "\\[" && profile?.[0] !== opening) return false;
+  const closing = profile ? "\\end{" + profile[1] + "}" : opening === "$$" ? "$$" : "\\]";
   let n = first + 1;
   while (n < last && line(n).trim() !== closing) n++;
   if (n === last) return false;
@@ -202,8 +227,9 @@ md.block.ruler.before("fence", "paper_display", (state, first, last, silent) => 
     const block = state.push("paper_span", "", 0);
     block.block = true;
     block.map = [first, n + 1];
-    block.meta = {type:"formula", display:true, tex:unicodeMathToTex(inner), raw:opening+"\n"+inner+"\n"+closing};
+    const raw = opening+"\n"+inner+"\n"+closing;
+    block.meta = formula(raw, profile ? raw : inner, true);
     state.line = n + 1;
   }
   return true;
-});
+}, {alt: ["paragraph"]});

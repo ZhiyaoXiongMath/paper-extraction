@@ -17,6 +17,7 @@ playwright-report/
 /dev-notes/
 /local-reports/
 /acceptance-results/
+/acceptance/
 /*方案.md
 /*优化细则.md
 /*优化指南.md
@@ -37,6 +38,8 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 .playwright-cli/
+/output/playwright/
+*.tsbuildinfo
 *.log
 *.tmp
 *.swp
@@ -44,3 +47,5 @@ htmlcov/
 # Superseded Vite bundles left in older workspaces. Current wheel assets stay tracked.
 /src/paper_extraction/static/assets/index-CmkkVQxy.js
 /src/paper_extraction/static/assets/index-KmKuHuuA.css
+/src/paper_extraction/static/assets/index-BJBFQiA_.js
+/src/paper_extraction/static/assets/index-CWg_0q7B.css

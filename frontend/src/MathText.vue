@@ -17,7 +17,10 @@ function navigate(event: MouseEvent) {
 }
 </script>
 
-<template><component :is="inline ? 'span' : 'div'" class="math-text" v-html="content" @click="navigate" /></template>
+<template>
+  <span v-if="inline" class="math-text" v-html="content" @click="navigate" />
+  <div v-else class="math-text" v-html="content" @click="navigate" />
+</template>
 
 <style scoped>
 .math-text { white-space: normal; overflow-wrap: anywhere; min-width: 0; }

@@ -28,8 +28,8 @@ function evidenceLabel(id: string, index: number) {
   <div v-if="blocks.length" class="reader" lang="en">
     <h2>Introduction</h2>
     <article v-for="b in blocks" :key="b.id" class="read-block">
-      <h3 v-if="b.heading">{{ b.heading }}<template v-if="b.caption"> <MathText
-        class="reader-locator" :text="'(' + b.caption + ').'" inline /></template></h3>
+      <h3 v-if="b.heading">{{ b.caption ? b.heading + ' ' : b.heading }}<MathText
+        v-if="b.caption" class="reader-locator" :text="'(' + b.caption + ').'" inline /></h3>
       <MathText :text="b.text" />
       <div class="citations">
         <button v-for="(id, i) in links[b.id]" :key="id" :class="{ active: id === activeEvidence }"

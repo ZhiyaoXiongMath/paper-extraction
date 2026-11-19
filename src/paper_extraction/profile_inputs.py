@@ -15,7 +15,8 @@ PREFLIGHT_WORKFLOW = "local-preflight-20261119"
 EVIDENCE_WORKFLOW = "evidence-links-20261119"
 BLOCK_WORKFLOW = "block-evidence-20261119"
 TARGETED_WORKFLOW = "targeted-revision-20261119"
-WORKFLOW_REVISION = "grounded-revision-20261119"
+GROUNDED_WORKFLOW = "grounded-revision-20261119"
+WORKFLOW_REVISION = "scope-revision-20261119"
 
 
 @contextmanager
@@ -57,27 +58,32 @@ def is_reliable_workflow(settings: dict) -> bool:
 
 
 def uses_local_preflight(settings: dict) -> bool:
-    return (settings.get("workflow_revision") in (PREFLIGHT_WORKFLOW, EVIDENCE_WORKFLOW, BLOCK_WORKFLOW, TARGETED_WORKFLOW, WORKFLOW_REVISION)
-            and settings.get("extraction_profile") == CURRENT_PROFILE)
+    return uses_evidence_link_patch(settings) or (
+        settings.get("workflow_revision") == PREFLIGHT_WORKFLOW and settings.get("extraction_profile") == CURRENT_PROFILE)
 
 
 def uses_evidence_link_patch(settings: dict) -> bool:
-    return (settings.get("workflow_revision") in (EVIDENCE_WORKFLOW, BLOCK_WORKFLOW, TARGETED_WORKFLOW, WORKFLOW_REVISION)
-            and settings.get("extraction_profile") == CURRENT_PROFILE)
+    return uses_block_workflow(settings) or (
+        settings.get("workflow_revision") == EVIDENCE_WORKFLOW and settings.get("extraction_profile") == CURRENT_PROFILE)
 
 
 def uses_block_workflow(settings: dict) -> bool:
-    return (settings.get("workflow_revision") in (BLOCK_WORKFLOW, TARGETED_WORKFLOW, WORKFLOW_REVISION)
-            and settings.get("extraction_profile") == CURRENT_PROFILE)
+    return uses_targeted_revision(settings) or (
+        settings.get("workflow_revision") == BLOCK_WORKFLOW and settings.get("extraction_profile") == CURRENT_PROFILE)
 
 
 def uses_targeted_revision(settings: dict) -> bool:
-    return (settings.get("workflow_revision") in (TARGETED_WORKFLOW, WORKFLOW_REVISION)
-            and settings.get("extraction_profile") == CURRENT_PROFILE)
+    return uses_grounded_revision(settings) or (
+        settings.get("workflow_revision") == TARGETED_WORKFLOW and settings.get("extraction_profile") == CURRENT_PROFILE)
 
 
 def uses_grounded_revision(settings: dict) -> bool:
-    """Only newly created batches use source-bound nomination and revision contracts."""
+    return (settings.get("workflow_revision") in (GROUNDED_WORKFLOW, WORKFLOW_REVISION)
+            and settings.get("extraction_profile") == CURRENT_PROFILE)
+
+
+def uses_scope_revision(settings: dict) -> bool:
+    """Enable scope comparison and lossless repairs only on the new execution contract."""
     return (settings.get("workflow_revision") == WORKFLOW_REVISION
             and settings.get("extraction_profile") == CURRENT_PROFILE)
 

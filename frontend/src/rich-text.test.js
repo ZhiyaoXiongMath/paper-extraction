@@ -51,6 +51,20 @@ test("candidate reasons link only registered text IDs while math and code keep t
   assert.doesNotMatch(renderMarkdown("c5"), /data-candidate-ref/);
 });
 
+test("profile displays preserve row math inside prose and literal code samples stay literal", () => {
+  const body = String.raw`&x_1=\frac{u}{v},\\&x_2=\bar w.`;
+  const block = String.raw`\begin{conditions}` + body + String.raw`\end{conditions}`;
+  for (const wrapped of [block, "\\[" + block + "\\]", "$$" + block + "$$"]) {
+    const html = renderMarkdown("Before " + wrapped + " after.");
+    assert.deepEqual(tex(html), ["\\begin{aligned}" + body.replaceAll("&", "&amp;") + "\\end{aligned}"]);
+    assert.match(html, /class="katex-display"/);
+    assert.match(html, /<mfrac>/);
+  }
+  assert.deepEqual(tex(renderMarkdown("`" + block + "`")), []);
+  assert.deepEqual(tex(renderMarkdown("```tex\n" + block + "\n```")), []);
+  assert.match(renderMarkdown(block.replace("\\bar w", "\\unknownMacro")), /math-fallback/);
+});
+
 test("raw HTML and active URL schemes cannot become executable paper markup", () => {
   const html = renderMarkdown('<img src=x onerror=alert(1)> [bad](javascript:alert(1)) **OK**');
   assert.doesNotMatch(html, /<img |href="javascript:/i);

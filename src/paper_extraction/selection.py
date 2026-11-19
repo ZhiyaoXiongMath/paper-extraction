@@ -13,7 +13,9 @@ from .models import SourceCheck
 from .scope_reconciliation import reconcile_scope
 from .profile_variants import COUNT_OVERRIDE
 from .lean_workflow import IndependentRole, ScreeningNote, independent_role_supported
-from .admission import admission_source, constrain_current_results, current_statement
+from .admission import admission_source, constrain_current_results, current_statement, scoped_image_readings
+from .profile_inputs import uses_scope_revision
+from .selection_scope import PLANNED_SCOPE, SELECTION_SCOPE
 from .request_budget import whole_source_budget
 
 SELECTION_VERSION = "v13-whole-paper-3"
@@ -450,6 +452,7 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
         affected.update(only_ids)
         preserved = {key: dict(row) for key, row in previous.items() if key not in affected}
         register = [r for r in register if r["candidate_id"] not in preserved]
+    scope_revision = uses_scope_revision(selection_settings or {})
     packet = selection_packet(catalog, register, optimized=optimized)
     if strict_types:
         source_options = {r["id"]: admission_source(r).get("formal_statement_options") for r in catalog}
@@ -459,8 +462,17 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
             return {**row, "formal_statement_options": options} if options else row
 
         packet["passages"] = [show_source(row) for row in packet["passages"]]
-    readings = {(r["source_id"], r["transcription"]): r for c in register for r in c.get("source_readings", [])}
-    readings.update(((r["source_id"], r["transcription"]), r) for r in checked_images)
+    def reading_key(r):
+        if scope_revision:
+            return r["source_id"], r.get("page"), tuple(r.get("region") or ()), r["transcription"]
+        return r["source_id"], r["transcription"]
+
+    readings = {reading_key(r): r for c in register for r in c.get("source_readings", [])}
+    readings.update((reading_key(r), r) for r in checked_images)
+    if scope_revision and preserved:
+        # Keep the original page and crop on each observation shown to the scoped selector.
+        origins = {r["id"]: r for r in catalog}
+        readings.update((reading_key(r), r) for r in scoped_image_readings(register, preserved.values(), origins))
     if lean and readings:
         packet["checked_source_images"] = list(readings.values())
     if lean and uncertainties:
@@ -497,6 +509,8 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
         from .profile_inputs import current_rules, node_prompt
         rubric = current_rules() if printed_cores is None else current_rules("B", "C")
         fields, correction = node_prompt("select"), node_prompt("correct_selection")
+        if scope_revision:
+            fields += "\n" + (PLANNED_SCOPE if printed_cores is None else SELECTION_SCOPE)
         if printed_cores is not None:
             fields += ("\nAssess each nominated candidate ID against B1/B2 or C1 and the retained printed results. "
                        "Give it a selected, unresolved or source-reasoned exclusion decision. If an already printed "
@@ -566,7 +580,7 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
             # page reading. Keep that evidence when checking the combined set.
             for row in preserved.values():
                 for reading in row.get("source_readings", []):
-                    verified_readings.setdefault((reading["source_id"], reading["transcription"]), reading)
+                    verified_readings.setdefault(reading_key(reading), reading)
         for reading in verified_readings.values():
             key = reading["source_id"]
             if key in records:
@@ -671,7 +685,8 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
                 return select_contributions(catalog, rows, models, current=True, lean=True, optimized=optimized, only_ids=checked_ids,
                     nominations=[{"candidate_id": key, "source_question": q.question} for key, q in zip(checked_ids, checks)],
                     nomination_sources=locs, checked_images=extra["source_images"], strict_types=strict_types,
-                    prefer_verified_variants=prefer_verified_variants)
+                    prefer_verified_variants=prefer_verified_variants,
+                    selection_settings=selection_settings if scope_revision else None)
         note = choice.summary
         if not note and not any(r["decision"] == "admitted" and r["kind"] in {"current", "application"} for r in rows):
             open_cores = [r for r in rows if r.get("scope_central_open") and r["decision"] == "unresolved"]

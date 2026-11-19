@@ -92,6 +92,31 @@ class BlockDirectResult(BaseModel):
     source_checks: list[SourceCheck] = Field(default_factory=list)
 
 
+def place_paragraph_positions(document):
+    """Move only the one unambiguous display field; leave all other keys for validation."""
+    draft = document.get("draft") if isinstance(document, dict) else None
+    if not isinstance(draft, dict) or not isinstance(draft.get("paragraph"), dict):
+        return document, []
+    groups = draft.get("groups")
+    if not isinstance(groups, list):
+        return document, []
+    corrected = list(groups)
+    moved = []
+    for i, group in enumerate(groups):
+        paragraph = group.get("paragraph") if isinstance(group, dict) else None
+        if not isinstance(paragraph, dict):
+            continue
+        position = paragraph.get("paragraph_position")
+        if position in ("before", "after") and group.get("paragraph_position", position) == position:
+            body = dict(paragraph)
+            del body["paragraph_position"]
+            corrected[i] = {**group, "paragraph": body, "paragraph_position": position}
+            moved.append(f"draft.groups.{i}.paragraph.paragraph_position")
+    if moved:
+        return {**document, "draft": {**draft, "groups": corrected}}, moved
+    return document, []
+
+
 def expand_direct_blocks(document):
     draft = document.get("draft") if isinstance(document, dict) else None
     if isinstance(draft, dict) and isinstance(draft.get("paragraph"), dict):

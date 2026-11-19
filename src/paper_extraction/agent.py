@@ -27,12 +27,12 @@ from .citation_layout import SOURCE_ROLE_GUIDANCE, reading_blocks, visual_page_c
 from .profile import BuildFailure, bind_formal_citations, bind_source_reference, build_case, renderer_context, saved_build_targets
 from .profile_inputs import (current_rules, installed_profile, is_optimized_workflow, is_reliable_workflow,
                              node_prompt, uses_block_workflow, uses_evidence_link_patch, uses_local_preflight,
-                             uses_grounded_revision, uses_targeted_revision, using_profile)
+                             uses_grounded_revision, uses_scope_revision, uses_targeted_revision, using_profile)
 from .request_budget import context_limit_error, whole_source_budget
 from .lean_workflow import (AddedCores, AddedCoresWithComparisons, DirectResult, EvidenceReview, FindingsDelta,
                             approved_cores, comparison_targets, direct_admission, fits_direct,
                             project_cores, selection_change, verify_bindings)
-from .block_response import BlockDirectResult, expand_direct_blocks
+from .block_response import BlockDirectResult, expand_direct_blocks, place_paragraph_positions
 from .summary_delivery import FORMAL_NAMES as _DOCUMENTS, artifact_names, write_run_report, write_summary
 from .profile_variants import CURRENT_PROFILE, READER_PROFILE, is_core_release, reader_guidance, release_for_draft
 from .usage import invoke_tracked, record_cache_hit, usage_stage
@@ -42,6 +42,7 @@ from .retry_context import attach_previous_failure
 from .sources import SourceIndex
 from .focused_evidence import projected_sources, repair_context, writer_candidates
 from .selection import SELECTION_VERSION, review_navigator, select_contributions
+from .selection_scope import DEFINITION_SCOPE, DIRECT_SCOPE, coverage_obligations
 from .scope_reconciliation import saved_count_exception, scope_failure_reason
 from .source_image_cache import cached_transcription
 from .direct_response import normalize_direct_shape
@@ -551,11 +552,14 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
     optimized = lean and is_optimized_workflow(settings)
     improve_layout = uses_local_preflight(settings)
     grounded = uses_grounded_revision(settings)
+    scope_revision = uses_scope_revision(settings)
     if current:
         rubric = current_rules("A", "B", "C")
         writing_rules = current_rules("budget", "A", "C", "D", "E")
         if uses_grounded_revision(settings):
             writing_rules += "\n" + SOURCE_ROLE_GUIDANCE
+        if scope_revision:
+            writing_rules += "\n" + DEFINITION_SCOPE
     else:
         reader_settings = reader_guidance()
         rubric = files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8") + "\n" + reader_settings
@@ -917,6 +921,8 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
             packet["passages"] = [r for r in original if r["id"] in locations]
         if lean:
             add_source_readings(packet, s)
+        if scope_revision and (coverage := coverage_obligations(candidates, draft)):
+            packet["coverage_to_verify"] = coverage
         return packet
 
     def add_source_readings(packet, s):
@@ -949,6 +955,8 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                 notify("extract", {"message": "补充证据后整篇请求超出输入预算，改为分段读取同一原文",
                                    "request_budget": request_size})
                 return None
+        if uses_scope_revision(settings) and hasattr(models, "on_direct_format_repair"):
+            models.on_direct_format_repair = lambda event: notify("extract", {"mode": "direct_format_repair", **event})
         try:
             return models.structured(DirectResult, direct_instructions, packet)
         except StructuredResponseError:
@@ -1026,36 +1034,77 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         }}
 
     def direct_finish(s):
+        scoped = uses_scope_revision(settings)
         evidence = s["direct_evidence_packet"]
         packet = {**direct_packet, "source_questions": evidence["source_questions"],
                   "source_images": evidence["source_images"]}
         if invalid := s.get("direct_invalid_checks"):
             packet["invalid_source_checks"] = invalid
+        reason = "no_validated_provisional"
         if provisional := s.get("direct_provisional"):
             provisional = normalize_direct_shape(provisional)
+            if scoped:
+                provisional, _ = place_paragraph_positions(provisional)
             packet["provisional_response"] = provisional
             try:
                 decision = expand_direct_blocks(provisional) if block_workflow else provisional
                 previous = DirectResult.model_validate(decision, context=direct_packet)
             except ValueError:
-                pass
+                reason = "invalid_provisional"
             else:
                 # Keep the source behind every provisional statement as well as
                 # the newly requested evidence. The response is still revalidated.
                 ids = set(evidence["passage_ids"])
                 for core in previous.cores:
                     ids.update(core.evidence_ids)
-                    ids.add(core.significance_source_id)
+                    if core.significance_source_id:
+                        ids.add(core.significance_source_id)
+                    if scoped and core.independent_role:
+                        ids.add(core.independent_role.source_id)
                 if previous.draft:
                     for row in previous.draft.evidence_links:
                         ids.update(row.evidence_ids)
                 if previous.summary:
                     ids.update(previous.summary.evidence_ids)
-                packet["passages"] = [row for row in direct_packet["passages"] if row["id"] in ids]
-                packet["source_locations"] = [
-                    {key: row[key] for key in ("id", "label", "section", "page", "file", "line") if key in row}
-                    for row in catalog
-                ]
+                missing_dependency = False
+                if scoped:
+                    # A heading may belong to another indexed passage. A failed search
+                    # or unread page leaves the scope of the open question unresolved.
+                    heading_ids = {core.source_statement_id for core in previous.cores if core.source_statement_id}
+                    for passage in direct_packet["passages"]:
+                        found = heading_ids.intersection(
+                            item["id"] for item in passage.get("formal_statement_options", ()))
+                        if found:
+                            ids.add(passage["id"])
+                            heading_ids.difference_update(found)
+                    missing_dependency = bool(heading_ids or invalid)
+                    for question in evidence["source_questions"]:
+                        ids.add(question["source_id"])
+                        if question.get("target_id"):
+                            ids.add(question["target_id"])
+                        ids.update(question.get("search_hits", ()))
+                        if question.get("lookup_result") or question.get("image_result") or question.get("search_hits") == []:
+                            missing_dependency = True
+                    ids.update(image["source_id"] for image in evidence["source_images"])
+                if scoped and (missing_dependency or not ids or not ids <= records.keys()):
+                    # An unresolved lookup or unidentified dependency can change the
+                    # whole-paper decision. Resume with the original complete snapshot.
+                    reason = "unresolved_source_dependency"
+                else:
+                    packet["passages"] = [row for row in direct_packet["passages"] if row["id"] in ids]
+                    reason = "validated_provisional" if len(ids) < len(records) else "all_passages_referenced"
+                    if not scoped or len(ids) < len(records):
+                        # The selected passages already carry their full location metadata.
+                        packet["source_locations"] = [
+                            {"id": row["id"]} if scoped and row["id"] in ids else
+                            {key: row[key] for key in ("id", "label", "section", "page", "file", "line") if key in row}
+                            for row in catalog
+                        ]
+        if scoped:
+            passages = packet["passages"]
+            notify("extract", {"mode": "direct_finish_context", "reason": reason,
+                               "source_ids": [row["id"] for row in passages], "catalog_count": len(catalog),
+                               "source_text_bytes": sum(len(row["text"].encode("utf-8")) for row in passages)})
         result = ask_whole_source(packet)
         if result is not None and result.source_checks:
             # Segmented reading retains the checked locations and page readings.
@@ -1084,6 +1133,10 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         return {**output, **_publish_result(work, {**s, **output}, notify, delivery)}
 
     def write_draft(s):
+        from .profile import render_tex
+        from .writer_patch import preview_exact_patch
+        from .grounded_writing import shared_repair_scope
+
         if drafts_started() >= MAX_DRAFT_ROUNDS:
             return {"draft_limit_reached": True}
         if not _selection_ready(s):
@@ -1097,7 +1150,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         defects = prior_check.get("defects", [])
         grounded = uses_grounded_revision(settings)
         targets = repair_targets(previous, prior_check, records.keys(), allow_collection_edits=uses_block_workflow(settings),
-                                 resolve_fields=grounded)
+                                 resolve_fields=grounded, pair_definition_sources=uses_scope_revision(settings))
         approved = approved_cores(s["candidates"]) if lean else {}
         structural = bool(lean and previous and prior_check.get("stage") == "select")
         if structural and (defects or prior_check.get("checks")):
@@ -1115,10 +1168,15 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                         local_review = {"stage": "review", "passed": False, "route": "draft", "defects": defects,
                                         "issues": check.repair_issues(), "evidence_ids": []}
                 targets = repair_targets(previous, local_review, records.keys(), allow_collection_edits=uses_block_workflow(settings),
-                                         resolve_fields=grounded)
+                                         resolve_fields=grounded, pair_definition_sources=uses_scope_revision(settings))
                 structural = bool(targets)
             else:
                 structural = False
+        unknown_definition_users = bool(uses_scope_revision(settings) and targets and not
+            shared_repair_scope(previous, targets, renderer_context(previous)["visible_headings"]))
+        if unknown_definition_users:
+            # A shared symbol can change the meaning of an implicitly dependent result.
+            targets, structural = [], False
         local_citation = None
         if (uses_evidence_link_patch(settings) and previous and prior_check.get("stage") == "review"
                 and prior_check.get("attempt") == s["attempt"] and prior_check.get("issues") == s.get("issues")
@@ -1128,7 +1186,8 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
             notify("draft", {"attempt": attempt, "mode": "local_citation", "message": "按复核意见缩短定理出处"})
         else:
             notify("draft", {"attempt": attempt, "mode": "patch" if targets or structural else "full",
-                             "blocks": [item["block_id"] for item in targets]})
+                             "blocks": [item["block_id"] for item in targets],
+                             **({"scope_reason": "shared_definition_implicit_users"} if unknown_definition_users else {})})
         instructions = writing_rules
         if drafts_started() >= MAX_DRAFT_ROUNDS:
             instructions += ("\nThis is the final writing round. Resolve the outstanding findings with the supplied "
@@ -1178,6 +1237,16 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                         for key in use["explicit_users"]:
                             if key not in scope:
                                 packet["context_blocks"][key] = block_at(previous, key)
+                    if uses_scope_revision(settings):
+                        # Supply the user's source as well as its statement. It may
+                        # come from a different section than the definition itself.
+                        users = {key for use in uses.values() for key in use["explicit_users"]}
+                        users.update(field for field, owner in previous["core_bindings"].items()
+                                     if any(use["scope"] == owner for use in uses.values()))
+                        ids = {loc for link in previous["evidence_links"] if link["block_id"] in users
+                               for loc in link["evidence_ids"]}
+                        present = {row["id"] for row in packet["passages"]}
+                        packet["passages"].extend(records[loc] for loc in sorted(ids - present))
                 if improve_layout and attempt > 2:
                     owners = previous.get("core_bindings", {})
                     evidence = {row["block_id"]: sorted(row["evidence_ids"]) for row in previous["evidence_links"]}
@@ -1213,9 +1282,13 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                                  "may also have implicit users. Coordinate changes to their requested dependent blocks "
                                  "in this patch. Never remove a necessary condition to make space.")
             if uses_targeted_revision(settings):
+                preview = None
+                if uses_scope_revision(settings):
+                    def preview(target, replacement):
+                        preview_exact_patch(previous, target, replacement, packet, records)
                 patch = write_targeted_patch(models, patch_prompt, packet, records, on_exact=lambda ids:
                     notify("draft", {"attempt": attempt, "mode": "exact_replacements", "blocks": ids,
-                                     "message": "采用复核给出的原句替换"}))
+                                     "message": "采用复核给出的原句替换"}), preview=preview)
             else:
                 patch = write_block_patch(models, patch_prompt, packet)
             draft = apply_patch(previous, patch, packet, records)
@@ -1249,7 +1322,6 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                     guidance += (" Where a retained paragraph's quoted relative phrase actually refers to a new result,"
                                  " bind its paragraph, exact phrase and core_id. Omit uncertain bindings.")
                 if grounded:
-                    from .profile import render_tex
                     def validate_merge(combined):
                         valid = AuthoritativeDraft.model_validate(combined, context={"approved_cores": approved})
                         render_tex(finalize_draft(valid, s["candidates"]))
@@ -1292,6 +1364,10 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
             draft = normalize_alignment(draft, improve_layout=improve_layout)
         if lean:
             verify_bindings(draft, approved_cores(s["candidates"]), set(records))
+        if targets and uses_scope_revision(settings):
+            # Confirm the combined edits after all citation binding, projection
+            # and alignment changes, before saving this round as a usable draft.
+            render_tex(draft)
         unknown = sorted({k for l in draft["evidence_links"] for k in l["evidence_ids"] if k not in records})
         issues = [f"Replace unregistered evidence IDs: {unknown[:5]}"] if unknown else []
         if save_draft:
@@ -1369,6 +1445,13 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                     ids = {loc for row in affected for loc in row["evidence_ids"]}
                     packet["passages"] = projected_sources(index.catalog(), ids, abridge=True)
                     packet["source_locations"] = [{"id": r["id"], "label": r.get("label", r["id"])} for r in index.catalog()]
+                if scope_revision:
+                    fields = {row["draft_field"] for row in changed_blocks}
+                    coverage = [item for item in coverage_obligations(s["candidates"], draft)
+                                if item["bound_field"] in fields or
+                                (item["bound_field"] or "").removesuffix(".theorem") + ".paragraph" in fields]
+                    if coverage:
+                        packet["coverage_to_verify"] = coverage
                 read_prompt += "\nchanged_blocks and number_dependent_blocks identify the review scope after the local edit. renumbered_definitions maps previous to current printed headings. context_blocks supplies adjacent material."
             else:
                 packet = selected_packet(s, s["draft"], reviewing=True)
@@ -1410,6 +1493,11 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                 else:
                     observation = _inspect(reader, read_prompt, packet)
             read_prompt += "\n" + (node_prompt("review") if current else REVIEW_GUIDANCE)
+            if scope_revision:
+                read_prompt += "\n" + DEFINITION_SCOPE
+                if packet.get("coverage_to_verify"):
+                    read_prompt += (" Verify the actual bound manuscript against each promised scope and its original "
+                                    "source. A missing exact quote can be a rephrasing; judge mathematical implication.")
             if grounded:
                 read_prompt += REVIEW_SCOPE
                 read_prompt += ("\nFor a missing result, use nominations with its original heading and a verbatim "
@@ -1722,6 +1810,14 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         block_workflow = uses_block_workflow(settings)
         direct_wire = BlockDirectResult if block_workflow else DirectResult
         direct_prompt = node_prompt("direct")
+        if uses_scope_revision(settings):
+            direct_prompt = direct_prompt.replace(
+                "Leave cores empty and draft and summary null.",
+                "Usually return only the checks. If a complete, source-supported decision is already available "
+                "and only a local detail needs checking, you may include that decision provisionally. "
+                "Do not write a new draft just to request evidence. If overall selection or scope depends "
+                "on the answer, return only the checks.",
+            )
         if block_workflow:
             direct_prompt = direct_prompt.replace(
                 "(core_bindings, formal_sources, evidence_links)",
@@ -1731,6 +1827,8 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         direct_instructions = current_rules() + "\n" + direct_prompt
         if uses_grounded_revision(settings):
             direct_instructions += "\n" + SOURCE_ROLE_GUIDANCE
+        if scope_revision:
+            direct_instructions += "\n" + DIRECT_SCOPE + " " + DEFINITION_SCOPE
         if not block_workflow and uses_evidence_link_patch(settings):
             direct_instructions += (
                 "\nFor a draft, evidence_links must contain exactly one row for each existing body block: "

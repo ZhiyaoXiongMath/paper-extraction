@@ -1,7 +1,7 @@
 """Apply a reviewer's exact text edit without asking a writer to restate the block."""
 import re
 
-from .citation_layout import citation_keys
+from .citation_layout import citation_keys, named_prerequisite_citations
 from .models import BlockReplacement, DraftPatch
 from .writer_patch import write_block_patch
 
@@ -36,11 +36,21 @@ def _exact_row(target, keys):
     return BlockReplacement(block_id=target["block_id"], text=text, evidence_ids=ids)
 
 
-def write_targeted_patch(models, instructions, packet, records, *, on_exact=None):
+def write_targeted_patch(models, instructions, packet, records, *, on_exact=None, preview=None):
     keys = {ref["key"] for ref in packet["references"]}
     local, remaining = [], []
     for target in packet["repair_targets"]:
         exact = _exact_row(target, keys)
+        if exact and preview:
+            if formal := target.get("formal_source"):
+                exact = exact.model_copy(update={"text": named_prerequisite_citations(exact.text, formal)})
+            # Give a failed local splice to the *existing* scoped writer, with
+            # the error from the actual publication renderer and the old evidence.
+            try:
+                preview(target, exact)
+            except ValueError as exc:
+                remaining.append({**target, "diagnostics": [str(exc)[:600]]})
+                continue
         if exact:
             local.append(exact)
         else:
@@ -50,7 +60,8 @@ def write_targeted_patch(models, instructions, packet, records, *, on_exact=None
     if not remaining:
         return DraftPatch.model_validate({"replacements": local}, context=packet)
     if not local:
-        return write_block_patch(models, instructions, packet, coupled_references=True, records=records)
+        return write_block_patch(models, instructions, {**packet, "repair_targets": remaining},
+                                 coupled_references=True, records=records)
 
     # The writer still sees what the neighbouring definitions and statements will
     # say. The saved draft is updated atomically after all edits are available.

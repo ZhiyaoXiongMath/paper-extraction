@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { readerFragment } from "./reader.js";
+import { createSSRApp } from "vue";
+import { renderToString } from "vue/server-renderer";
+import { createServer } from "vite";
 
 test("a saved historical caption renders its locator and preserves the statement", () => {
   const body = "Every convergent sequence in a metric space has a unique limit.";
@@ -47,4 +50,42 @@ test("the English reader localizes known legacy locator fields only inside citat
   const body = "Original title «定理» \\cite[\\S1，引理 2；第 8--9 页]{source}.";
   assert.equal(readerFragment(body, "", [], "en").text,
     "Original title «定理» [Source paper, §1, Lemma 2; pp. 8–9].");
+});
+
+test("the actual reader renders aligned profile equations, separated captions and source buttons", async () => {
+  const vite = await createServer({
+    optimizeDeps: { noDiscovery: true, include: [] },
+    server: { middlewareMode: true, hmr: false, watch: null },
+  });
+  try {
+    const { default: Reader } = await vite.ssrLoadModule("/src/IntroductionReader.vue");
+    const draft = { reader_blocks: [
+      { id: "groups.0.theorem", heading: "Theorem 1", caption: "[1, Theorem 3.3]",
+        text: String.raw`Assume:
+\begin{conditions}
+&\operatorname{rank} B_i=\operatorname{rank} B_i',\\
+&\det B_i=\det B_i'\quad\text{if }n=m.
+\end{conditions}
+Then the matrices lie in one orbit.` },
+      { id: "shared_definitions.0", heading: "Definition 1", caption: "[1, §4]",
+        text: String.raw`\[
+\begin{relations}
+A&=B\\
+ &=C.
+\end{relations}
+\]` },
+    ] };
+    const html = await renderToString(createSSRApp(Reader, {
+      draft, links: { "groups.0.theorem": ["p2-1"] }, activeEvidence: "p2-1",
+    }));
+    assert.equal((html.match(/class="katex-display"/g) || []).length, 2);
+    assert.equal((html.match(/<mtr>/g) || []).length, 4);
+    assert.match(html, /Theorem 1 <span/);
+    assert.match(html, /Definition 1 <span/);
+    assert.match(html, /Evidence · PDF p\. 2/);
+    assert.match(html, /Then the matrices lie in one orbit/);
+    assert.doesNotMatch(html, /math-fallback|\\(?:begin|end)\{(?:conditions|relations)\}/);
+  } finally {
+    await vite.close();
+  }
 });

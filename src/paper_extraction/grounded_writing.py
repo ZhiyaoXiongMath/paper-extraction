@@ -77,6 +77,23 @@ def definition_uses(draft, targets, visible_headings):
     return result
 
 
+def shared_repair_scope(draft, targets, visible_headings):
+    """Prove coverage of shared-definition edits from the manuscript's local coordinates."""
+    owners = set(draft.get("core_bindings", {}))
+    body_targets = {row["block_id"] for row in targets}
+    shared = [row for row in targets if row["block_id"].startswith("shared_definitions.")
+              and (row.get("remove") or any(
+                  edit["draft_field"] == row["block_id"] for edit in row.get("defects", ())))]
+    if not shared:
+        return True
+    uses = definition_uses(draft, shared, visible_headings)
+    # A list of numbered references proves who uses the definition explicitly.
+    # Every other retained result could use it implicitly. Keep the full writer
+    # if any result would be absent from both the repair targets and these users.
+    return all(owners <= body_targets | set(uses.get(row["block_id"], {}).get("explicit_users", ()))
+               for row in shared)
+
+
 class AdditionRequest(dict):
     """The wire receives only new cores and source excerpts. Validate against the full draft locally."""
 
