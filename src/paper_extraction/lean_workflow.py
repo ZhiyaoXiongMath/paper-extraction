@@ -9,7 +9,7 @@ from typing import ClassVar, Literal
 
 from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, model_validator
 
-from .admission import constrain_current_results
+from .admission import constrain_current_results, unresolved_source_reason
 from .citation_types import FormalSource
 from .models import MAX_GROUP_DEFINITIONS, AdmissionReview, AuthoritativeDraft, Candidate, Reference, SourceCheck, json_text
 
@@ -157,7 +157,7 @@ def direct_admission(result, records, *, strict_types=False):
         labels = "、".join((r.get("source_number") or r["candidate_id"]) for r in (unresolved or candidates))
         return candidates, None, {"kind": "insufficient_evidence" if unresolved else "no_qualifying_result",
             "question": f"《{result.draft.title}》给出了哪些独立的主要成果？",
-            "reason": (f"候选 {labels} 缺少足以确认其原文正式类型或定位的依据。" if unresolved else
+            "reason": (unresolved_source_reason(unresolved, records) if unresolved else
                        f"候选 {labels} 可以从原文定位，但现有依据只支持其陈述、背景或证明用途，未能确立合格的独立贡献。"),
             "evidence_ids": list(dict.fromkeys(i for row in unresolved or candidates for i in row["evidence_ids"]))}
     draft = project_cores(result.draft.model_dump(), approved)

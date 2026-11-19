@@ -24,6 +24,8 @@ _DISPLAY_TITLE = (r"Theorem|Théorème|Theoreme|Satz|Teorema|定理|Corollary|Co
 _TITLE = re.compile(rf"^(?P<title>{_DISPLAY_TITLE})(?![^\W\d_])", re.I)
 _NUMBER = r"(?:[A-Z]\.\d+|[0-9]+)(?:[.·]\d+)*[a-zA-Z]?|(?:[IVXLCDM]{2,}|[A-Z])"
 _LOCATOR_NUMBER = re.compile(rf"(?P<number>{_NUMBER})(?![\w·]|\.\d)")
+_LEADING_NUMBER = re.compile(rf"^(?:\(({_NUMBER})\)|({_NUMBER})\.)\s*")
+_PARENTHESIZED_NUMBER = re.compile(rf"^\(({_NUMBER})\)")
 _MODEL_TITLE = re.compile(rf"^(?P<title>{_DISPLAY_TITLE}|Thm\.?|Cor\.?|Prop\.?|Lem\.?)(?![^\W\d_])", re.I)
 _CITATION_HEADING = re.compile(rf"(?<!\w)(?P<title>{_DISPLAY_TITLE})\s+(?P<number>{_NUMBER})(?![\w·]|\.\d)", re.I)
 _LABEL_REF = re.compile(r"\\(?:ref|eqref|autoref|cref)\s*\{([^{}]+)\}")
@@ -53,10 +55,20 @@ def printed_statement_kind(title):
 def _pdf_statement(line):
     """Recognize headings at the start of text lines, with a visible boundary."""
     line = _normalized(line).replace("\x02", "")
+    prefix = _LEADING_NUMBER.match(line)
+    if prefix:
+        line = line[prefix.end():]
     match = _TITLE.match(line)
     if not match or match["title"][0].islower():
         return None
     title, tail = match["title"], line[match.end():].strip()
+    if prefix:
+        # A list entry like "2. Theorem 4.1 implies ..." cites another result.
+        # Require the caption to end here or at printed caption punctuation.
+        if tail and (not _CAPTION_END.match(tail) or _PARENTHESIZED_NUMBER.match(tail)):
+            return None
+        number = prefix[1] or prefix[2]
+        return printed_statement_kind(title), number.replace("·", "."), f"{title} {number}"
     number = _LOCATOR_NUMBER.match(tail)
     if number:
         rest = tail[number.end():].strip()
@@ -69,14 +81,33 @@ def _pdf_statement(line):
     return None
 
 
+def with_page_reading(record, transcription):
+    """Keep the original line boundary when supplementing PDF text with an image reading."""
+    return {**record, "original_line_count": record.get("original_line_count", len(record["text"].splitlines())),
+            "text": record["text"] + "\n" + transcription}
+
+
 def source_statement_options(record):
     """Typed, source-local statement identities usable in model requests and checks."""
     if record.get("page"):
-        return [{"id": f"{record['id']}.l{line_no}", "kind": kind, "number": number, "heading": heading,
-                 "unnumbered": not number}
-                for line_no, line in enumerate(record["text"].splitlines(), 1)
-                if (parts := _pdf_statement(line))
-                for kind, number, heading in (parts,)]
+        options = []
+        original_titles = set()
+        lines = record["text"].splitlines()
+        original_count = record.get("original_line_count", len(lines))
+        for line_no, line in enumerate(lines, 1):
+            parts = _pdf_statement(line)
+            if parts is None:
+                continue
+            kind, number, heading = parts
+            # A page reading may repeat a printed title. Two original headings
+            # with the same number must still remain distinct and ambiguous.
+            if line_no <= original_count:
+                original_titles.add((kind, number))
+            elif number and (kind, number) in original_titles:
+                continue
+            options.append({"id": f"{record['id']}.l{line_no}", "kind": kind, "number": number,
+                            "heading": heading, "unnumbered": not number})
+        return options
     return [{"id": statement["id"], "kind": printed_statement_kind(statement["kind"]) or "other",
              "number": statement["number"], "heading": statement["kind"], "label": statement["label"],
              "unnumbered": statement["unnumbered"]}
@@ -98,6 +129,12 @@ def admission_source(record):
 
 def _candidate_locator(value):
     text = _normalized(value)
+    prefix = _LEADING_NUMBER.match(text)
+    if prefix:
+        after = text[prefix.end():]
+        if not after or (title := _TITLE.match(after)):
+            kind = printed_statement_kind(title["title"]) if after else None
+            return kind, (prefix[1] or prefix[2]).replace("·", "."), ""
     match = _MODEL_TITLE.match(text)
     kind = None
     if match:
@@ -127,8 +164,7 @@ def _cited_heading(citation):
     return printed_statement_kind(ref["title"]), ref["number"].replace("·", ".")
 
 
-def current_statement(row, records, heading_citation=""):
-    """Resolve exactly one compatible original heading from the cited evidence."""
+def _resolve_statement(row, records, heading_citation=""):
     # Require the assigned evidence to contain the actual heading. Setting and
     # proof passages supplied when finding leads do not justify a new locator.
     ids = row.get("selection_evidence_ids") or row.get("evidence_ids", ())
@@ -137,12 +173,25 @@ def current_statement(row, records, heading_citation=""):
     manual_id = row.get("source_statement_id")
     if manual_id:
         option = options.get(manual_id)
+        if option is None:
+            # A saved binding may reference an appended image transcription
+            # that now resolves to one original line on the same evidence page.
+            loc, _, lineno = manual_id.rpartition(".l")
+            rec = records.get(loc, {}) if loc in ids and lineno.isdecimal() else {}
+            if "original_line_count" in rec and int(lineno) > rec["original_line_count"]:
+                lines = rec["text"].splitlines()
+                parts = _pdf_statement(lines[int(lineno) - 1]) if int(lineno) <= len(lines) else None
+                if parts and parts[1]:
+                    originals = [s for s in options.values() if s["id"].startswith(loc + ".l") and
+                                 (s["kind"], s["number"]) == parts[:2]]
+                    if len(originals) == 1:
+                        option = originals[0]
         if option and (not kind or option["kind"] == kind) and (
                 not number or option["number"] == number or (not option["number"] and not option["unnumbered"])):
-            return option
-        return None
+            return option, ""
+        return None, "指定的标题位置与所引原文的编号或类型不一致。"
     if not kind and not number and not label:
-        return None
+        return None, "没有可用于匹配的编号、类型或源码标签。"
     matches = [s for s in options.values() if (not kind or s["kind"] == kind)
                and ((number and s["number"] == number) or
                     (label and s.get("label") == label) or
@@ -151,13 +200,40 @@ def current_statement(row, records, heading_citation=""):
         # A bound formal citation can distinguish Theorem 1 from Corollary 1
         # on the same page. It cannot supply a new heading or number.
         matches = [s for s in matches if (s["kind"], s["number"]) == hint]
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) == 1:
+        return matches[0], ""
+    if matches:
+        return None, "有多个符合所给编号和类型的标题，无法唯一定位。"
+    return None, "在所引位置没有找到与候选编号和类型相符的正式标题。"
+
+
+def current_statement(row, records, heading_citation=""):
+    """Resolve exactly one compatible original heading from the cited evidence."""
+    return _resolve_statement(row, records, heading_citation)[0]
+
+
+def unresolved_source_reason(rows, records):
+    details = []
+    for row in rows:
+        ids = row.get("selection_evidence_ids") or row.get("evidence_ids", ())
+        locations = "、".join(dict.fromkeys(records.get(loc, {}).get("label") or loc for loc in ids))
+        label = row.get("source_number") or row["candidate_id"]
+        details.append(f"候选 {label}（{locations or '无已绑定位置'}）：{row['decision_reason']}")
+    return "\n".join(details)
 
 
 def nomination_heading_label(value):
     """A chapter or attribution may precede the single explicit numbered heading."""
     headings = list(_CITATION_HEADING.finditer(_normalized(value).replace("~", " ")))
     return headings[0].group(0) if len(headings) == 1 else value
+
+
+def _transcribed_heading(line):
+    normalized = _normalized(line)
+    if hit := _CITATION_HEADING.match(normalized):
+        return printed_statement_kind(hit["title"]), hit["number"].replace("·", ".")
+    parts = _pdf_statement(normalized)
+    return parts[:2] if parts and parts[1] else None
 
 
 def scoped_image_readings(active, preserved, records):
@@ -193,10 +269,9 @@ def scoped_image_readings(active, preserved, records):
             # Require the reading itself to identify the same numbered source heading.
             lines = [line.strip().lstrip("# ").replace("**", "") for line in reading["transcription"].splitlines()
                      if line.strip()]
-            if not lines or not _CITATION_HEADING.match(_normalized(lines[0])):
+            if not lines or not _transcribed_heading(lines[0]):
                 continue
-            captions = {(printed_statement_kind(hit["title"]), hit["number"].replace("·", "."))
-                        for line in lines if (hit := _CITATION_HEADING.match(_normalized(line)))}
+            captions = {heading for line in lines if (heading := _transcribed_heading(line))}
             if captions == {(statement["kind"], statement["number"])} and reading not in result:
                 result.append(reading)
     return result
@@ -217,7 +292,14 @@ def damaged_heading_page(row, records):
         if not rec.get("page"):
             continue
         for line in rec["text"].splitlines():
-            match = header.match(line)
+            line = _normalized(line)
+            prefix = _LEADING_NUMBER.match(line)
+            if prefix:
+                if (prefix[1] or prefix[2]).replace("·", ".") != number:
+                    continue
+                match = re.match(r"^([^\W\d_]{4,})(?=\s*(?:\.(?!\d)|[—–:]))", line[prefix.end():])
+            else:
+                match = header.match(line)
             if not match or not match[1][0].isupper():
                 continue
             word = "".join(c for c in unicodedata.normalize("NFKD", match[1].casefold()) if not unicodedata.combining(c))
@@ -261,14 +343,13 @@ def constrain_current_results(rows, records, *, heading_citations=None):
         if row["decision"] != "admitted" or row["kind"] not in _CURRENT_ROLES:
             continue
         reported_kind, _, _ = _candidate_locator(row.get("source_number"))
-        statement = current_statement(row, records, (heading_citations or {}).get(row["candidate_id"], ""))
+        statement, reason = _resolve_statement(row, records, (heading_citations or {}).get(row["candidate_id"], ""))
         if (reported_kind is not None and reported_kind not in _ELIGIBLE_TYPES) or (
                 statement and statement["kind"] not in _ELIGIBLE_TYPES):
             row.update(decision="excluded", decision_reason="原文为命题、引理或其他材料，作为支持证据保留。")
             continue
         if not statement:
-            row.update(decision="unresolved", scope_central_open=True,
-                       decision_reason="尚无法在所引原文定位此精确断言的 Theorem 或 Corollary 标题。")
+            row.update(decision="unresolved", scope_central_open=True, decision_reason=reason)
             continue
         # Parts of one source theorem can have materially different hypotheses
         # and conclusions. Merge exact repeats of the assertion only.

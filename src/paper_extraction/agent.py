@@ -42,6 +42,7 @@ from .retry_context import attach_previous_failure
 from .sources import SourceIndex
 from .focused_evidence import projected_sources, repair_context, writer_candidates
 from .selection import SELECTION_VERSION, review_navigator, select_contributions
+from .admission import with_page_reading
 from .selection_scope import DEFINITION_SCOPE, DIRECT_SCOPE, coverage_obligations
 from .scope_reconciliation import saved_count_exception, scope_failure_reason
 from .source_image_cache import cached_transcription
@@ -981,7 +982,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         evidence_records = dict(records)
         for reading in packet.get("source_images", []):
             key = reading["source_id"]
-            evidence_records[key] = {**evidence_records[key], "text": evidence_records[key]["text"] + "\n" + reading["transcription"]}
+            evidence_records[key] = with_page_reading(evidence_records[key], reading["transcription"])
         candidates, selected_draft, note = direct_admission(result, evidence_records, strict_types=strict_types)
         images = list(packet.get("source_images", ()))
         if uses_targeted_revision(settings) and result.draft and any(row["decision"] == "unresolved" for row in candidates):
@@ -989,7 +990,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
             extra = verify_damaged_headings([core.register_row() for core in result.cores], evidence_records, resolve_questions)
             for image in extra:
                 loc = image["source_id"]
-                evidence_records[loc] = {**evidence_records[loc], "text": evidence_records[loc]["text"] + "\n" + image["transcription"]}
+                evidence_records[loc] = with_page_reading(evidence_records[loc], image["transcription"])
             if extra:
                 images.extend(extra)
                 candidates, selected_draft, note = direct_admission(result, evidence_records, strict_types=strict_types)

@@ -13,7 +13,8 @@ from .models import SourceCheck
 from .scope_reconciliation import reconcile_scope
 from .profile_variants import COUNT_OVERRIDE
 from .lean_workflow import IndependentRole, ScreeningNote, independent_role_supported
-from .admission import admission_source, constrain_current_results, current_statement, scoped_image_readings
+from .admission import (admission_source, constrain_current_results, current_statement,
+                        scoped_image_readings, unresolved_source_reason, with_page_reading)
 from .profile_inputs import uses_scope_revision
 from .selection_scope import PLANNED_SCOPE, SELECTION_SCOPE
 from .request_budget import whole_source_budget
@@ -584,7 +585,7 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
         for reading in verified_readings.values():
             key = reading["source_id"]
             if key in records:
-                records[key] = {**records[key], "text": records[key]["text"] + "\n" + reading["transcription"]}
+                records[key] = with_page_reading(records[key], reading["transcription"])
         selected_rows = {r.candidate_id: r for r in choice.selected}
         for row in rows:
             if row["decision"] != "admitted" or row["kind"] not in {"current", "historical", "application"}:
@@ -613,7 +614,7 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
                 extra = verify_damaged_headings(rows, records, resolve_central)
                 for reading in extra:
                     loc = reading["source_id"]
-                    records[loc] = {**records[loc], "text": records[loc]["text"] + "\n" + reading["transcription"]}
+                    records[loc] = with_page_reading(records[loc], reading["transcription"])
                     for row in rows:
                         if loc in row.get("selection_evidence_ids", ()) or loc in row["evidence_ids"]:
                             row.setdefault("source_readings", []).append(reading)
@@ -691,10 +692,9 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
         if not note and not any(r["decision"] == "admitted" and r["kind"] in {"current", "application"} for r in rows):
             open_cores = [r for r in rows if r.get("scope_central_open") and r["decision"] == "unresolved"]
             ids = list(dict.fromkeys(i for r in (open_cores or rows) for i in r["evidence_ids"]))
-            labels = "、".join(r.get("source_number") or r["candidate_id"] for r in open_cores)
             note = ScreeningNote(kind="insufficient_evidence" if open_cores else "no_qualifying_result",
                 question="原文是否给出了值得单列的当前贡献？", evidence_ids=ids or [r["id"] for r in catalog[:1]],
-                reason=(f"原文提及 {labels}，现有证据不足以完整核实其条件和结论。" if open_cores else
+                reason=(unresolved_source_reason(open_cores, records) if open_cores else
                         "原文支持所列陈述或其证明用途，但没有确立能够单独列入的主要成果。"))
         return rows, note
     return rows if unlimited_current else reconcile_scope(catalog, rows, models, rubric, previous_failure)
