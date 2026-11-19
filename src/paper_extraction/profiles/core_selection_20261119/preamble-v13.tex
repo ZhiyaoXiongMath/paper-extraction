@@ -1,0 +1,166 @@
+% Release: core-selection-20261119
+% Shared typography and source-author credit; use with the matching v13 files.
+% Generic profile: no paper-specific mathematical aliases.
+% Compile with pdfLaTeX (TeX Live with newtx, amsthm and enumitem).
+\documentclass[11pt,a4paper]{article}
+% Machine-readable identity; verify the four-file manifest as well.
+\newcommand{\IntroRelease}{core-selection-20261119}
+\typeout{INTRO-PROFILE-RELEASE: \IntroRelease}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=22mm]{geometry}
+\usepackage{amsmath,amsthm}
+\usepackage{newtxtext,newtxmath}
+\usepackage{mathrsfs}
+\usepackage{enumitem,needspace,microtype,etoolbox}
+\usepackage[hidelinks]{hyperref}
+\usepackage{titlesec}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4.5pt plus 0.5pt}
+\linespread{1.035}
+\raggedbottom
+\setlength{\emergencystretch}{1em}
+\clubpenalty=2500
+\widowpenalty=2500
+\displaywidowpenalty=5000
+\AtBeginDocument{%
+  \setlength{\abovedisplayskip}{8pt plus 1pt minus 1pt}%
+  \setlength{\belowdisplayskip}{8pt plus 1pt minus 1pt}%
+  \setlength{\abovedisplayshortskip}{5pt plus 1pt}%
+  \setlength{\belowdisplayshortskip}{6pt plus 1pt}%
+}
+\titleformat{\section}{\large\bfseries}{\thesection}{0.6em}{}
+\titlespacing*{\section}{0pt}{11pt plus 2pt}{7pt}
+\newtheoremstyle{stageplain}{8pt plus 1pt}{8pt plus 1pt}{\itshape}{}%
+  {\bfseries}{.}{0.6em}{}
+\newtheoremstyle{stagedef}{8pt plus 1pt}{8pt plus 1pt}{\normalfont}{}%
+  {\bfseries}{.}{0.6em}{}
+% All visible result numbers are flat: A/B/C and 1/2/3, never 1.1.
+\theoremstyle{stageplain}
+\newtheorem{rawtheorem}{Theorem}
+\newtheorem{rawhistorical}{Theorem}
+\renewcommand{\therawhistorical}{\Alph{rawhistorical}}
+\theoremstyle{stagedef}
+\newtheorem{rawdefinition}{Definition}
+
+% Rendered-size budgets. U is the fixed normal body baseline at document start.
+% Blocks are typeset ONCE in a scratch vbox, measured, then unboxed unchanged.
+% No clipping, scaling, automatic truncation, or hidden duplicate text is used.
+\newdimen\IntroUnit
+\newdimen\IntroHeight
+\newdimen\IntroLimit
+\newdimen\IntroGroupHeight
+\newdimen\IntroProseHeight
+\newdimen\IntroSharedHeight
+\newbox\IntroMeasuredBox
+\newcount\IntroBlockCount
+\newcount\IntroGroupID
+\newcount\IntroActiveGroup
+\newcount\IntroGroupTheorems
+\newcount\IntroGroupDefinitions
+\newcount\IntroSharedDefinitions
+\newcount\IntroProseCount
+\AtBeginDocument{\global\IntroUnit=\baselineskip
+  \typeout{INTRO-UNIT-SP: \number\IntroUnit}}
+\newcommand{\IntroBudgetError}[1]{%
+  \PackageError{intro-v13}{#1}{Rewrite the selected mathematics. Do not change the budget or font.}}
+\newcommand{\IntroMeasured}[3]{%
+  \par
+  \global\advance\IntroBlockCount by 1
+  \setbox\IntroMeasuredBox=\vbox{\hsize=\linewidth #3\par}%
+  \IntroHeight=\dimexpr\ht\IntroMeasuredBox+\dp\IntroMeasuredBox\relax
+  \IntroLimit=#2\IntroUnit
+  \typeout{INTRO-BLOCK|\the\IntroBlockCount|#1|\number\IntroHeight|\number\IntroLimit|\the\IntroActiveGroup}%
+  \ifdim\IntroHeight>\IntroLimit
+    \IntroBudgetError{Block \the\IntroBlockCount\space (#1) exceeds #2U}%
+  \fi
+  \ifnum\IntroActiveGroup>0
+    \global\advance\IntroGroupHeight by \IntroHeight
+  \fi
+  \ifstrequal{#1}{P}{\global\advance\IntroProseHeight by \IntroHeight}{}%
+  \ifstrequal{#1}{D}{\ifnum\IntroActiveGroup=0
+    \global\advance\IntroSharedHeight by \IntroHeight\fi}{}%
+  % Each measured block is bounded: preserve it as one readable unit.
+  \Needspace{\dimexpr\IntroHeight+4pt\relax}%
+  \unvbox\IntroMeasuredBox
+  \par\addvspace{4pt}%
+}
+\NewDocumentEnvironment{introparagraph}{+b}{%
+  \global\advance\IntroProseCount by 1
+  \IntroMeasured{P}{8}{\noindent #1}%
+}{}
+\NewDocumentEnvironment{definition}{O{} +b}{%
+  \ifnum\IntroActiveGroup>0
+    \global\advance\IntroGroupDefinitions by 1
+    \ifnum\IntroGroupDefinitions>2 \IntroBudgetError{More than two dedicated definitions in one result group}\fi
+  \else
+    \global\advance\IntroSharedDefinitions by 1
+    \ifnum\IntroSharedDefinitions>2 \IntroBudgetError{More than two shared definitions}\fi
+  \fi
+  \IntroMeasured{D}{10}{\begin{rawdefinition}[{#1}]#2\end{rawdefinition}}%
+}{}
+\NewDocumentEnvironment{historical}{O{} +b}{%
+  \ifnum\value{rawtheorem}>0 \IntroBudgetError{Historical theorem placed after current results}\fi
+  \ifnum\IntroActiveGroup>0 \IntroBudgetError{History is not part of a current-result group}\fi
+  \IntroMeasured{H}{11}{\begin{rawhistorical}[{#1}]#2\end{rawhistorical}}%
+}{}
+\NewDocumentEnvironment{theorem}{O{} +b}{%
+  \ifnum\IntroActiveGroup=0 \IntroBudgetError{Current theorem requires a resultgroup}\fi
+  \global\advance\IntroGroupTheorems by 1
+  \IntroMeasured{T}{16}{\begin{rawtheorem}[{#1}]#2\end{rawtheorem}}%
+}{}
+\newenvironment{resultgroup}{%
+  \ifnum\IntroActiveGroup>0 \IntroBudgetError{Nested resultgroup}\fi
+  \global\advance\IntroGroupID by 1
+  \global\IntroActiveGroup=\IntroGroupID
+  \global\IntroGroupHeight=0pt
+  \global\IntroGroupTheorems=0
+  \global\IntroGroupDefinitions=0
+}{%
+  \IntroLimit=32\IntroUnit
+  \typeout{INTRO-GROUP|\the\IntroGroupID|\number\IntroGroupHeight|\number\IntroLimit|\the\IntroGroupTheorems|\the\IntroGroupDefinitions}%
+  \ifdim\IntroGroupHeight>\IntroLimit \IntroBudgetError{Result group exceeds 32U}\fi
+  \ifnum\IntroGroupTheorems=1\else \IntroBudgetError{A result group must contain exactly one theorem}\fi
+  \global\IntroActiveGroup=0
+}
+% Independent hypotheses: every source row begins with &, so their left edges align.
+\NewDocumentEnvironment{conditions}{+b}{\[\begin{aligned}#1\end{aligned}\]}{}
+% A genuine equality/inequality chain: exactly one relation anchor in each row.
+\NewDocumentEnvironment{relations}{+b}{\[\begin{aligned}#1\end{aligned}\]}{}
+\AtEndDocument{%
+  \typeout{INTRO-COUNTS|\arabic{rawhistorical}|\arabic{rawtheorem}|\arabic{rawdefinition}|\the\IntroProseCount|\the\IntroGroupID}%
+  \ifnum\value{rawhistorical}>3 \IntroBudgetError{More than three historical theorems}\fi
+  \ifnum\value{rawtheorem}<1 \IntroBudgetError{At least one admitted current theorem is required}\fi
+  % The current-theorem count is selected under the user-authorized scope.
+  \ifnum\value{rawdefinition}>6 \IntroBudgetError{More than six definitions}\fi
+  \IntroLimit=40\IntroUnit
+  \ifdim\IntroProseHeight>\IntroLimit \IntroBudgetError{Total connecting prose exceeds 40U}\fi
+  \IntroLimit=20\IntroUnit
+  \ifdim\IntroSharedHeight>\IntroLimit \IntroBudgetError{Shared definitions exceed 20U}\fi
+  \ifnum\IntroActiveGroup>0 \IntroBudgetError{Unclosed result group}\fi
+}
+\setlist[enumerate,1]{label=(\roman*),ref=\roman*,leftmargin=2em,
+  itemsep=3pt,topsep=4pt,parsep=0pt,partopsep=0pt}
+% Source attribution is separate from editorial authorship.
+% Preserve the complete title and all authors in source order; names wrap naturally.
+\newcommand{\papertitle}[1]{\par\begingroup\centering
+  \Large\bfseries #1\par\endgroup\addvspace{5pt}}
+\newcommand{\sourceauthors}[1]{\par\begingroup\centering
+  \small\textit{Authors of the original paper:}\enspace #1\par
+  \endgroup\addvspace{8pt}}
+\newcommand{\paperheader}[2]{%
+  \ifstrempty{#1}{\PackageError{intro-v13}{Missing source title}
+    {Supply the verified source title.}}{}%
+  \ifstrempty{#2}{\PackageError{intro-v13}{Missing source author credit}
+    {Supply all verified source authors in source order.}}{}%
+  \papertitle{#1}\sourceauthors{#2}}
+% Nonprinting bibliography anchors: checker compares actual pages and PDF positions.
+% These labels do not add visible headings or change the typography.
+\makeatletter
+\apptocmd{\thebibliography}{\label{intro:references-start}}{}{%
+  \PackageError{intro-v13}{Cannot instrument bibliography}{Use the supported article profile.}}
+\AtEndEnvironment{thebibliography}{\label{intro:references-end}}
+\makeatother
+% Source-specific mathematical commands belong after this common profile.
+\pagestyle{plain}
+% End of common profile.

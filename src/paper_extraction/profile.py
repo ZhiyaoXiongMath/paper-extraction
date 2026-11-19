@@ -14,11 +14,11 @@ from urllib.parse import quote
 
 from filelock import FileLock
 
-from .citation_layout import reader_draft_view, reading_blocks
+from .citation_layout import bibliography_targets, reader_draft_view, reading_blocks
 from .pdfops import page_count, render_page
 from .profile_assets.tools import v13_check
 from .profile_variants import (
-    CURRENT_PROFILE, checker_for_bundle, checker_for_release, companion_text, current_check,
+    checker_for_bundle, checker_for_release, companion_text, current_check, is_core_release,
     is_versioned_release, previous_check, profile_bundle, release_for_draft,
 )
 
@@ -281,8 +281,8 @@ def _citation(text: str, after_command: int, field: str, keys: set[str]) -> tupl
         command += "[" + clean + "]"
     labels, end = v13_check.balanced(text, cursor)
     cited = [key.strip() for key in labels.split(",")]
-    if not all(key in keys for key in cited):
-        raise ValueError(f"{field} cites an unlisted bibliography key.")
+    if missing := [key for key in cited if key not in keys]:
+        raise ValueError(f"{field} cites an unlisted bibliography key: {', '.join(missing)}.")
     return command + "{" + ",".join(cited) + "}", end
 
 
@@ -403,7 +403,9 @@ def render_tex(draft: dict, *, block_map: list | None = None, _legacy_citations:
     authors = [_fragment(a, "authors", keys, allow_blocks=False)
                for a in _list(draft.get("authors"), "authors", 1)]
     release = release_for_draft(draft)
-    canonical = release == CURRENT_PROFILE
+    canonical = is_core_release(release)
+    if canonical and (missing := bibliography_targets(draft, keys)):
+        raise BuildFailure(" ".join(issue for row in missing for issue in row["diagnostics"]), missing)
     projected = {row["id"]: row for row in reading_blocks(draft, strict=True)} if canonical else {}
     header = companion_text(ASSETS, "template-v13.tex", release).split(r"\begin{document}", 1)[0]
     parts = [header, r"\begin{document}", rf"\paperheader{{{title}}}{{{', '.join(authors)}}}",
@@ -519,6 +521,65 @@ class BuildFailure(ValueError):
         self.technical = technical
 
 
+def draft_layout_targets(draft):
+    """Validate each writable draft block without stopping at the first format problem."""
+    from .repair_progress import block_at
+
+    checker = checker_for_release(release_for_draft(draft))
+    references = draft.get("references", [])
+    keys = {row.get("key") for row in references}
+    targets = bibliography_targets(draft, keys)
+    # Missing keys have already been mapped to their original editable fields.
+    # The projected caption may include another block's comparison citation.
+    keys.update(key for row in targets for key in row["missing_reference_keys"])
+    for row in reading_blocks(draft):
+        field = row["id"]
+        diagnostics = []
+        formal = bool(re.fullmatch(r"history\.\d+|(?:shared_definitions|groups\.\d+\.definitions)\.\d+|groups\.\d+\.theorem", field))
+        env = ("historical" if field.startswith("history.") else "definition" if "definitions." in field else
+               "theorem" if field.endswith(".theorem") else "introparagraph")
+        fragments = [(row["text"], field, False)]
+        if formal:
+            fragments.append((row["caption"], field + " source", True))
+        for text, name, caption in fragments:
+            try:
+                if caption and not text.strip():
+                    raise ValueError("Put the source citation in the formal heading.")
+                _fragment(text, name, keys, formal=caption, allow_blocks=not caption)
+            except (ValueError, TypeError) as exc:
+                diagnostics.append(str(exc))
+        if formal and re.search(r"\\cite\b", row["text"]):
+            diagnostics.append("Move the formal source out of the body and into its heading attribution.")
+        displays = checker.display_bodies(row["text"])
+        cap = checker.BLOCK_LIMITS[env]
+        if len(displays) > cap["displays"] or sum(len(checker.source_rows(body)) for _, body in displays) > cap["rows"]:
+            diagnostics.append(
+                f"Use at most {cap['displays']} display groups and {cap['rows']} display source rows in this block."
+            )
+        for style, body in displays:
+            rows = checker.source_rows(body)
+            anchors = [len(re.findall(r"(?<!\\)&", line)) for line in rows]
+            if len(rows) > 4:
+                diagnostics.append("A display may use at most four source rows.")
+            if style == "conditions" and (any(count != 1 for count in anchors)
+                                          or any(not line.startswith("&") for line in rows)):
+                diagnostics.append("Start each independent condition with exactly one left-edge alignment anchor.")
+            elif style == "relations" and any(count != 1 for count in anchors):
+                diagnostics.append("Use one alignment anchor per relation-chain row.")
+            elif style not in {"conditions", "relations"} and r"\begin{aligned}" in body:
+                diagnostics.append("Use a plain display for one row or conditions or relations for multiple rows.")
+        if diagnostics:
+            targets.append({"draft_field": field, "current_text": block_at(draft, field),
+                            "diagnostics": list(dict.fromkeys(diagnostics))})
+    for index, ref in enumerate(references):
+        field = f"references.{index}.text"
+        try:
+            _fragment(ref.get("text"), field, keys, allow_blocks=False)
+        except (ValueError, TypeError) as exc:
+            targets.append({"draft_field": field, "current_text": ref.get("text"), "diagnostics": [str(exc)]})
+    return targets
+
+
 def _build_targets(blocks, issues, log="", *, release=v13_check.RELEASE):
     if is_versioned_release(release):
         checker = checker_for_release(release)
@@ -619,6 +680,8 @@ def saved_build_targets(draft, issues):
         return []  # Old review traces truncate each diagnostic at this length.
     try:
         render_tex(draft, block_map=blocks)
+    except BuildFailure as exc:
+        return exc.repair_targets
     except (ValueError, TypeError, KeyError):
         return []
     return _build_targets(blocks, issues, release=release_for_draft(draft))

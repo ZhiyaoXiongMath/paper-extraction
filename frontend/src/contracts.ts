@@ -132,12 +132,17 @@ export interface Paper {
   stage: string;
   reason?: string;
   delivery?: {
-    status: "reviewed" | "delivered";
+    status: "reviewed" | "delivered" | "interrupted";
     kind?: string;
     outcome?: "no_qualifying_result" | "insufficient_evidence";
     summary?: { question: string; reason: string; evidence: { id: string; label: string }[] };
     note?: string;
     draft_round?: number;
+    compiler_verified?: boolean;
+    diagnostic?: string;
+    checks?: Record<"content" | "layout" | "visual", "passed" | "failed" | "not_checked">;
+    layout_issues?: string[];
+    check_issues?: Partial<Record<"content" | "layout" | "visual", string[]>>;
   };
   draft?: Draft;
   links?: EvidenceLink[];

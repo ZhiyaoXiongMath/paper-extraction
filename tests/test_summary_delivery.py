@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from paper_extraction.api import create_app
 from paper_extraction.store import Store
-from paper_extraction.summary_delivery import FORMAL_NAMES, SUMMARY_NAME, write_summary
+from paper_extraction.summary_delivery import FORMAL_NAMES, RUN_REPORT_NAME, SUMMARY_NAME, write_run_report, write_summary
 
 
 def test_summary_only_and_mixed_exports(tmp_path):
@@ -78,3 +78,30 @@ def test_summary_requires_valid_original_evidence(tmp_path):
         with pytest.raises(ValueError):
             write_summary(tmp_path, tmp_path / "paper.pdf", kind=kind, question="问题", reason="说明",
                           evidence_ids=ids, catalog=[])
+
+
+def test_interruption_record_download_does_not_count_as_a_delivered_paper(tmp_path):
+    store = Store(tmp_path / "home")
+    source = tmp_path / "paper.tex"
+    source.write_text("A discussion of the problem.", encoding="utf-8")
+    store.create("batch", {"provider": "openai"}, [
+        {"id": "paper", "name": "Reading", "kind": "tex", "source": str(source), "root": str(tmp_path)},
+    ])
+    paper = store.paper("paper")
+    result = write_run_report(store.work(paper), source, {
+        "status": "failed", "reason": "原文读取中断", "resumable": True,
+    }, source_ids=["t1-1", "t1-1"])
+    store.finish(paper, result)
+    with TestClient(create_app(store.home, runner=lambda *_: pytest.fail("Unexpected task launch"))) as client:
+        batch = client.get("/api/batches/batch").json()
+        assert batch["counts"] == {"failed": 1} and batch["summary_count"] == 0
+        assert batch["papers"][0]["delivery"]["kind"] == "run_report"
+        note = client.get("/api/papers/paper/artifacts/" + RUN_REPORT_NAME)
+        assert note.status_code == 200 and "paper-run-report.md" in note.headers["content-disposition"]
+        assert "原文读取中断" in note.text and note.text.count("t1-1") == 1
+        archive_response = client.get("/api/batches/batch/download")
+        with ZipFile(io.BytesIO(archive_response.content)) as archive:
+            assert archive.read("001-Reading/paper-run-report.md") == note.content
+            manifest = json.loads(archive.read("manifest.json"))
+            assert manifest["papers"][0]["delivery"]["kind"] == "run_report"
+            assert manifest["papers"][0]["status"] == "failed"

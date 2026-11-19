@@ -2,9 +2,10 @@
 
 import hashlib
 from pathlib import Path
-
+from tempfile import NamedTemporaryFile
 
 SUMMARY_NAME = "summary.md"
+RUN_REPORT_NAME = "run-report.md"
 FORMAL_NAMES = ("introduction.tex", "introduction.pdf", "preamble-v13.tex")
 OUTCOMES = {
     "no_qualifying_result": "已核对原文，未选出值得单列的当前定理。",
@@ -16,7 +17,29 @@ def artifact_names(delivery: dict | None) -> tuple[str, ...]:
     """Old receipts have no delivery kind and contain the formal TeX bundle."""
     if delivery and delivery.get("kind") == "summary":
         return (SUMMARY_NAME,)
+    if delivery and delivery.get("kind") == "run_report":
+        return (RUN_REPORT_NAME,)
     return FORMAL_NAMES
+
+
+def write_run_report(work, source, failed, *, source_ids=()):
+    """Persist a downloadable interruption record without claiming a screening decision."""
+    reason = failed["reason"]
+    locations = "、".join(dict.fromkeys(source_ids)) or "尚未取得可引用的原文位置"
+    message = (
+        f"# 论文提取运行说明\n\n论文：{source.name}\n\n"
+        "本次处理未完成。\n\n"
+        f"## 中断原因\n\n{reason}\n\n## 已登记的原文位置\n\n{locations}\n\n"
+        "修复中断原因后，可从工作台重试此篇。已有检查点将随同一模型配置恢复。\n"
+    ).encode("utf-8")
+    digest = hashlib.sha256(message).hexdigest()
+    directory = work / ("run-report-" + digest[:20])
+    directory.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=directory, delete=False) as pending:
+        pending.write(message)
+    Path(pending.name).replace(directory / RUN_REPORT_NAME)
+    return {**failed, "result_dir": str(directory), "hashes": {RUN_REPORT_NAME: digest},
+            "delivery": {"status": "interrupted", "kind": "run_report"}}
 
 
 def write_summary(work: Path, source: Path, *, kind: str, question: str, reason: str,

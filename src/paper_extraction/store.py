@@ -19,7 +19,7 @@ from .scope_reconciliation import saved_count_exception, stale_scope_result
 from .editorial import confirmation_only
 from .draft_artifacts import FILENAMES, capture_files, draft_digest, saved_rounds, snapshot_dir
 from .exporting import batch_export_directory, extraction_basename, standalone_tex
-from .summary_delivery import FORMAL_NAMES, SUMMARY_NAME, artifact_names
+from .summary_delivery import FORMAL_NAMES, RUN_REPORT_NAME, SUMMARY_NAME, artifact_names
 
 NAMES = FORMAL_NAMES
 CONTENT_REVIEW_VERSION = "source-packet-v2"
@@ -493,7 +493,8 @@ class Store:
     def finish(self, p, result):
         result = {**result, "work_attempt":p["result"].get("work_attempt",p["attempt"])}
         status = result.get("status","failed")
-        if status == "completed":
+        has_report = status == "failed" and result.get("delivery", {}).get("kind") == "run_report"
+        if status == "completed" or has_report:
             directory = Path(result["result_dir"]).resolve()
             if not directory.is_relative_to(self.work(p)):
                 raise ValueError("成品目录超出本次任务范围")
@@ -571,7 +572,8 @@ class Store:
 
     def artifact(self, p, name):
         result = p["result"]
-        if p["status"] != "completed" or name not in artifact_names(result.get("delivery")):
+        report = p["status"] == "failed" and name == RUN_REPORT_NAME
+        if (p["status"] != "completed" and not report) or name not in artifact_names(result.get("delivery")):
             raise ValueError("成品尚未就绪")
         path = Path(result["result_dir"])/name
         if not path.is_file() or sha(path) != result.get("hashes", {}).get(name):
@@ -718,10 +720,12 @@ class Store:
         return count
 
     def _write_extraction(self, archive, paper, base, directory=""):
-        if paper["result"].get("delivery", {}).get("kind") == "summary":
-            name = base + ".md"
-            archive.write(self.artifact(paper, SUMMARY_NAME), directory + name)
-            return {name: paper["result"]["hashes"][SUMMARY_NAME]}
+        kind = paper["result"].get("delivery", {}).get("kind")
+        if kind in {"summary", "run_report"}:
+            stored_name = SUMMARY_NAME if kind == "summary" else RUN_REPORT_NAME
+            name = base + ".md" if kind == "summary" else base.removesuffix("-extraction") + "-run-report.md"
+            archive.write(self.artifact(paper, stored_name), directory + name)
+            return {name: paper["result"]["hashes"][stored_name]}
         tex = self.export_tex(paper)
         pdf = self.artifact(paper, "introduction.pdf")
         tex_name, pdf_name = base + ".tex", base + ".pdf"
@@ -741,7 +745,7 @@ class Store:
             else:
                 for i, info in enumerate(self.describe(batch)["papers"], 1):
                     row = {k: info[k] for k in ("id", "name", "status", "reason")}
-                    if info["status"] == "completed":
+                    if info["status"] == "completed" or info.get("delivery", {}).get("kind") == "run_report":
                         paper = self.paper(info["id"])
                         base = extraction_basename(paper["source"])
                         directory = batch_export_directory(i, paper["name"]) + "/"

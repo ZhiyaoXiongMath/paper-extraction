@@ -14,8 +14,8 @@ import {
   metrics,
   formatDate,
   shortId,
-  paperOutcome,
-  tone,
+  batchPaperLabel,
+  paperTone,
   terminal,
   stageName,
   eventSummary,
@@ -641,8 +641,8 @@ onBeforeUnmount(() => {
                     }}</small>
                   </div>
                   <span class="stage">{{ stageName(p.stage) }}</span
-                  ><span class="pill" :class="tone(p.status)">{{
-                    paperOutcome(p).title
+                  ><span class="pill" :class="paperTone(p)">{{
+                    batchPaperLabel(p)
                   }}</span
                   ><a
                     class="icon-link"

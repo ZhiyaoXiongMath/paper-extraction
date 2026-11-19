@@ -14,8 +14,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationIn
 
 from .editorial import says_no_edit
 from .citation_types import FormalSource
-from .direct_response import normalize_direct_shape, safe_direct_errors, unfence
-from .profile_inputs import is_optimized_workflow
+from .direct_response import (EvidenceCoverageError, direct_retry_packet, direct_source_action, normalize_direct_shape,
+                              prepare_evidence_patch, provisional_direct_answer, safe_direct_errors, unfence,
+                              with_evidence_links)
+from .profile_inputs import (is_optimized_workflow, is_reliable_workflow, uses_block_workflow,
+                             uses_evidence_link_patch, uses_grounded_revision)
 from .settings import DEFAULT_REASONING_EFFORT, chat_options
 from .usage import invoke_tracked, observe_http
 
@@ -26,7 +29,8 @@ class StructuredResponseError(ValueError):
     """The provider replied, but no attempt supplied a usable typed response."""
     def __init__(self, schema, history):
         self.schema = schema
-        super().__init__(f"Invalid {schema.__name__} response after three attempts: " + " | ".join(history))
+        attempts = {1: "one attempt", 2: "two attempts", 3: "three attempts"}[len(history)]
+        super().__init__(f"Invalid {schema.__name__} response after {attempts}: " + " | ".join(history))
 
 
 class Candidate(BaseModel):
@@ -71,8 +75,12 @@ class TextFindings(Findings):
     source_checks: list[SourceCheck] = Field(default_factory=list)
 
 
+MAX_DEFINITIONS = 6
+MAX_GROUP_DEFINITIONS = 2
+
+
 class Group(BaseModel):
-    definitions: list[str] = Field(max_length=2)
+    definitions: list[str] = Field(max_length=MAX_GROUP_DEFINITIONS)
     theorem: str = Field(min_length=1)
     paragraph: str = ""
     paragraph_position: Literal["before", "after"] = Field(default="after", description="Place the connecting paragraph before the group's definitions and theorem, or after the theorem")
@@ -86,6 +94,11 @@ class Reference(BaseModel):
 class EvidenceLink(BaseModel):
     block_id: str
     evidence_ids: list[str] = Field(min_length=1)
+
+
+class EvidenceLinkPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    evidence_links: list[EvidenceLink]
 
 
 class BlockReplacement(EvidenceLink):
@@ -112,6 +125,20 @@ class DraftPatch(BaseModel):
         registered = {row["id"] for row in info.context["passages"]}
         for row in self.replacements:
             target = targets[row.block_id]
+            if target.get("requires_formal_source") and row.formal_source is None:
+                raise ValueError(f"{row.block_id}: supply the formal source for the new definition heading")
+            if requested_attrs := target.get("attribution_fields"):
+                if row.formal_source is None:
+                    raise ValueError(f"{row.block_id}: revise the specified formal_source fields {list(requested_attrs)}")
+                updated = row.formal_source.model_dump()
+                current = target["formal_source"]
+                if any(updated[key] == value for key, value in requested_attrs.items()):
+                    raise ValueError(f"{row.block_id}: the requested heading attribution still has its old value")
+                if any(updated[key] != value for key, value in current.items() if key not in requested_attrs):
+                    raise ValueError(f"{row.block_id}: retain the unrequested heading attribution fields")
+                if (not target.get("diagnostics") and all(defect["draft_field"] != row.block_id for defect in target["defects"])
+                        and row.text != target["current_text"]):
+                    raise ValueError(f"{row.block_id}: preserve the statement body for a heading-only repair")
             revised = " ".join(row.text.split())
             if target.get("remove"):
                 if revised or row.formal_source or row.paragraph_position is not None:
@@ -123,7 +150,9 @@ class DraftPatch(BaseModel):
                 raise ValueError("Only a result group's connecting paragraph can change position")
             moved = row.paragraph_position is not None and row.paragraph_position != target.get("paragraph_position")
             new_attribution = row.formal_source is not None and row.formal_source.model_dump() != target.get("formal_source")
-            if not revised or (not moved and not new_attribution and revised == " ".join(target["current_text"].split())):
+            fixes_reference = any(ref.key in target.get("missing_reference_keys", ())
+                                  for ref in getattr(self, "additional_references", ()))
+            if not revised or (not moved and not new_attribution and not fixes_reference and revised == " ".join(target["current_text"].split())):
                 raise ValueError(f"{row.block_id}: make the requested edit to the existing text")
             locations = set(row.evidence_ids)
             if not locations <= registered or not set(target["required_evidence_ids"]) <= locations:
@@ -156,8 +185,8 @@ class Draft(BaseModel):
             blocks.update(f"groups.{i}.definitions.{j}" for j in range(len(group.definitions)))
         linked = [link.block_id for link in self.evidence_links]
         if set(linked) != blocks or len(linked) != len(blocks):
-            raise ValueError(f"Provide one evidence link for each block: {sorted(blocks)}")
-        if len(self.shared_definitions) + sum(len(g.definitions) for g in self.groups) > 6:
+            raise EvidenceCoverageError(blocks)
+        if len(self.shared_definitions) + sum(len(g.definitions) for g in self.groups) > MAX_DEFINITIONS:
             raise ValueError("The Introduction has more than six definitions")
         keys = [ref.key for ref in self.references]
         if len(set(keys)) != len(keys):
@@ -296,10 +325,13 @@ def json_text(value) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def structured_request_text(schema, instructions, payload):
+def structured_request_text(schema, instructions, payload, *, compact=False):
+    # Whitespace in source text, formulae and schema descriptions must survive intact.
+    separators = (",", ":") if compact else None
     system = (instructions + "\nReturn one JSON object matching the supplied "
-              "schema; escape TeX backslashes in JSON strings.\n" + json_text(schema.model_json_schema()))
-    return system, json_text(payload)
+              "schema; escape TeX backslashes in JSON strings.\n"
+              + json.dumps(schema.model_json_schema(), ensure_ascii=False, separators=separators))
+    return system, json.dumps(payload, ensure_ascii=False, separators=separators)
 
 
 def png_message(request: str, image: bytes) -> HumanMessage:
@@ -364,6 +396,12 @@ class Models:
         timeout = settings.get("timeout", 120)
         self.provider = settings["provider"].lower()
         self.optimized_workflow = is_optimized_workflow(settings)
+        self.reliable_workflow = is_reliable_workflow(settings)
+        self.patch_evidence_links = uses_evidence_link_patch(settings)
+        self.block_workflow = uses_block_workflow(settings)
+        from .profile_inputs import uses_targeted_revision
+        self.targeted_revision = uses_targeted_revision(settings)
+        self.grounded_revision = uses_grounded_revision(settings)
         text_options = chat_options(settings, "text", timeout=timeout, max_retries=2)
         text_client = ReasoningChatOpenAI if "extra_body" in text_options else ChatOpenAI
         self.text = text_client(**text_options)
@@ -383,22 +421,43 @@ class Models:
     def structured(self, schema: type[Model], instructions: str, payload,
                    image: bytes | None = None) -> Model:
         model = self.vision if image is not None else self.text
-        system_text, user_text = structured_request_text(schema, instructions, payload)
+        wire_schema = schema
+        local_blocks = getattr(self, "block_workflow", False) and schema.__name__ == "DirectResult"
+        if local_blocks:
+            from .block_response import BlockDirectResult, expand_direct_blocks
+            wire_schema = BlockDirectResult
+        targeted = getattr(self, "targeted_revision", False)
+        review_form = targeted and schema.__name__ in {"EvidenceReview", "AdmissionReview"}
+        if review_form:
+            from .review_response import EvidenceReviewForm, ReviewVerdictForm, editorial_response
+            wire_schema = EvidenceReviewForm if schema.__name__ == "EvidenceReview" else ReviewVerdictForm
+            instructions += ("\nUse nominations on the extract route for missing results. Identify the original heading, "
+                             "passage and omission loss. Keep independent edits to existing text in issues.")
+        compact = getattr(self, "grounded_revision", False)
+        system_text, user_text = structured_request_text(wire_schema, instructions, payload, compact=compact)
         system = SystemMessage(content=system_text)
         original = png_message(user_text, image) if image is not None else HumanMessage(content=user_text)
         next_messages = [system, original]
         original_findings, repair_indexes = None, []
         keep_previous = (issubclass(schema, (Findings, Draft, DraftPatch, AdmissionReview, Review))
+                         or (isinstance(payload, dict) and "definition_budget" in payload)
                          or getattr(schema, "retry_with_previous", False))
         history = []
         direct = getattr(self, "optimized_workflow", False) and schema.__name__ == "DirectResult"
+        reliable_direct = direct and getattr(self, "reliable_workflow", False)
         retry_diagnostics = []
-        for attempt in range(3):
-            runner = model.with_structured_output(schema, method="json_mode", include_raw=True)
+        request_payload = payload
+        row_repairs = getattr(self, "block_workflow", False) and schema.__name__ in {
+            "ReadingAnswers", "EvidenceReview", "AdmissionReview"}
+        patch = None
+        for attempt in range(2 if reliable_direct else 3):
+            current_patch, patch = patch, None
+            response_schema = current_patch.schema if current_patch else wire_schema
+            runner = model.with_structured_output(response_schema, method="json_mode", include_raw=True)
             try:
-                response = invoke_tracked(runner, next_messages, operation=schema.__name__,
+                response = invoke_tracked(runner, next_messages, operation=response_schema.__name__,
                                           channel="vision" if image is not None else "text",
-                                          passages=payload.get("passages", ()) if isinstance(payload, dict) else (),
+                                          passages=request_payload.get("passages", ()) if isinstance(request_payload, dict) else (),
                                           schema_attempt=attempt + 1,
                                           **({"previous_schema_failure": retry_diagnostics} if retry_diagnostics else {}))["raw"]
                 finish = response.response_metadata.get("finish_reason") or "unknown"
@@ -411,8 +470,10 @@ class Models:
                 out = getattr(exc.completion.usage, "completion_tokens", 0) or 0
 
             details = ""
+            document = None
             retry_diagnostics = []
             next_messages = [system, original]
+            request_payload = payload
             if finish == "length":
                 # ChatOpenAI aliases max_tokens to max_completion_tokens. These providers
                 # accept max_tokens in the JSON wire body, so supply the provider field.
@@ -423,20 +484,49 @@ class Models:
                     model = model.model_copy(update={"extra_body": {**(model.extra_body or {}),
                                                                    "max_tokens": budget}})
                 details = "Truncated output. Regenerate a complete JSON object from the original evidence."
-                if direct:
+                if direct or row_repairs:
                     retry_diagnostics = [{"field": "document", "code": "output_length"}]
             elif not text.strip():
                 details = "Blank JSON output. Produce a complete JSON object using the schema."
-                if direct:
+                if direct or row_repairs:
                     retry_diagnostics = [{"field": "document", "code": "empty_response"}]
             else:
                 try:
                     document = json.loads(unfence(text) if direct else text)
                 except json.JSONDecodeError as exc:
                     details = f"Malformed JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}."
-                    if direct:
+                    if direct or row_repairs:
                         retry_diagnostics = [{"field": "document", "code": "invalid_json"}]
                 else:
+                    if current_patch:
+                        try:
+                            document = current_patch.merge(document)
+                        except (ValidationError, ValueError) as exc:
+                            # Use the last existing retry slot for the original complete task.
+                            document = None
+                            details = "The partial correction was insufficient. Return the complete original response."
+                            retry_diagnostics = [{"field": "partial_response", "code":
+                                "invalid_partial_rows" if isinstance(exc, ValidationError) else str(exc)}]
+                    if reliable_direct:
+                        checks, invalid = direct_source_action(document, payload, SourceCheck)
+                        if checks:
+                            # Validate the action by itself. A simultaneous draft is private,
+                            # provisional context for the next read, never a published decision.
+                            action = schema.model_validate({"source_checks": checks})
+                            action._provisional = provisional_direct_answer(document)
+                            action._invalid_checks = invalid
+                            return action
+                        if invalid:
+                            retry_diagnostics = invalid[:16]
+                            details = "; ".join(f"{d['field']}: {d['code']}" for d in retry_diagnostics)
+                    if local_blocks and not details:
+                        try:
+                            document = expand_direct_blocks(document)
+                        except ValidationError as exc:
+                            retry_diagnostics = safe_direct_errors(wire_schema, exc.errors(include_input=False))
+                            for error in retry_diagnostics:
+                                error["field"] = "draft." + error["field"]
+                            details = "; ".join(f"{d['field']}: {d['code']}" for d in retry_diagnostics)
                     if repair_indexes:
                         corrections = document.get("candidates") if isinstance(document, dict) else None
                         if not isinstance(corrections, list) or len(corrections) != len(repair_indexes):
@@ -448,6 +538,8 @@ class Models:
                             document = {**original_findings, "candidates": merged}
                     if not details:
                         try:
+                            if review_form:
+                                return editorial_response(wire_schema, document, payload, schema)
                             return schema.model_validate(document, context=payload)
                         except ValidationError as exc:
                             if direct:
@@ -459,20 +551,73 @@ class Models:
                                         return schema.model_validate(normalized, context=payload)
                                     except ValidationError as remaining:
                                         exc = remaining
-                                retry_diagnostics = safe_direct_errors(schema, exc.errors(include_input=False))
+                                errors = exc.errors(include_input=False)
+                                coverage = errors[0].get("ctx", {}).get("error")
+                                if (not attempt and reliable_direct and getattr(self, "patch_evidence_links", False)
+                                        and len(errors) == 1 and isinstance(coverage, EvidenceCoverageError)):
+                                    kept, targets, packet = prepare_evidence_patch(normalized, coverage.blocks, payload)
+                                    if targets:
+                                        return self._correct_direct_links(model, schema, normalized, payload,
+                                                                          kept, targets, packet)
+                                    document = with_evidence_links(normalized, kept)
+                                    try:
+                                        return schema.model_validate(document, context=payload)
+                                    except ValidationError as remaining:
+                                        # Removing an orphan row cost no request. Any other failing
+                                        # field still gets the normal single correction attempt.
+                                        errors = remaining.errors(include_input=False)
+                                retry_diagnostics = safe_direct_errors(schema, errors)
                                 details = "; ".join(f"{d['field']}: {d['code']}" for d in retry_diagnostics)
                             else:
                                 errors, details = _field_errors(exc, explain=keep_previous)
+                                if attempt == 0 and hasattr(payload, "budget_correction"):
+                                    patch = payload.budget_correction(document)
+                                    if patch:
+                                        patch.payload["validation_errors"] = details
+                                        patch_system, patch_user = structured_request_text(
+                                            patch.schema, instructions + "\nRevise only the listed over-budget cores, "
+                                            "retaining all source-supported assumptions and conclusions.", patch.payload)
+                                        request_payload = patch.payload
+                                        next_messages = [SystemMessage(content=patch_system), HumanMessage(content=patch_user)]
+                                        history.append(f"{attempt + 1}: definition budget correction, {details}")
+                                        continue
+                                if row_repairs:
+                                    from .partial_response import plan_reply_repair, retry_diagnostics as row_diagnostics
+                                    retry_diagnostics = row_diagnostics(errors)
+                                    if attempt == 0 or (review_form and attempt == 1 and not current_patch):
+                                        patch = plan_reply_repair(schema, document, payload, errors,
+                                                                  targeted=review_form,
+                                                                  source_index=getattr(self, "review_source_index", None))
+                                        if patch:
+                                            patch.payload["validation_errors"] = details
+                                            patch_system, patch_user = structured_request_text(
+                                                patch.schema, instructions + "\nFor this correction use the supplied "
+                                                "patch schema and return only its requested rows.", patch.payload, compact=compact)
+                                            request_payload = patch.payload
+                                            next_messages = [SystemMessage(content=patch_system), HumanMessage(content=patch_user)]
+                                            history.append(f"{attempt + 1}: row-level correction, {details}")
+                                            continue
                             if issubclass(schema, Findings):
                                 indexes = _correctable_candidates(document, errors)
                                 if indexes:
                                     original_findings, repair_indexes = document, indexes
-                    if not repair_indexes and details and keep_previous:
+                    if not repair_indexes and details and keep_previous and document is not None:
                         next_messages.append(HumanMessage(content=json_text({
                             "previous_complete_json": document, "correction": details,
                             "return": "Correct the reported fields and return JSON matching the schema in the system message."
                         })))
             history.append(f"{attempt+1}: finish={finish}, output_tokens={out}, {details}")
+            if reliable_direct:
+                if attempt:
+                    break
+                request_payload = direct_retry_packet(payload, document, retry_diagnostics)
+                if request_payload is None:
+                    break
+                # Initiate a focused correction only when the provider supplied
+                # a response to repair. An empty/truncated reply goes back to the
+                # graph so another full-source paid call cannot repeat the failure.
+                next_messages = [system, HumanMessage(content=json_text(request_payload))]
+                continue
             if repair_indexes:
                 next_messages.append(HumanMessage(content=json_text({
                     "correction": details,
@@ -484,6 +629,42 @@ class Models:
             elif len(next_messages) == 2:
                 next_messages.append(HumanMessage(content=details + " Return JSON matching the schema in the system message."))
         raise StructuredResponseError(schema, history)
+
+    def _correct_direct_links(self, model, schema, document, payload, kept, targets, packet):
+        """Use the existing correction slot to fix ONLY the inconsistent evidence rows."""
+        history = ["evidence_link_coverage", "evidence-link patch"]
+        instructions = ("Choose the supplied source passages that actually support each requested block. "
+                        "Return exactly one evidence link per block_id. If the supplied sources are "
+                        "insufficient, return an empty list. Preserve mathematical claims and source IDs.")
+        system, user = structured_request_text(EvidenceLinkPatch, instructions, packet,
+                                               compact=getattr(self, "grounded_revision", False))
+        runner = model.with_structured_output(EvidenceLinkPatch, method="json_mode", include_raw=True)
+        diagnostics = [{"field": "draft.evidence_links", "code": "evidence_link_coverage"}]
+        try:
+            raw = invoke_tracked(runner, [SystemMessage(content=system), HumanMessage(content=user)],
+                                 operation=EvidenceLinkPatch.__name__, channel="text", schema_attempt=2,
+                                 passages=packet["passages"], previous_schema_failure=diagnostics)["raw"]
+        except LengthFinishReasonError as exc:
+            raise StructuredResponseError(schema, [history[0], "incomplete evidence-link patch"]) from exc
+        try:
+            if raw.response_metadata.get("finish_reason") == "length" or not isinstance(raw.content, str):
+                raise ValueError("Incomplete evidence patch")
+            patch = EvidenceLinkPatch.model_validate_json(unfence(raw.content))
+            if sorted(row.block_id for row in patch.evidence_links) != targets:
+                raise ValueError("Incorrect evidence patch targets")
+            shown = {row["id"] for row in packet["passages"]}
+            if any(not set(row.evidence_ids) <= shown for row in patch.evidence_links):
+                raise ValueError("Evidence patch cites an unseen passage")
+            links = [row.model_dump() for row in patch.evidence_links]
+            # Only evidence links can change. Re-run every semantic validator,
+            # including core identity and source membership, on the entire paper.
+            return schema.model_validate(with_evidence_links(document, [*kept, *links]), context=payload)
+        except ValidationError as exc:
+            codes = safe_direct_errors(schema, exc.errors(include_input=False))
+            history[-1] += " / " + ", ".join(row["code"] for row in codes)
+            raise StructuredResponseError(schema, history) from exc
+        except ValueError as exc:
+            raise StructuredResponseError(schema, [history[0], str(exc)]) from exc
 
 
     def transcribe(self, image: bytes, page: int) -> str:

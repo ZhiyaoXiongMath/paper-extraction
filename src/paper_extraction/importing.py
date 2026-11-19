@@ -26,12 +26,12 @@ def relative_path(raw: str):
 def discover(root: Path, names: list[str]):
     root = root.resolve()
     tex_paths = [PurePosixPath(name) for name in names if name.lower().endswith(".tex")]
-    contents = {p: uncomment(read_tex(root / p)) for p in tex_paths}
+    contents = {p: uncomment(read_tex(root / p, use_declared_encoding=True)) for p in tex_paths}
     declared = [p for p, text in contents.items() if _DOC.search(text)]
 
     def closure(entry):
         return {PurePosixPath(file.relative_to(root).as_posix())
-                for file in paper_files(root / entry, root, strict=False)}
+                for file in paper_files(root / entry, root, strict=False, use_declared_encoding=True)}
 
     # A subfiles chapter can contain its own documentclass. An explicit include edge
     # from the parent manuscript identifies it as a chapter.

@@ -1,6 +1,27 @@
+import pytest
+
 from paper_extraction.focused_evidence import projected_sources, repair_context
 from paper_extraction.models import json_text
 from paper_extraction.selection import LeanChoice, SourceSelection, select_contributions
+
+
+@pytest.mark.parametrize(('extra_bytes', 'expected'), [(25, LeanChoice), (150_000, SourceSelection)])
+def test_optional_full_selection_respects_increment_and_model_capacity(extra_bytes, expected):
+    class Seen(Exception):
+        pass
+
+    class Reader:
+        def structured(self, schema, instructions, packet):
+            assert schema is expected
+            assert ('b' in {row['id'] for row in packet['passages']}) == (schema is LeanChoice)
+            raise Seen
+
+    catalog = [{'id': 'a', 'text': 'Original theorem.'}, {'id': 'b', 'text': 'x' * extra_bytes}]
+    candidate = dict(kind='current', claim='A result', source_number='Theorem 1', assumptions='',
+                     dependencies=[], evidence_ids=['a', 'b'], decision='admitted', decision_reason='Main result.')
+    with pytest.raises(Seen):
+        select_contributions(catalog, [candidate], Reader(), current=True, lean=True, optimized=True,
+                             strict_types=True, selection_settings={'context_window': 100_000})
 
 
 def test_select_can_read_complete_proofs_without_truncating_adjacent_exceptions():

@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
 from typing import ClassVar, Literal
 
-from pydantic import BaseModel, Field, ValidationInfo, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, ValidationError, ValidationInfo, model_validator
 
+from .admission import admission_source
 from .models import Candidate, Findings, SourceCheck, json_text
 from .sources import uncomment
 
@@ -87,6 +89,72 @@ class SegmentLeads(BaseModel):
     questions: list[ReadingQuestion] = Field(default_factory=list)
     closed_readings: list[ReadingAnswer] = Field(default_factory=list)
     retry_with_previous: ClassVar[bool] = True
+    _unchecked: dict[int | None, list[str]] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def preserve_supported_rows(cls, value, handler, info: ValidationInfo):
+        context = info.context or {}
+        if not context.get("recover_segment_findings") or not isinstance(value, dict):
+            return handler(value)
+        if not isinstance(value.get("candidates"), list):
+            return handler(value)
+        origins = {r["id"] for r in context["passages"]}
+        requested = {r["question_id"] for r in context.get("previously_open", [])}
+        candidates, positions = [], {}
+        pending = {}
+        for index, raw in enumerate(value["candidates"]):
+            try:
+                item = Lead.model_validate(raw)
+            except ValidationError:
+                continue
+            if set(item.evidence_ids) <= origins:
+                positions[index] = len(candidates)
+                candidates.append(item)
+            else:
+                pending.setdefault(None, []).append(f"候选「{item.source_number or item.claim[:80]}」缺少本段可核实的依据。")
+        if value["candidates"] and not candidates:
+            return handler(value)
+
+        questions = []
+        raw_questions = value.get("questions") or []
+        for raw in raw_questions if isinstance(raw_questions, list) else ():
+            try:
+                item = ReadingQuestion.model_validate(raw)
+            except ValidationError:
+                continue
+            index = item.candidate_index
+            owner = positions.get(index)
+            if index is not None and owner is None:
+                # An out-of-range index must not attach to a different lead.
+                pending.setdefault(None, []).append(item.question)
+                continue
+            try:
+                item.lookup()
+            except ValidationError:
+                pending.setdefault(owner, []).append(item.question)
+                continue
+            if item.source_id not in origins:
+                pending.setdefault(owner, []).append(item.question)
+                continue
+            questions.append(item.model_copy(update={"candidate_index": owner}))
+
+        closures = []
+        raw_closures = value.get("closed_readings") or []
+        if isinstance(raw_closures, list):
+            occurrences = Counter(row.get("question_id") for row in raw_closures
+                                  if isinstance(row, dict) and isinstance(row.get("question_id"), str))
+            for raw in raw_closures:
+                try:
+                    item = ReadingAnswer.model_validate(raw)
+                except ValidationError:
+                    continue
+                if (occurrences[item.question_id] == 1 and item.question_id in requested
+                        and item.status == "resolved" and item.evidence_ids and set(item.evidence_ids) <= origins):
+                    closures.append(item)
+        fixed = handler({**value, "candidates": candidates, "questions": questions, "closed_readings": closures})
+        fixed._unchecked = pending
+        return fixed
 
     @model_validator(mode="after")
     def check_sources(self, info: ValidationInfo):
@@ -192,8 +260,11 @@ def _local_finding(q, metadata, labels):
     return None
 
 
-def _passage(row):
-    return {k: row[k] for k in ("id", "section", "label", "text", "evidence_type") if row.get(k)}
+def _passage(row, strict_types=False):
+    value = {k: row[k] for k in ("id", "section", "label", "text", "evidence_type") if row.get(k)}
+    if strict_types and (options := admission_source(row).get("formal_statement_options")):
+        value["formal_statement_options"] = options
+    return value
 
 
 def _open_in_passages(ledger, origins, labels):
@@ -240,10 +311,12 @@ def attach_closed_readings(candidates, ledger):
     return output
 
 
-def read_segment(models, rubric, packet, metadata, labels, ledger, readings, resolve, notify):
+def read_segment(models, rubric, packet, metadata, labels, ledger, readings, resolve, notify, *, strict_types=False):
     origins = {r["id"]: r for r in packet["passages"]}
-    source_packet = {**packet, "passages": [_passage(r) for r in origins.values()],
+    source_packet = {**packet, "passages": [_passage(r, strict_types) for r in origins.values()],
                      "paper_identity": {k: v for k, v in metadata.items() if v}}
+    if strict_types:
+        source_packet["recover_segment_findings"] = True
     previous = _open_in_passages(ledger, origins, labels)
     previous_ids = {f"prior{i}": key for i, key in enumerate(previous, 1)}
     if previous_ids:
@@ -255,6 +328,19 @@ def read_segment(models, rubric, packet, metadata, labels, ledger, readings, res
     for answer in scan.closed_readings:
         ledger[previous_ids[answer.question_id]].update(answer.model_dump(exclude={"question_id"}), settled_later=True)
     candidates = list(scan.candidates)
+    for candidate_index, findings in scan._unchecked.items():
+        if candidate_index is None:
+            continue
+        lead = candidates[candidate_index]
+        item = lead.model_dump(exclude={"gain"})
+        owner = _owner(item)
+        for finding in findings:
+            key = hashlib.sha256(json_text([owner, "unlocated_question", finding]).encode()).hexdigest()
+            # Keep the supported lead's location for attribution. The invalid
+            # lookup is unavailable and is never sent to the evidence tools.
+            ledger.setdefault(key, {"owner": owner, "source_id": lead.evidence_ids[0],
+                                    "source_number": lead.source_number, "field": "source_location",
+                                    "subject": "unlocated question", "finding": finding, "status": "unresolved"})
     pending = {}
     questions = {}
     for q in scan.questions:
@@ -305,7 +391,7 @@ def read_segment(models, rubric, packet, metadata, labels, ledger, readings, res
         evidence["passages"] = [r for r in evidence["passages"] if r["id"] in relevant]
         for i, (q, resolved) in enumerate(zip(checks, evidence["source_questions"], strict=True)):
             resolved.update(question_id=f"q{i+1}", field=q.field, subject=q.subject, candidate_index=q.candidate_index)
-        evidence.update(passages=[_passage(r) for r in evidence["passages"]],
+        evidence.update(passages=[_passage(r, strict_types) for r in evidence["passages"]],
                         affected_candidates=[{"candidate_index": i, **candidates[i].model_dump()} for i in affected])
         result = models.structured(ReadingAnswers, CHECK_INSTRUCTIONS, evidence)
         keys = {f"q{i+1}": key for i, key in enumerate(pending)}
@@ -326,10 +412,15 @@ def read_segment(models, rubric, packet, metadata, labels, ledger, readings, res
             i = q.candidate_index
             ids = list(dict.fromkeys([*candidates[i].evidence_ids, *ledger[key].get("evidence_ids", [])]))
             candidates[i] = candidates[i].model_copy(update={"evidence_ids": ids})
-    candidates = [c.candidate([ledger[key]["finding"] for key, q in questions.items()
-                               if q.candidate_index == i and ledger[key]["status"] == "unresolved"])
+    candidates = [c.candidate([*scan._unchecked.get(i, []),
+                               *(ledger[key]["finding"] for key, q in questions.items()
+                                 if q.candidate_index == i and ledger[key]["status"] == "unresolved")])
                   for i, c in enumerate(candidates)]
-    return Findings(candidates=candidates, uncertainties=open_readings(ledger))
+    unchecked = list(dict.fromkeys(q for questions in scan._unchecked.values() for q in questions))
+    if unchecked:
+        notify("evidence", {"tool": "retain_segment_findings", "locations": list(origins),
+                            "message": f"保留有原文依据的候选，另有 {len(unchecked)} 项查证仍待定位。"})
+    return Findings(candidates=candidates, uncertainties=list(dict.fromkeys([*open_readings(ledger), *unchecked])))
 
 
 def open_readings(ledger):

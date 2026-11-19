@@ -9,15 +9,16 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import textwrap
 
 from PIL import Image, ImageDraw, ImageFont
 
 from .citation_layout import reading_blocks
 from .pdfops import page_count, render_page
-from .profile import ASSETS, BuildFailure, profile_bundle, release_for_draft, render_tex
+from .profile import ASSETS, BuildFailure, build_case, draft_layout_targets, profile_bundle, release_for_draft, render_tex
 from .profile_assets.tools import v13_check
-from .profile_variants import checker_for_bundle
+from .profile_variants import checker_for_bundle, checker_for_release
 from .sources import SourceIndex
 from .writer_patch import _address
 
@@ -43,6 +44,26 @@ _UNICODE = str.maketrans({"–": "--", "—": "---", "‘": "'", "’": "'", "�
                           "≤": "<=", "≥": ">=", "−": "-", "\u00a0": " ", "\u00ad": ""})
 _LOCATORS = re.compile(r"\\cite\s*\[[^\]]+\]\s*\{[A-Za-z0-9:.,_ -]+\}")
 _DELIVERY_ERRORS = (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired)
+_ALIGNED_AT = re.compile(
+    r"\\\[\s*\\begin\{alignedat\}\s*\{[12]\}(?P<body>.*?)\\end\{alignedat\}\s*\\\]", re.S,
+)
+_INDEPENDENT_GATHERED = re.compile(
+    r"(?P<lead>\b(?:following|independent)\s+(?:data|conditions|requirements)\s*:\s*)"
+    r"\\\[\s*\\begin\{gathered\}(?P<body>.*?)\\end\{gathered\}\s*\\\]", re.S | re.I,
+)
+_ALIGNED_DISPLAY = re.compile(
+    r"\\\[\s*\\begin\{aligned\}(?P<body>.*?)\\end\{aligned\}\s*\\\]", re.S,
+)
+_LAYOUT_SENSITIVE = re.compile(r"%|\\(?:begin|end|intertext|tag|notag|label|nonumber|displaybreak)\b|\\\\\s*\[")
+_ALIGNMENT_ANCHOR = re.compile(r"(?<!\\)&")
+_RELATION_START = re.compile(r"(?:\s*\{\})?\s*(?:[=<>]|\\(?:to|longrightarrow|rightarrow|leq?|geq?|equiv|sim)\b)")
+_RELATION_ROW = re.compile(
+    r"\s*&?(?P<left>[^&\r\n]+?)\s*&{1,2}\s*(?P<right>(?:\{\})?(?:[=<>]|\\(?:to|longrightarrow|rightarrow|leq?|geq?|equiv|sim)\b)[^&\r\n]+)\s*",
+)
+_MEASURED_BLOCK = re.compile(r"(?m)^INTRO-BLOCK\|(\d+)\|([PDHT])\|(\d+)\|(\d+)\|\d+\s*$")
+_INTERRUPTED_MEASUREMENT = re.compile(
+    r"Package intro-v13 Error: (?:Block \d+ \([PDHT]\)|Result group|Total connecting prose|Shared definitions) exceeds \d+U"
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +73,8 @@ class DeliveryCase:
     diagnostic: str = ""
     compiler_verified: bool = True
     draft: dict | None = None
+    layout_check: str = "not_checked"
+    layout_issues: tuple[str, ...] = ()
 
 
 class _CompilerFailure(BuildFailure):
@@ -60,7 +83,70 @@ class _CompilerFailure(BuildFailure):
         self.line = line
 
 
-def _compile(case: Path) -> list[int]:
+def normalize_alignment(draft: dict, *, improve_layout=False) -> dict:
+    """Normalize only displays whose mathematical rows and expressions can be retained."""
+    def replace(match):
+        body = match["body"].strip()
+        if re.search(r"%|\\(?:begin|end|intertext|tag|notag|label)\b|\\\\\s*\[", body):
+            return match[0]
+        rows = [row for row in body.split(r"\\") if row.strip()]
+        relations = [_RELATION_ROW.fullmatch(row) for row in rows]
+        if not 2 <= len(rows) <= 4 or not all(relations):
+            return match[0]
+        lines = [f'{row["left"].strip()} &{row["right"].strip()}' for row in relations]
+        return r"\begin{relations}" + "\n" + (" " + r"\\" + "\n").join(lines) + "\n" + r"\end{relations}"
+
+    def independent_rows(match):
+        body = match["body"].strip()
+        if _LAYOUT_SENSITIVE.search(body) or _ALIGNMENT_ANCHOR.search(body):
+            return match[0]
+        rows = [row.strip() for row in body.split(r"\\")]
+        if not 2 <= len(rows) <= 4 or not all(rows):
+            return match[0]
+        return (match["lead"] + r"\begin{conditions}" + "\n" +
+                (" " + r"\\" + "\n").join("& " + row for row in rows) + "\n" + r"\end{conditions}")
+
+    def single_row(match):
+        body = match["body"].strip()
+        if not body or r"\\" in body or _LAYOUT_SENSITIVE.search(body):
+            return match[0]
+        anchors = list(_ALIGNMENT_ANCHOR.finditer(body))
+        if anchors:
+            if len(anchors) != 1:
+                return match[0]
+            offset = anchors[0].start()
+            left, right = body[:offset], body[offset + 1:]
+            braces = re.findall(r"(?<!\\)[{}]", left)
+            if (braces.count("{") != braces.count("}") or
+                    (left.strip() and not _RELATION_START.match(right)) or not right.strip()):
+                return match[0]
+            body = (left.rstrip() + " " + right.lstrip()).strip()
+        return r"\[" + "\n" + body + "\n" + r"\]"
+
+    def rewrite(value):
+        if isinstance(value, str):
+            if improve_layout:
+                value = _INDEPENDENT_GATHERED.sub(independent_rows, value)
+                value = _ALIGNED_DISPLAY.sub(single_row, value)
+            return _ALIGNED_AT.sub(replace, value)
+        if isinstance(value, list):
+            return [rewrite(row) for row in value]
+        return value
+
+    result = {**draft}
+    for key in ("paragraph", "history", "shared_definitions"):
+        if key in draft:
+            result[key] = rewrite(draft[key])
+    if "groups" in draft:
+        result["groups"] = [
+            {key: rewrite(value) if key in {"theorem", "paragraph", "definitions"} else value
+             for key, value in group.items()}
+            for group in draft["groups"]
+        ]
+    return result
+
+
+def _compile(case: Path, *, passes: int = 2) -> list[int]:
     executable = shutil.which("pdflatex")
     if executable is None:
         raise BuildFailure("未找到 pdfLaTeX。", [], case_dir=case, technical=True)
@@ -70,7 +156,7 @@ def _compile(case: Path) -> list[int]:
     inputs = (case / "introduction.tex", case / "preamble-v13.tex")
     before = [v13_check.digest(path) for path in inputs]
     returncodes = []
-    for i in (1, 2):
+    for i in range(1, passes + 1):
         completed = subprocess.run(command, cwd=case, env=environment, capture_output=True,
                                    text=True, encoding="utf-8", errors="replace", timeout=120)
         output = completed.stdout + completed.stderr
@@ -195,21 +281,171 @@ def _write_formal(case: Path, tex: str) -> None:
     (case / "introduction.tex").write_text(tex, encoding="utf-8")
 
 
+def _measure_layout(work: Path, draft: dict, case: Path | None) -> list[dict]:
+    if case is None or not (case / "introduction.log").is_file():
+        return []
+    blocks = []
+    tex = render_tex(draft, block_map=blocks)
+    log = (case / "introduction.log").read_text(encoding="utf-8", errors="replace")
+    measured = list(_MEASURED_BLOCK.finditer(log))
+    if len(measured) < len(blocks) and _INTERRUPTED_MEASUREMENT.search(log):
+        # A hard budget error may stop TeX before it measures later blocks.
+        # The temporary PDF is diagnostic only and never becomes an artifact.
+        with tempfile.TemporaryDirectory(prefix="layout-", dir=work) as scratch:
+            probe = Path(scratch)
+            shutil.copyfile(case / "preamble-v13.tex", probe / "preamble-v13.tex")
+            _write_formal(probe, tex)
+            try:
+                _compile(probe, passes=1)
+            except (BuildFailure, subprocess.TimeoutExpired):
+                pass
+            diagnostic_log = probe / "introduction.log"
+            if diagnostic_log.is_file():
+                extended = list(_MEASURED_BLOCK.finditer(
+                    diagnostic_log.read_text(encoding="utf-8", errors="replace")
+                ))
+                if len(extended) > len(measured):
+                    measured = extended
+    limits = checker_for_release(release_for_draft(draft)).BLOCK_LIMITS
+    rows = []
+    for number, kind, height, limit in (row.groups() for row in measured):
+        offset = int(number) - 1
+        if not 0 <= offset < len(blocks) or not int(limit):
+            continue
+        block = blocks[offset]
+        cap = limits[block["environment"]]
+        if cap["kind"] == kind:
+            rows.append({"draft_field": block["draft_field"], "current_text": block["current_text"],
+                         "height_units": round(int(height) * cap["units"] / int(limit), 3),
+                         "limit_units": cap["units"], "over_limit": int(height) > int(limit)})
+    return rows
+
+
+def local_layout_diagnostics(work: Path, draft: dict, case: Path | None, strict_targets: list[dict],
+                             *, rendered: bool) -> tuple[list[dict], list[dict], list[str]]:
+    """Collect independent formatting and height issues from the same saved manuscript."""
+    static = draft_layout_targets(draft)
+    measured = _measure_layout(work, draft, case)
+    extra = list(static)
+    for row in measured:
+        if row["over_limit"]:
+            height, limit = row["height_units"], row["limit_units"]
+            extra.append({"draft_field": row["draft_field"], "current_text": row["current_text"],
+                          "diagnostics": [f"Shorten this block (rendered height {height:.3f}U, limit {limit}U)."]})
+    if not strict_targets and rendered:
+        # A document-level failure still needs the original full-draft path.
+        # Add the known local facts without claiming that they explain it all.
+        return [], measured, [f'{row["draft_field"]}: {detail}' for row in extra for detail in row["diagnostics"]]
+    targets = {}
+    for row in [*strict_targets, *extra]:
+        field = row["draft_field"]
+        target = targets.setdefault(field, {**row, "diagnostics": []})
+        for detail in row["diagnostics"]:
+            if any(re.search(r"rendered height [\d.]+U, limit \d+U", text) for text in target["diagnostics"]) \
+                    and detail.startswith("Shorten this block (rendered height"):
+                continue
+            if detail not in target["diagnostics"]:
+                target["diagnostics"].append(detail)
+    return list(targets.values()), measured, []
+
+
 def _receipt(case: Path, bundle: Path, kind: str, returncodes: list[int], diagnostic: str,
-             *, draft: dict | None = None) -> DeliveryCase:
+             *, draft: dict | None = None, layout_check: str = "not_checked",
+             layout_issues: tuple[str, ...] = ()) -> DeliveryCase:
     pages = _readable(case)
     checker = checker_for_bundle(bundle)
     binding = checker.check_binding(checker.verify(bundle), case)
+    compiler_verified = returncodes in ([0, 0], [0, 0, 0])
     v13_check.atomic_json(case / "delivery.json", {
         "kind": kind,
         "diagnostic": diagnostic,
-        "compiler_verified": returncodes == [0, 0],
+        "compiler_verified": compiler_verified,
         "compiler_returncodes": returncodes,
         "pdf_pages": pages,
         "files": {name: v13_check.digest(case / name) for name in _FILES},
         "input_binding": binding,
+        "layout_check": layout_check,
+        "layout_issues": list(layout_issues),
     })
-    return DeliveryCase(case, kind, diagnostic, compiler_verified=returncodes == [0, 0], draft=draft)
+    return DeliveryCase(case, kind, diagnostic, compiler_verified, draft, layout_check, layout_issues)
+
+
+def _layout_findings(contract: dict, other: list[str]) -> tuple[str, ...]:
+    messages = []
+    labels = {"introparagraph": "引言段", "historical": "历史定理", "definition": "定义", "theorem": "定理"}
+    for block in contract.get("blocks", []):
+        height, limit = block.get("height_units"), block.get("height_limit_units")
+        if height is not None and limit is not None and height > limit:
+            name = labels.get(block["environment"], block["environment"])
+            messages.append(f'{name} {block["number"]} 实测 {height:g}U，上限 {limit:g}U。')
+    generic = {"rendered_block_height_exceeded"} if messages else set()
+    for group in contract.get("groups", []):
+        height, limit = group.get("height_units"), group.get("height_limit_units")
+        if height is not None and limit is not None and height > limit:
+            messages.append(f'第 {group["group"]} 组实测 {height:g}U，上限 {limit:g}U。')
+            generic.add("resultgroup_measurement_failed")
+    errors = contract.get("errors", [])
+    return tuple(dict.fromkeys([*messages, *(error for error in errors if error not in generic), *other]))[:12]
+
+
+def _measure_delivery(case: Path, checker) -> tuple[str, ...]:
+    """Measure the exact fallback files, even when a strict run stopped at its first warning."""
+    tex = (case / "introduction.tex").read_text(encoding="utf-8")
+    log = (case / "introduction.log").read_text(encoding="utf-8", errors="replace")
+    aux = (case / "introduction.aux").read_text(encoding="utf-8", errors="replace")
+    pdf = case / "introduction.pdf"
+    blocking, _ = checker.classify_diagnostics(log)
+    findings = list(blocking)
+    pages = checker.inspect_pdf(pdf, aux, tex)
+    if pages["body_page_limit"] is False and (count := pages["main_text_pages"]) is not None:
+        findings.append(f'正文 {count} 页，上限 {pages["max_body_pages"]} 页。')
+    if not pages["references_separate"]:
+        findings.append("参考文献未独立起页或缺少可识别的参考文献页。")
+    return _layout_findings(checker.format_contract(tex, log, pdf), findings)
+
+
+def _saved_layout(case: Path, manifest_case: Path) -> tuple[str, tuple[str, ...]]:
+    try:
+        status = json.loads((manifest_case / "build-status.json").read_text(encoding="utf-8"))
+        if (status.get("tex_sha256") != v13_check.digest(case / "introduction.tex")
+                or status.get("compiled_pdf_sha256") != v13_check.digest(case / "introduction.pdf")):
+            return "not_checked", ()
+        if status.get("engineering_accepted"):
+            return "passed", ()
+        issues = _layout_findings(status.get("format_contract", {}), status.get("blocking_diagnostics", []))
+        return "failed", issues or (status.get("error") or "未通过严格排版检查。",)
+    except (OSError, ValueError, TypeError):
+        return "not_checked", ()
+
+
+def _strict_formal(work, source, source_root, draft, bundle, snapshot_hash) -> DeliveryCase:
+    checker = checker_for_bundle(bundle)
+    try:
+        case = build_case(work, source, source_root, draft)
+    except BuildFailure as exc:
+        if saved := _prior(work, exc.case_dir, source, snapshot_hash):
+            layout_check, issues = _saved_layout(saved, exc.case_dir)
+            case = checker.allocate(bundle, source, work, "delivery-checked", source_root)
+            for name in ("introduction.tex", "introduction.pdf"):
+                shutil.copyfile(saved / name, case / name)
+            status = json.loads((exc.case_dir / "build-status.json").read_text(encoding="utf-8"))
+            return _receipt(case, bundle, "final", status["returncodes"], "", draft=draft, layout_check=layout_check,
+                            layout_issues=issues)
+        # The strict preamble can stop during an over-height block before a PDF
+        # exists. Build a fresh, readable pair with the same content and then
+        # measure that exact output. A failed strict run never earns a pass.
+        case = checker.allocate(bundle, source, work, "delivery", source_root)
+        _write_formal(case, render_tex(draft, allow_empty_history=True))
+        passes = _compile(case)
+        try:
+            issues = _measure_delivery(case, checker)
+        except (*_DELIVERY_ERRORS, checker.ValidationError):
+            issues = ()
+        layout_check = "failed" if issues or not exc.technical else "not_checked"
+        return _receipt(case, bundle, "final", passes, "", draft=draft, layout_check=layout_check,
+                        layout_issues=issues or (str(exc)[:600],))
+    status = json.loads((case / "build-status.json").read_text(encoding="utf-8"))
+    return _receipt(case, bundle, "final", status["returncodes"], "", draft=draft, layout_check="passed")
 
 
 def _literal(value: str, reference_numbers: dict | None = None) -> str:
@@ -334,7 +570,7 @@ def _local_pdf(path: Path, title: str, authors: str, sections: list[tuple[str, s
 
 def deliver_case(work: Path, source: Path, source_root: Path | None, draft: dict, *,
                  previous_case: Path | str | None = None, previous_draft: dict | None = None,
-                 candidates: list[dict] | tuple = ()) -> DeliveryCase:
+                 candidates: list[dict] | tuple = (), strict: bool = False) -> DeliveryCase:
     """Compile the latest structured draft or a verified, reproducible alternative."""
     work, source = Path(work).resolve(), Path(source).resolve()
     case = None
@@ -345,6 +581,9 @@ def deliver_case(work: Path, source: Path, source_root: Path | None, draft: dict
         mapped_blocks = []
         failed_line = None
         try:
+            if strict:
+                return _strict_formal(work, source, source_root, normalize_alignment(draft), bundle,
+                                      snapshot["sha256"])
             tex = render_tex(draft, block_map=mapped_blocks, allow_empty_history=True)
             if previous_case and previous_draft == draft:
                 prior = _prior(work, previous_case, source, snapshot["sha256"])
@@ -375,7 +614,8 @@ def deliver_case(work: Path, source: Path, source_root: Path | None, draft: dict
                         return _receipt(case, bundle, "repaired", _compile(case), diagnostic, draft=patched)
                 except _DELIVERY_ERRORS:
                     pass
-            return DeliveryCase(prior, "prior", diagnostic)
+            layout_check, issues = _saved_layout(prior, Path(previous_case)) if strict else ("not_checked", ())
+            return DeliveryCase(prior, "prior", diagnostic, layout_check=layout_check, layout_issues=issues)
         case = checker.allocate(bundle, source, work, "delivery-readable", source_root)
         title = _literal(draft.get("title") or source.stem)
         authors = _literal(", ".join(draft.get("authors") or []))

@@ -27,7 +27,8 @@ const props = defineProps<{ paperId: string; eventCount: number; status: string 
 const usage = ref<Usage | null>(null);
 const error = ref("");
 const labels: Record<string, string> = {
-  direct: "整篇直写", extract: "分段提取", write_draft: "写稿", select: "整篇筛选",
+  direct: "整篇直写", direct_evidence: "定向查证", direct_finish: "补证后整篇收尾",
+  extract: "分段提取", write_draft: "写稿", select: "整篇筛选",
   review: "内容复核", review_with_fallback: "内容复核",
   visual: "成品逐页检查", source_image_lookup: "定向查原页", prerequisites: "定向补查",
 };

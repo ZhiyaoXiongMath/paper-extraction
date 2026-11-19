@@ -103,8 +103,15 @@ def test_lean_short_source(mode, tmp_path, monkeypatch):
         pytest.skip("formal delivery requires pdfLaTeX")
     source = tmp_path / "source" / "352.tex"
     source.parent.mkdir()
-    source.write_text(r"\documentclass{article}\begin{document}" + "\n" + r"\section{Theorem 1.1}" + "\n" +
-                      MAIN + "\n" + r"\section{Corollary 1.2}" + "\n" + APPLICATION + "\n" + r"\end{document}")
+    source.write_text(
+        r"\documentclass{article}\newtheorem{main}{Theorem}[section]\newtheorem{consequence}[main]{Corollary}"
+        "\n" + r"\begin{document}\section{Calabi flow}" + "\n"
+        + r"\begin{main}" + MAIN + r"\end{main}" + "\n"
+        + r"\subsection{Application}" + "\n"
+        + r"\begin{consequence}" + APPLICATION + r"\end{consequence}" + "\n"
+        + r"\end{document}",
+        encoding="utf-8",
+    )
     replay = Replay(mode)
     monkeypatch.setattr(agent, "Models", lambda _: replay)
     events = []
@@ -123,7 +130,10 @@ def test_lean_short_source(mode, tmp_path, monkeypatch):
     assert APPLICATION in result["draft"]["groups"][1]["theorem"]
     assert (Path(result["result_dir"]) / "introduction.pdf").read_bytes().startswith(b"%PDF")
     assert (LeanChoice in replay.calls) == (mode == "omitted")
-    assert (DraftPatch in replay.calls) == (mode == "quantifier")
+    assert DraftPatch not in replay.calls
+    if mode == "quantifier":
+        assert replay.calls.count(EvidenceReview) == 2
+        assert any(data.get("mode") == "exact_replacements" for _, data in events)
 
 
 def test_direct_never_truncates_or_discards_scans():

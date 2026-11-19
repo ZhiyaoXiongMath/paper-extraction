@@ -10,6 +10,7 @@ import tempfile
 from urllib.parse import urlsplit
 
 from .models import structured_request_text
+from .profile_inputs import uses_grounded_revision
 
 
 # OpenAI API model card, verified 2026-11-19. Only valid for the exact
@@ -76,7 +77,7 @@ def whole_source_budget(catalog, schema, instructions, packet, settings, model_p
     capacity_known = "max_input_tokens" in limits or "context_window" in limits
     if not capacity_known:
         limits["context_window"], origins["context_window"] = _DEFAULT_WINDOW, "fallback"
-    system, user = structured_request_text(schema, instructions, packet)
+    system, user = structured_request_text(schema, instructions, packet, compact=uses_grounded_revision(settings))
     raw_size = len(system.encode("utf-8")) + len(user.encode("utf-8"))
     encoding = _local_encoding(model) if official_openai and capacity_known else None
     count = (len(encoding.encode_ordinary(system)) + len(encoding.encode_ordinary(user))

@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 import shutil
 
@@ -153,6 +154,63 @@ def test_repair_matches_typed_heading_and_core_id_without_requiring_body_cite(tm
         other = deepcopy(draft)
         other[field][path] = changed
         assert delivery._patch_from_prior(other, blocks, prior, tmp_path, line) is None
+
+
+def test_relations_realign_only_simple_known_rows():
+    text = r"""\[
+\begin{alignedat}{2}
+&\det A &&{}=0\quad\text{on }D,\\
+&u_Z(z) &&{}\longrightarrow 0,\\
+&u_Z(z)-\log|z-Z| &&{}=O(1).
+\end{alignedat}
+\]"""
+    result = delivery.normalize_alignment({"groups": [{"theorem": text, "source": "p7-1"}]})
+    assert result["groups"][0] == {"source": "p7-1", "theorem": r"""\begin{relations}
+\det A &{}=0\quad\text{on }D, \\
+u_Z(z) &{}\longrightarrow 0, \\
+u_Z(z)-\log|z-Z| &{}=O(1).
+\end{relations}"""}
+    uncertain = text.replace("O(1).", "O(1). & y.")
+    assert delivery.normalize_alignment({"paragraph": uncertain})["paragraph"] == uncertain
+
+
+@pytest.mark.skipif(shutil.which("pdflatex") is None, reason="requires pdfLaTeX")
+def test_strict_final_records_actual_pdf_and_layout_defects(tmp_path):
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"An immutable input snapshot.")
+    draft = synthetic_draft()
+    work = tmp_path / "work"
+    good = delivery.deliver_case(work, source, None, draft, strict=True)
+    assert good.compiler_verified and good.layout_check == "passed"
+    draft["paragraph"] = "We consider positive real numbers. " * 24
+    fallback = delivery.deliver_case(work, source, None, draft, strict=True)
+    assert fallback.compiler_verified and fallback.layout_check == "failed"
+    assert fallback.layout_issues and pdfops.page_count(fallback.path / "introduction.pdf") > 0
+    receipt = json.loads((fallback.path / "delivery.json").read_text("utf-8"))
+    assert receipt["files"]["introduction.pdf"] == delivery.v13_check.digest(fallback.path / "introduction.pdf")
+    assert receipt["layout_check"] == "failed"
+
+
+def test_completed_checks_require_review_of_the_published_pair(tmp_path, monkeypatch):
+    from paper_extraction import agent
+
+    monkeypatch.setattr(agent, "_render_pages", lambda _pdf: [(1, b"first"), (2, b"second")])
+    same_page = hashlib.sha256(b"first").hexdigest()
+    other_page = hashlib.sha256(b"different second").hexdigest()
+    old_draft = {"paragraph": "Original statement."}
+    revised = {"paragraph": "Revised statement."}
+    case = delivery.DeliveryCase(tmp_path, "final", layout_check="passed")
+    review = agent._record({"draft": old_draft, "attempt": 2}, "review", True, [])
+    visuals = [
+        {"stage": "visual", "page": 1, "page_sha256": same_page, "passed": True},
+        {"stage": "visual", "page": 2, "page_sha256": other_page, "passed": True},
+    ]
+    statuses, issues = agent._completed_checks(case, revised, [review, *visuals])
+    assert statuses == {"content": "not_checked", "layout": "passed", "visual": "not_checked"}
+    assert not issues
+    visuals[1]["page_sha256"] = hashlib.sha256(b"second").hexdigest()
+    statuses, _ = agent._completed_checks(case, old_draft, [review, *visuals])
+    assert all(check == "passed" for check in statuses.values())
 
 
 def _build_failure(tmp_path: Path, source: Path, draft: dict) -> Exception:

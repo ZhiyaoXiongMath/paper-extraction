@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { canDeleteBatch, metrics, readBlocks, terminal, paperOutcome } from "./format.js";
+import { batchPaperLabel, canDeleteBatch, metrics, readBlocks, terminal, paperOutcome, paperTone } from "./format.js";
 
 test("single-batch deletion accepts paused papers and waits for active papers to pause", () => {
   for (const counts of [{ paused: 3 }, { completed: 1, paused: 2 }, { paused: 1, failed: 1, cancelled: 1 }]) {
@@ -67,6 +67,28 @@ test("delivered papers open the reader regardless of a previous review failure",
   assert.equal(paperOutcome({ ...task, delivery: { status: "delivered" } }).initialTab, "reader");
   assert.equal(paperOutcome({ ...task, delivery: { status: "reviewed" } }).title, "已交付 · 已通过检查");
 });
+test("partial check coverage has a plain delivery label in the batch and paper header", () => {
+  const task = {
+    status: "completed", delivery: {
+      status: "delivered", draft_round: 2, compiler_verified: true,
+      checks: { content: "not_checked", layout: "failed", visual: "not_checked" },
+    },
+  };
+  for (const kind of ["final", "prior", "readable"]) {
+    const paper = { ...task, delivery: { ...task.delivery, kind } };
+    assert.equal(paperTone(paper), "neutral");
+    assert.equal(batchPaperLabel(paper), "已交付");
+    assert.equal(paperOutcome(paper).title, "已交付");
+  }
+  const reviewed = { ...task, delivery: { ...task.delivery, status: "reviewed" } };
+  assert.equal(paperTone(reviewed), "good");
+  assert.match(batchPaperLabel(reviewed), /全检查通过/);
+  const summary = { ...task, delivery: { status: "delivered", kind: "summary" } };
+  assert.equal(paperTone(summary), "good");
+  assert.equal(batchPaperLabel(summary), "已交付 · 筛选说明");
+  assert.equal(batchPaperLabel({ status: "completed" }), "已完成");
+});
+
 test("a Markdown-only result opens the screening note", () => {
   const paper = {status: "completed", delivery: {
     kind: "summary", outcome: "insufficient_evidence", note: "证据不足。"

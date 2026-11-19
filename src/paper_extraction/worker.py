@@ -6,7 +6,9 @@ from pathlib import Path
 from filelock import FileLock
 
 from .settings import provider_settings
+from .profile_inputs import is_reliable_workflow
 from .store import Store
+from .summary_delivery import write_run_report
 from .usage import usage_session
 
 
@@ -62,7 +64,13 @@ def process(home, pid):
             store.finish(paper, result)
         except Exception as exc:
             reason = str(exc).replace(settings["api_key"], "[redacted]") if settings["api_key"] else str(exc)
-            store.finish(paper, {"status":"failed","reason":reason[:1800] or type(exc).__name__})
+            result = {"status": "failed", "reason": reason[:1800] or type(exc).__name__}
+            if is_reliable_workflow(settings):
+                try:
+                    result = write_run_report(store.work(paper), Path(paper["source"]), result)
+                except OSError:
+                    logging.getLogger(__name__).warning("Could not save the interruption report")
+            store.finish(paper, result)
 
 
 if __name__ == "__main__":

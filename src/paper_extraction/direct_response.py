@@ -1,5 +1,60 @@
 """Lossless wire-shape repairs and safe diagnostics for a whole-source reply."""
 import re
+from collections import defaultdict
+
+from pydantic import ValidationError
+
+from .focused_evidence import projected_sources
+from .repair_progress import block_at
+
+
+class EvidenceCoverageError(ValueError):
+    def __init__(self, blocks):
+        self.blocks = blocks
+        super().__init__(f"Provide one evidence link for each block: {sorted(blocks)}")
+
+
+def prepare_evidence_patch(document, blocks, payload):
+    """Freeze valid rows. Only a model can choose the evidence for a missing link."""
+    draft = document["draft"]
+    rows = draft["evidence_links"]
+    by_block = defaultdict(list)
+    for row in rows:
+        by_block[row["block_id"]].append(row)
+    kept = [by_block[path][0] for path in sorted(blocks) if len(by_block[path]) == 1]
+    targets = sorted(path for path in blocks if len(by_block[path]) != 1)
+    core_by_id = {row["candidate_id"]: row for row in document.get("cores", [])}
+    group_owners = draft.get("core_bindings", {})
+    source_ids = set()
+    target_texts = []
+    orphan_ids = {sid for row in rows if row["block_id"] not in blocks for sid in row["evidence_ids"]}
+    for path in targets:
+        group = path.split(".")[:2]
+        owner_path = ".".join([*group, "theorem"]) if group[0] == "groups" else path
+        core = core_by_id.get(group_owners.get(owner_path), {})
+        hints = set(core.get("evidence_ids", [])) | orphan_ids
+        for row in rows:
+            if row["block_id"].split(".")[:2] == group:
+                hints.update(row["evidence_ids"])
+        if not hints:
+            # Shared context can refer to several results. Give the correction
+            # the material already cited by the model, including definition sources.
+            hints = {sid for row in [*rows, *core_by_id.values()] for sid in row["evidence_ids"]}
+        source_ids.update(hints)
+        target_texts.append({"block_id": path, "text": block_at(draft, path),
+                             "attribution": draft.get("formal_sources", {}).get(path, {})})
+    packet = {"blocks": target_texts, "passages": projected_sources(payload["passages"], source_ids, abridge=True)}
+    packet["source_images"] = [r for r in payload.get("source_images", []) if r["source_id"] in source_ids]
+    return kept, targets, packet
+
+
+def with_evidence_links(document, links):
+    pending = {row["block_id"]: row for row in links}
+    ordered = []
+    for row in document["draft"]["evidence_links"]:
+        if row["block_id"] in pending:
+            ordered.append(pending.pop(row["block_id"]))
+    return {**document, "draft": {**document["draft"], "evidence_links": [*ordered, *pending.values()]}}
 
 
 def unfence(text):
@@ -29,6 +84,80 @@ def normalize_direct_shape(document):
         if len(unique) != len(links):
             draft["evidence_links"] = unique
     return {**document, "draft": draft} if draft != document["draft"] else document
+
+
+def direct_source_action(document, payload, check_schema):
+    """Read the action independently of any unvalidated manuscript fields."""
+    if not isinstance(document, dict) or not document.get("source_checks"):
+        return [], []
+    raw_checks = document["source_checks"]
+    if not isinstance(raw_checks, list):
+        return [], [{"field": "source_checks", "code": "list_type"}]
+    source = {row["id"]: row for row in payload.get("passages", [])}
+    source.update({row["id"]: row for row in payload.get("source_locations", []) if row["id"] not in source})
+    checks, invalid = [], []
+    for i, raw in enumerate(raw_checks):
+        field = f"source_checks.{i}"
+        try:
+            check = check_schema.model_validate(raw)
+        except ValidationError as exc:
+            loc = exc.errors(include_input=False)[0]["loc"]
+            detail = loc[0] if loc and loc[0] in check_schema.model_fields else None
+            invalid.append({"field": f"{field}.{detail}" if detail else field, "code": "invalid_source_check"})
+            continue
+        target = check.target_id or check.source_id
+        if check.source_id not in source or target not in source:
+            invalid.append({"field": field, "code": "unknown_source_id"})
+        elif not check.question.strip() or (check.read_image and not source[target].get("page")):
+            invalid.append({"field": field, "code": "invalid_source_check"})
+        elif check not in checks:
+            checks.append(check)
+    return checks, invalid[:16]
+
+
+def provisional_direct_answer(document):
+    return {key: document[key] for key in ("cores", "draft", "summary") if document.get(key)}
+
+
+def direct_retry_packet(payload, document, diagnostics):
+    """Repair the existing response using its cited material and a location index."""
+    if not isinstance(document, dict):
+        return None
+    previous = provisional_direct_answer(document)
+    if not previous and not document.get("source_checks"):
+        return None
+    if document.get("source_checks"):
+        previous["source_checks"] = document["source_checks"]
+    locations = payload.get("source_locations") or payload.get("passages", [])
+    used = set()
+
+    def find_ids(value):
+        if isinstance(value, str):
+            used.add(value)
+        elif isinstance(value, list):
+            for item in value:
+                find_ids(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                find_ids(item)
+
+    find_ids(previous)
+    return {
+        "previous_response": previous,
+        "previous_schema_failure": diagnostics,
+        "source_metadata": payload.get("source_metadata", {}),
+        "source_locations": [{k: row[k] for k in ("id", "label", "section", "page", "file", "line") if k in row}
+                             for row in locations],
+        "passages": [row for row in payload.get("passages", []) if row["id"] in used],
+        "source_questions": payload.get("source_questions", []),
+        "source_images": payload.get("source_images", []),
+        "correction": (
+            "Repair the listed fields of previous_response. Preserve verified wording and evidence. "
+            "Use registered locations and a concrete question for a source request; set cores to [] "
+            "and draft and summary to null in that action. If source_questions already contains answers, "
+            "return the corrected decision. Do not invent a fact, location, or uncited hypothesis."
+        ),
+    }
 
 
 _DOCUMENT_ERRORS = {

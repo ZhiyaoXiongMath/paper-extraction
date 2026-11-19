@@ -7,7 +7,9 @@ from pathlib import Path
 from filelock import FileLock
 
 from .profile_assets.tools import v13_check
-from .profiles.core_20261118.tools import v13_check as current_check
+from .profiles.core_selection_20261119.tools import v13_check as current_check
+from .profiles.core_20261119.tools import v13_check as reliability_check
+from .profiles.core_20261118.tools import v13_check as token_check
 from .profiles.current.tools import v13_check as previous_check
 
 
@@ -15,13 +17,23 @@ STANDARD_CURRENT_MAX = 4
 UNLIMITED_CURRENT = v13_check.UNLIMITED_CURRENT_RELEASE
 READER_PROFILE = "reader"
 CURRENT_PROFILE = current_check.RELEASE
-CURRENT_ASSETS = Path(__file__).with_name("profiles") / "core_20261118"
+CURRENT_ASSETS = Path(__file__).with_name("profiles") / "core_selection_20261119"
+RELIABILITY_PROFILE = reliability_check.RELEASE
+RELIABILITY_ASSETS = CURRENT_ASSETS.with_name("core_20261119")
+TOKEN_PROFILE = token_check.RELEASE
+TOKEN_ASSETS = CURRENT_ASSETS.with_name("core_20261118")
 PREVIOUS_PROFILE = previous_check.RELEASE
 # Older editable installations still read this literal path while they serve a
 # batch. Keep its original bytes, and install subsequent profiles side by side.
 PREVIOUS_ASSETS = CURRENT_ASSETS.with_name("current")
 _INSTALLED = {CURRENT_PROFILE: (CURRENT_ASSETS, current_check),
+              RELIABILITY_PROFILE: (RELIABILITY_ASSETS, reliability_check),
+              TOKEN_PROFILE: (TOKEN_ASSETS, token_check),
               PREVIOUS_PROFILE: (PREVIOUS_ASSETS, previous_check)}
+
+
+def is_core_release(release: str | None) -> bool:
+    return release in (CURRENT_PROFILE, RELIABILITY_PROFILE, TOKEN_PROFILE)
 
 
 def is_versioned_release(release: str | None) -> bool:

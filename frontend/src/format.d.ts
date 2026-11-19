@@ -7,6 +7,8 @@ export function paperOutcome(paper: Paper): {
 };
 export function label(status?: string): string;
 export function tone(status?: string): string;
+export function paperTone(paper: Paper): string;
+export function batchPaperLabel(paper: Paper): string;
 export function terminal(status?: string): boolean;
 export function canDeleteBatch(batch: BatchSummary, allowPaused?: boolean): boolean;
 export function eventSummary(event: {

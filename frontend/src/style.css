@@ -760,6 +760,12 @@ td small {
   background: #ecefe9;
   color: #556257;
 }
+.paper-row .pill,
+.detail-heading > .pill {
+  flex-shrink: 0;
+  max-width: 46%;
+  white-space: normal;
+}
 .id-title {
   font-size: 0.8em;
   color: #596a5f;

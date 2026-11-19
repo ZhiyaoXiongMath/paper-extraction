@@ -60,8 +60,9 @@ def provider_answer(request, visual_pages):
 
     # The adapter supplies the live Pydantic schema in its system message.
     schema = json.loads(sys_msg.rsplit("\n", 1)[1])["title"]
-    if schema == "DirectResult":
-        assert current_rules() in sys_msg and node_prompt("direct") in sys_msg
+    if schema == "BlockDirectResult":
+        assert current_rules() in sys_msg and "Apply B1 to the total number" in sys_msg
+        assert "evidence_ids inside each body block" in sys_msg
         spans = data["passages"]
         criterion = next((s["id"] for s in spans if r"\label{thm:criterion}" in s["text"]), None)
         if criterion is None:
@@ -88,13 +89,20 @@ def provider_answer(request, visual_pages):
                 links["history.0"] = [background]
                 formal["history.0"] = {"source": r"\cite[Background]{source}"}
                 core_ids["history.0"] = "c2"
+            def block(field, text):
+                row = {"text": text, "evidence_ids": links[field]}
+                if field in formal:
+                    row["formal_source"] = formal[field]
+                if field in core_ids:
+                    row["candidate_id"] = core_ids[field]
+                return row
             answer["draft"] = {"title": TITLE, "authors": ["Paper Extraction Contributors"],
-                "paragraph": "Which families of continuous functions are relatively compact in the supremum norm?",
-                "history": [HISTORY] if background else [], "shared_definitions": [],
-                "groups": [{"definitions": [DEFINITION], "theorem": CURRENT}], "core_bindings": core_ids,
-                "formal_sources": formal, "references": [{"key": "source", "text": TITLE}],
-                "evidence_links": [{"block_id": k, "evidence_ids": v} for k, v in links.items()]}
-    elif schema == "EvidenceReview":
+                "paragraph": block("paragraph", "Which families of continuous functions are relatively compact in the supremum norm?"),
+                "history": [block("history.0", HISTORY)] if background else [], "shared_definitions": [],
+                "groups": [{"definitions": [block("groups.0.definitions.0", DEFINITION)],
+                            "theorem": block("groups.0.theorem", CURRENT)}],
+                "references": [{"key": "source", "text": TITLE}]}
+    elif schema == "EvidenceReviewForm":
         answer = {"verdict": {"route": "pass", "issues": [], "evidence_ids": []}, "source_checks": []}
     elif schema == "Findings":
         spans = data["passages"]
@@ -224,7 +232,7 @@ def test_full_batch_with_loopback_model_fixture(tmp_path, monkeypatch, with_hist
             pid = completed["id"]
             ledger = client.get(f"/api/papers/{pid}/usage").json()
             operations = {row["operation"]: row["model_calls"] for row in ledger["groups"]}
-            assert operations["DirectResult"] == 1 and operations["EvidenceReview"] == 1
+            assert operations["BlockDirectResult"] == 1 and operations["EvidenceReviewForm"] == 1
             assert not {"Findings", "TextFindings", "evidence_decision"}.intersection(operations)
             locations = next(link["evidence_ids"] for link in completed["links"] if link["block_id"]=="groups.0.theorem")
             result = client.get(f"/api/papers/{pid}/evidence/{locations[0]}").json()

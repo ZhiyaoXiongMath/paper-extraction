@@ -4,9 +4,13 @@ from copy import deepcopy
 
 from pydantic import ValidationError
 
-from .models import AdmissionReview, AuthoritativeDraft, CurrentDraft, Draft, DraftPatch
-from .profile_variants import CURRENT_PROFILE, PREVIOUS_PROFILE
-from .profile import bind_formal_citations, saved_build_targets
+from .admission import source_statement_options
+from .citation_layout import citation_keys
+from .models import MAX_DEFINITIONS, MAX_GROUP_DEFINITIONS, AdmissionReview, AuthoritativeDraft, CurrentDraft, Draft, DraftPatch
+from .profile_variants import is_versioned_release
+from .profile import bind_formal_citations, render_tex, renderer_context, saved_build_targets
+from .reference_patch import ReferencePatch, reference_packet
+from .grounded_writing import definition_uses, source_address
 
 WRITER_VERSION = "block-patch-v1"
 PATCH_GUIDANCE = (
@@ -28,17 +32,81 @@ def _address(draft, block):
 def _schema(draft):
     if draft.get("core_bindings"):
         return AuthoritativeDraft
-    return CurrentDraft if draft.get("editorial_profile") in {CURRENT_PROFILE, PREVIOUS_PROFILE} else Draft
+    return CurrentDraft if is_versioned_release(draft.get("editorial_profile")) else Draft
 
 
-def repair_targets(draft, verdict, registered):
+def narrow_reviewed_citation(draft, verdict, candidates, records):
+    """Apply one exact review edit that drops extra locators from an existing theorem citation."""
+    if (verdict.get("stage") != "review" or verdict.get("route") != "draft"
+            or verdict.get("passed") is not False or verdict.get("evidence_ids")
+            or len(verdict.get("defects", ())) != 1):
+        return None
+    try:
+        review = AdmissionReview(route="draft", issues=verdict["defects"], evidence_ids=[])
+    except ValidationError:
+        return None
+    edit = review.issues[0]
+    field = re.fullmatch(r'''formal_sources\[(["'])(groups\.\d+\.theorem)\1\]\.source''', edit.draft_field)
+    if (not field or edit.operation != "replace" or edit.kind != "incorrect_attribution_or_locator"
+            or review.repair_issues() != verdict.get("issues")):
+        return None
+    block = field[2]
+    citation = draft.get("formal_sources", {}).get(block, {}).get("source")
+    if not citation or citation != edit.current_excerpt:
+        return None
+    cite = r"\\cite\[([^\[\]\n]+)\]\{([A-Za-z0-9:._-]+)\}"
+    before = re.fullmatch(cite, citation)
+    after = re.fullmatch(cite, edit.replacement_text)
+    if not before or not after or before[2] != after[2]:
+        return None
+    items = re.split(r"\s+and\s+|;\s*|,\s*", before[1])
+    locator = re.compile(r"(Theorem|Corollary)[~ ]+(\d+(?:\.\d+)*)(?:\([a-z0-9]+\))?")
+    kept = locator.fullmatch(after[1])
+    if not kept or len(items) < 2 or items.count(after[1]) != 1 or not all(map(locator.fullmatch, items)):
+        return None
+    core_id = draft.get("core_bindings", {}).get(block)
+    core = next((row for row in candidates if row.get("candidate_id") == core_id), {})
+    evidence = next((row["evidence_ids"] for row in draft["evidence_links"] if row["block_id"] == block), ())
+    location = edit.evidence_id
+    if (location not in records or location not in evidence or location not in core.get("evidence_ids", ())
+            or core.get("decision") != "admitted"):
+        return None
+    # The surviving locator must point to the actual admitted heading in the cited span.
+    if not any(option["id"] == core.get("source_statement_id") and option["kind"] == kept[1].lower()
+               and option["number"] == kept[2] for option in source_statement_options(records[location])):
+        return None
+    revised = deepcopy(draft)
+    revised["formal_sources"][block]["source"] = edit.replacement_text
+    try:
+        _schema(revised).model_validate(revised)
+    except ValidationError:
+        return None
+    return revised
+
+
+def _unused_reference(draft, field, excerpt):
+    index = int(field.split(".")[-1])
+    references = draft["references"]
+    if (index >= len(references) or len(references) <= 1 or references[index]["key"] == "source"
+            or references[index]["text"] != excerpt):
+        return False
+    # The ordinary renderer checks citation keys in bodies, headings and comparisons.
+    try:
+        render_tex({**draft, "references": references[:index] + references[index + 1:]})
+    except ValueError:
+        return False
+    return True
+
+
+def repair_targets(draft, verdict, registered, *, allow_collection_edits=False, resolve_fields=False):
     """Plan a patch only when every unresolved issue maps to an existing writable block."""
     if not draft or verdict.get("passed") is not False or not verdict.get("issues"):
         return []
     if verdict.get("stage") == "combined":
         merged = {}
         for check in verdict["checks"]:
-            rows = repair_targets(draft, check, registered)
+            rows = repair_targets(draft, check, registered, allow_collection_edits=allow_collection_edits,
+                                  resolve_fields=resolve_fields)
             if not rows:
                 return []
             for row in rows:
@@ -50,6 +118,11 @@ def repair_targets(draft, verdict, registered):
                     merged[key]["diagnostics"].extend(row["diagnostics"])
                     merged[key]["required_evidence_ids"] = list(dict.fromkeys(
                         [*merged[key]["required_evidence_ids"], *row["required_evidence_ids"]]))
+                    if row.get("missing_reference_keys"):
+                        merged[key]["missing_reference_keys"] = sorted(set(
+                            merged[key].get("missing_reference_keys", ())) | set(row["missing_reference_keys"]))
+                    if row.get("attribution_fields"):
+                        merged[key].setdefault("attribution_fields", {}).update(row["attribution_fields"])
         return list(merged.values())
     try:
         schema = _schema(draft)
@@ -95,16 +168,55 @@ def repair_targets(draft, verdict, registered):
             return []
         if review.repair_issues() != verdict["issues"] or verdict.get("evidence_ids"):
             return []
+        lean = bool(draft.get("core_bindings"))
         for defect in review.issues:
-            row = target(defect.draft_field, allow_append=defect.operation == "insert" and not defect.current_excerpt.strip())
-            lean = bool(draft.get("core_bindings"))
+            field = defect.draft_field
+            attr = None
+            if resolve_fields:
+                field, attr = source_address(draft, field)
+                if attr:
+                    value = draft["formal_sources"][field].get(attr, "as reported in" if attr == "reporting" else "")
+                    if (defect.operation not in {"replace", "insert", "remove"}
+                            or not isinstance(value, str) or defect.current_excerpt not in value
+                            or (not defect.current_excerpt and (value or defect.operation != "insert"))
+                            or (defect.current_excerpt and value.count(defect.current_excerpt) != 1)):
+                        return []
+            insert = defect.operation == "insert" and not defect.current_excerpt.strip()
+            extended = allow_collection_edits and lean
+            collection = re.fullmatch(r"groups\.(\d+)\.definitions", field)
+            if extended and collection and insert:
+                index = int(collection[1])
+                groups = draft["groups"]
+                if index >= len(groups) or (not resolve_fields and len(groups[index]["definitions"]) >= MAX_GROUP_DEFINITIONS):
+                    return []
+                # An unindexed insert identifies the containing group, not an arbitrary
+                # position between existing definitions. Append in the named group.
+                field += f".{len(groups[index]['definitions'])}"
+                if field in targets:
+                    return []
+            if extended and defect.operation == "remove" and re.fullmatch(r"references\.\d+", field):
+                if (field in targets or defect.evidence_id not in registered
+                        or not _unused_reference(draft, field, defect.current_excerpt)):
+                    return []
+                targets[field] = dict(block_id=field, current_text=defect.current_excerpt,
+                                      bound_evidence_ids=[], required_evidence_ids=[defect.evidence_id],
+                                      defects=[defect.model_dump()], diagnostics=[], remove=True, unused_reference=True)
+                continue
+            row = target(field, allow_append=insert)
             if (row is None or defect.operation not in ({"replace", "insert", "remove"} if lean else {"replace", "insert"})
                     or (not lean and defect.kind == "improper_selection" and defect.operation != "replace") or defect.evidence_id not in registered
-                    or (defect.current_excerpt.strip() and defect.current_excerpt not in row["current_text"])):
+                    or (not attr and defect.current_excerpt.strip() and defect.current_excerpt not in row["current_text"])):
                 return []
-            row["defects"].append(defect.model_dump())
-            if lean and defect.operation == "remove" and defect.current_excerpt.strip() == row["current_text"].strip():
-                if not re.fullmatch(r"(?:groups\.\d+\.paragraph|(?:shared_definitions|groups\.\d+\.definitions)\.\d+)", defect.draft_field):
+            if extended and field in additions:
+                row["requires_formal_source"] = True
+            edit = defect.model_dump()
+            if attr:
+                row.setdefault("attribution_fields", {})[attr] = value
+            elif resolve_fields:
+                edit["draft_field"] = field
+            row["defects"].append(edit)
+            if not attr and lean and defect.operation == "remove" and defect.current_excerpt.strip() == row["current_text"].strip():
+                if not re.fullmatch(r"(?:groups\.\d+\.paragraph|(?:shared_definitions|groups\.\d+\.definitions)\.\d+)", field):
                     return []
                 row["remove"] = True
             if defect.evidence_id not in row["required_evidence_ids"]:
@@ -125,6 +237,26 @@ def repair_targets(draft, verdict, registered):
                 return []
             row["diagnostics"].extend(diagnostics)
             row["required_evidence_ids"] = list(row["bound_evidence_ids"])
+            if error.get("missing_reference_keys"):
+                row["missing_reference_keys"] = error["missing_reference_keys"]
+    if additions and allow_collection_edits and draft.get("core_bindings"):
+        count = len(parsed.shared_definitions) + sum(len(group.definitions) for group in parsed.groups)
+        removed_defs = [field for field, item in targets.items() if resolve_fields and item.get("remove")
+                        and re.fullmatch(r"(?:shared_definitions|groups\.\d+\.definitions)\.\d+", field)]
+        if removed_defs:
+            users = definition_uses(draft, [targets[key] for key in removed_defs], renderer_context(draft)["visible_headings"])
+            if any(set(use["explicit_users"]) - targets.keys() for use in users.values()):
+                # A slot cannot be released locally by leaving a reference to a different numbered definition.
+                return []
+        delta = {}
+        for field, slots in [(field, 1) for field in additions] + [(field, -1) for field in removed_defs]:
+            owner = field.rsplit(".", 1)[0]
+            delta[owner] = delta.get(owner, 0) + slots
+        if (count + len(additions) - len(removed_defs) > MAX_DEFINITIONS or any(
+                len(_address(draft, block)[0]) + delta[block.rsplit(".", 1)[0]] > MAX_GROUP_DEFINITIONS
+                for block in additions)):
+            # Release a slot only when its exact prior owner was explicitly removed in this same review.
+            return []
     if additions and not draft.get("core_bindings"):
         prospective = deepcopy(draft)
         for block in additions:
@@ -138,10 +270,39 @@ def repair_targets(draft, verdict, registered):
     return list(targets.values())
 
 
+def write_block_patch(models, instructions, packet, *, coupled_references=False, records=None):
+    schema = DraftPatch
+    if coupled_references:
+        schema = ReferencePatch
+        packet = reference_packet(packet, records or {})
+        instructions += (" Every new citation key in a replacement needs its original entry in additional_references "
+                         "with its source_id. Reuse an existing key for the same work. If the bibliography entry "
+                         "is unavailable, cite the exact reporting passage in the supplied paper.")
+    targets = packet["repair_targets"]
+    local = [row for row in targets if row.get("unused_reference")]
+    if not local:
+        return models.structured(schema, instructions, packet)
+    remaining = [row for row in targets if not row.get("unused_reference")]
+    drops = {int(row["block_id"].split(".")[1]) for row in local}
+    model_packet = {**packet, "repair_targets": remaining,
+                    "references": (packet["references"] if coupled_references else
+                                   [ref for i, ref in enumerate(packet["references"]) if i not in drops])}
+    answer = models.structured(schema, instructions, model_packet) if remaining else None
+    edits = answer.replacements if answer else []
+    removals = [{"block_id": row["block_id"], "evidence_ids": row["required_evidence_ids"], "text": ""}
+                for row in local]
+    extras = {"additional_references": answer.additional_references} if answer and coupled_references else {}
+    return schema(replacements=[*edits, *removals], **extras)
+
+
 def apply_patch(draft, patch, packet, records):
     """Merge only requested text and its evidence links, preserving all other serialized fields."""
-    checked = DraftPatch.model_validate(patch.model_dump(), context=packet)
+    if isinstance(patch, ReferencePatch):
+        packet = reference_packet(packet, records)
+    checked = type(patch).model_validate(patch.model_dump(), context=packet)
     result = deepcopy(draft)
+    additional = {r.key: r for r in getattr(checked, "additional_references", ())}
+    result["references"].extend({"key": key, "text": row.text} for key, row in additional.items())
     links = {link["block_id"]: link for link in result["evidence_links"]}
     removed = []
     targets = {t["block_id"]: t for t in packet["repair_targets"]}
@@ -158,10 +319,17 @@ def apply_patch(draft, patch, packet, records):
             parent["paragraph_position"] = row.paragraph_position
         if row.formal_source is not None and "formal_sources" in result:
             result["formal_sources"][row.block_id] = row.formal_source.model_dump()
+        evidence_ids = list(row.evidence_ids)
+        if additional:
+            used = citation_keys(row.text)
+            for value in result.get("formal_sources", {}).get(row.block_id, {}).values():
+                if isinstance(value, str):
+                    used.update(citation_keys(value))
+            evidence_ids = list(dict.fromkeys([*evidence_ids, *(r.source_id for key, r in additional.items() if key in used)]))
         if row.block_id in links:
-            links[row.block_id]["evidence_ids"] = row.evidence_ids
+            links[row.block_id]["evidence_ids"] = evidence_ids
         elif not row.block_id.startswith("references."):
-            result["evidence_links"].append({"block_id": row.block_id, "evidence_ids": row.evidence_ids})
+            result["evidence_links"].append({"block_id": row.block_id, "evidence_ids": evidence_ids})
     bound = bind_formal_citations(result, records)
     for row in checked.replacements:
         if row.block_id in removed:
@@ -173,7 +341,8 @@ def apply_patch(draft, patch, packet, records):
                   else previous.get(key, "") if key == "paragraph" else previous[key])
         moved = row.paragraph_position is not None and row.paragraph_position != previous.get("paragraph_position", "after")
         citation_changed = row.formal_source is not None and result.get("formal_sources", {}).get(row.block_id) != draft.get("formal_sources", {}).get(row.block_id)
-        if before == normalized[key] and not moved and not citation_changed:
+        reference_added = any(k in additional for k in targets[row.block_id].get("missing_reference_keys", []))
+        if before == normalized[key] and not moved and not citation_changed and not reference_added:
             raise ValueError(f"{row.block_id}: the requested change is missing after binding the original citation")
         parent[key] = normalized[key]
     # Apply all edits to old coordinates first; deleting list entries earlier
@@ -182,6 +351,10 @@ def apply_patch(draft, patch, packet, records):
     for field in sorted(removed, key=lambda v: int(v.split(".")[-1]) if v.split(".")[-1].isdigit() else 0,
                         reverse=True):
         parent, key = _address(result, field)
+        if targets[field].get("unused_reference") and not _unused_reference(result, field, targets[field]["current_text"]):
+            # A simultaneous change may now cite the entry. Preserve the reference
+            # rather than export a dangling citation; review the merged revision.
+            continue
         if isinstance(parent, list):
             parent.pop(key)
             dropped.setdefault(field.rsplit(".", 1)[0], []).append(key)

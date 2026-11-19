@@ -7,6 +7,7 @@ import {
   shortId,
   formatDate,
   paperOutcome,
+  paperTone,
   tone,
   stageName,
 } from "./format.js";
@@ -48,6 +49,13 @@ const evidenceLabels = computed(() => readerView.value ? {
 const prefix = computed(() => paperUrl(props.paper.id));
 const downloads = computed(() => paperDownloads(props.paper, prefix.value));
 const summary = computed(() => props.paper.delivery?.kind === "summary" ? props.paper.delivery.summary : undefined);
+const checkNames = [["content", "数学内容"], ["layout", "编译排版"], ["visual", "逐页视觉"]] as const;
+const checkStatus = { passed: "通过", failed: "发现问题", not_checked: "本稿未检查" };
+const checkIssues = computed(() => {
+  const { check_issues, layout_issues } = props.paper.delivery || {};
+  return [...new Set([...(check_issues?.content || []), ...(check_issues?.layout || layout_issues || []),
+    ...(check_issues?.visual || [])])];
+});
 const failureReasons = computed(() => visibleFailureReasons(props.paper));
 const published = computed(() => tone(props.paper.status) === "good");
 const links = computed(() =>
@@ -135,10 +143,10 @@ watch(
         {{ paper.draft.authors.join(" · ") }}
       </p>
     </div>
-    <span class="pill" :class="tone(paper.status)">{{ outcome.title }}</span>
+    <span class="pill" :class="paperTone(paper)">{{ outcome.title }}</span>
   </section>
   <section class="paper-downloads" aria-label="论文文件下载">
-    <div class="download-context">
+    <div v-if="!published" class="download-context">
       <strong>{{ downloads.label }}</strong>
       <span v-if="downloads.recompiled">按本轮保存稿重新编译</span>
       <span v-else-if="downloads.restored">已恢复本轮保存稿</span>
@@ -146,7 +154,7 @@ watch(
     </div>
     <div class="download-buttons">
       <a v-if="downloads.markdown" class="btn primary" :href="downloads.markdown" download>
-        <Icon name="download" :size="15" />下载说明 .md</a>
+        <Icon name="download" :size="15" />{{ paper.delivery?.kind === "run_report" ? "下载中断记录 .md" : "下载说明 .md" }}</a>
       <template v-else>
       <a v-if="downloads.tex" class="btn primary" :href="downloads.tex" download>
         <Icon name="download" :size="15" />下载 .tex</a>
@@ -158,7 +166,6 @@ watch(
       <a v-if="published && !summary" class="btn" :href="prefix + '/download'" download>
         <Icon name="download" :size="15" />下载单篇 ZIP</a>
     </div>
-    <p v-if="published && paper.delivery?.note && !summary" class="delivery-note">{{ paper.delivery.note }}</p>
   </section>
   <div class="file-actions" v-if="paper.kind === 'pdf' || ['failed','queued','running','pausing','paused'].includes(paper.status)">
     <a v-if="paper.kind === 'pdf'" :href="prefix + '/source'" class="btn" target="_blank" rel="noopener">
@@ -236,8 +243,28 @@ watch(
       <IntroductionReader v-if="readerView" :draft="paper.draft"
         :links="links" :active-evidence="evidenceKey" @evidence="openEvidence" />
       <CandidatePanel v-if="tab === 'candidates'" :candidates="paper.candidates || []" @evidence="openEvidence" />
-      <ReviewsPanel v-if="tab === 'checks'" :reviews="paper.reviews || []" :stage="paper.stage"
-                    :draft="paper.draft" @evidence="openEvidence" />
+      <template v-if="tab === 'checks'">
+        <details v-if="published && (paper.delivery?.checks || paper.delivery?.note)" class="delivery-record">
+          <summary>交付稿检查记录<span v-if="paper.delivery.draft_round"> · 第 {{ paper.delivery.draft_round }} 稿</span></summary>
+          <p v-if="paper.delivery.kind === 'readable'">文件版本 · 简明版</p>
+          <p v-else-if="paper.delivery.kind === 'prior'">文件版本 · 采用此前已编译的稿件</p>
+          <dl v-if="paper.delivery.checks">
+            <div v-for="[key, name] in checkNames" :key="key">
+              <dt>{{ name }}</dt><dd>{{ checkStatus[paper.delivery.checks[key]] }}</dd>
+            </div>
+          </dl>
+          <p v-if="paper.delivery.note">{{ paper.delivery.note }}</p>
+          <ul v-if="checkIssues.length" class="failure-reasons">
+            <li v-for="issue in checkIssues" :key="issue">{{ issue }}</li>
+          </ul>
+          <details v-if="paper.delivery.diagnostic" class="diagnostic">
+            <summary>编译记录</summary>
+            <p>{{ paper.delivery.diagnostic }}</p>
+          </details>
+        </details>
+        <ReviewsPanel :reviews="paper.reviews || []" :stage="paper.stage"
+                      :draft="paper.draft" @evidence="openEvidence" />
+      </template>
       <template v-if="tab === 'log'"
         ><div class="panel-head">
           <h2>运行记录</h2>
@@ -326,7 +353,11 @@ watch(
 .download-context, .download-buttons { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
 .download-context { margin-bottom: 8px; font-size: 13px; color: var(--muted); }
 .download-context strong { color: var(--ink, #26372e); }
-.delivery-note { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+.delivery-record { margin: 14px 20px; color: var(--muted); font-size: 13px; }
+.delivery-record summary { cursor: pointer; }
+.delivery-record dl { margin-block: .75em; }
+.delivery-record dl > div { display: flex; gap: 1em; }
+.delivery-record dd { margin: 0; }
 .download-buttons .btn:disabled { cursor: default; opacity: .52; }
 .failure-reasons { margin: .45rem 0; padding-inline-start: 1.2rem; }
 .failure-reasons li + li { margin-top: .25rem; }

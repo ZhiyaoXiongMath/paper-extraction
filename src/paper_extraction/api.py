@@ -26,7 +26,7 @@ from .settings import (PROVIDERS, apply_reasoning_preferences, data_home, probe,
                        reasoning_choices, reasoning_config, workbench_limits)
 from .sources import SourceIndex
 from .store import BatchStillActive, Store
-from .summary_delivery import SUMMARY_NAME
+from .summary_delivery import RUN_REPORT_NAME, SUMMARY_NAME
 
 
 class PaperChoice(BaseModel):
@@ -396,6 +396,9 @@ def create_app(home=None, runner=launch_worker):
         path = store.artifact(paper, name)
         if name == SUMMARY_NAME:
             return FileResponse(path, media_type="text/markdown; charset=utf-8", filename=basename + ".md")
+        if name == RUN_REPORT_NAME:
+            return FileResponse(path, media_type="text/markdown; charset=utf-8",
+                                filename=basename.removesuffix("-extraction") + "-run-report.md")
         if name == "introduction.pdf":
             return FileResponse(path, media_type="application/pdf", filename=basename + ".pdf",
                                 content_disposition_type="inline")

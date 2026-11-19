@@ -3,6 +3,7 @@ import re
 
 from .citation_types import FormalSource
 from .profile_assets.tools.v13_check import ValidationError, balanced
+from .profile_inputs import uses_grounded_revision
 
 
 _CITE = re.compile(r"\\cite\b\s*")
@@ -11,9 +12,12 @@ _NUMBER = r"\d+(?:\.\d+)*[a-z]?"
 _LABEL = re.compile(rf"(?:(Theorems?|Lemmas?|Corollar(?:y|ies)|Propositions?|Definitions?)\s+)?({_NUMBER})", re.I)
 _JOIN = re.compile(r"(?:,\s*(?:and\s+)?|\s+and\s+)")
 _AUTHOR = r"[A-Z][A-Za-zÀ-ž'’\\{}~.\-]*(?:\s+(?:and|van|von|de|der|[A-Z][A-Za-zÀ-ž'’\\{}~.\-]*)){0,10}"
+SOURCE_ROLE_GUIDANCE = (
+    "Put a formal statement's provenance in its formal_source. Use its comparison only for an actual "
+    "comparison with earlier work. Keep a connecting paragraph's own locator on that paragraph.")
 
 
-def _citations(text):
+def tex_citations(text):
     """Read real TeX citations. Brackets in math are left untouched."""
     cursor = 0
     while match := _CITE.search(text, cursor):
@@ -32,6 +36,36 @@ def _citations(text):
 
 def _identity(text):
     return " ".join(text.replace("~", " ").split())
+
+
+def citation_keys(text):
+    return {key.strip() for _, _, _, keys, _ in tex_citations(text) for key in keys.split(",")}
+
+
+def bibliography_targets(draft, keys):
+    """Locate missing keys before a paragraph's comparison is moved to a printed heading."""
+    targets = []
+    def inspect(field, text):
+        if not isinstance(text, str):
+            return
+        missing = citation_keys(text) - keys
+        attribution = draft.get("formal_sources", {}).get(field, {})
+        for value in attribution.values():
+            if isinstance(value, str):
+                missing.update(citation_keys(value) - keys)
+        if missing:
+            targets.append({"draft_field": field, "current_text": text, "missing_reference_keys": sorted(missing),
+                            "diagnostics": [f"{field} cites an unlisted bibliography key: {key}." for key in sorted(missing)]})
+    inspect("paragraph", draft.get("paragraph"))
+    for group in ("history", "shared_definitions"):
+        for i, text in enumerate(draft.get(group, [])):
+            inspect(f"{group}.{i}", text)
+    for i, row in enumerate(draft.get("groups", [])):
+        for field in ("theorem", "paragraph"):
+            inspect(f"groups.{i}.{field}", row.get(field))
+        for j, text in enumerate(row.get("definitions", [])):
+            inspect(f"groups.{i}.definitions.{j}", text)
+    return targets
 
 
 def _unwrapped(text):
@@ -60,7 +94,7 @@ def _separate_provenance(text):
     Preserve a citation with an unknown grammatical role in its original wording.
     """
     text = text.strip()
-    cites = list(_citations(text))
+    cites = list(tex_citations(text))
     if not cites:
         return text, ""
     # Mask actual citation commands before matching ordinary prose. This prevents
@@ -133,10 +167,10 @@ def _comparison(additional, primary):
     A paragraph citing Theorems 5.12 and 5.15 in the group for 5.15 contributes
     the 5.12 comparison to that heading. Never infer containment of a range.
     """
-    own = {(_identity(keys), _identity(loc)) for _, _, _, keys, loc in _citations(primary)}
+    own = {(_identity(keys), _identity(loc)) for _, _, _, keys, loc in tex_citations(primary)}
     own_labels = {(key, label) for key, loc in own for label in _named_locators(loc)}
     comparisons = []
-    for _, _, command, keys, loc in _citations(additional):
+    for _, _, command, keys, loc in tex_citations(additional):
         identity = _identity(keys), _identity(loc)
         if identity in own:
             continue
@@ -158,6 +192,8 @@ def reading_blocks(draft, *, strict=False):
     """Return body/caption pairs without modifying the saved source or its evidence links."""
     blocks = []
     formal = draft.get("formal_sources") or {}
+    grounded = uses_grounded_revision({"extraction_profile": draft.get("editorial_profile"),
+                                       "workflow_revision": draft.get("workflow_revision")})
 
     def add(block_id, heading, text, *, is_formal=False, comparison=""):
         if not isinstance(text, str) or not text.strip():
@@ -205,8 +241,20 @@ def reading_blocks(draft, *, strict=False):
     for i, group in enumerate(draft.get("groups", [])):
         base = f"groups.{i}."
         _, paragraph = _unwrapped(group.get("paragraph") or "")
-        paragraph, comparison = _separate_provenance(paragraph)
         explicit = formal.get(base + "theorem") or {}
+        body, edge = _separate_provenance(paragraph)
+        if grounded:
+            # Only the separate comparison field identifies a comparison with earlier work.
+            # An ordinary paragraph may cite its own source even when printed before a theorem.
+            comparison = explicit.get("comparison", "")
+            # Keep grammatically meaningful words, such as a named author's attribution.
+            plain_edge = edge
+            for _, _, command, _, _ in tex_citations(edge):
+                plain_edge = plain_edge.replace(command, "")
+            if comparison and edge and not plain_edge.strip(" ,;.~") and not _comparison(edge, comparison):
+                paragraph = body
+        else:
+            paragraph, comparison = body, edge
         before = group.get("paragraph_position") == "before" and not (comparison or explicit.get("comparison"))
         if before:
             add(base + "paragraph", "", paragraph)
@@ -216,6 +264,40 @@ def reading_blocks(draft, *, strict=False):
         if not before:
             add(base + "paragraph", "", paragraph)
     return blocks
+
+
+def visual_page_context(blocks, page_text):
+    """Describe actual printed order; include full entries only for headings found on this page."""
+    field_index, draft_blocks, displays, positions = {}, {}, {}, {}
+    printed_theorems = set()
+    found = [i for i, block in enumerate(blocks) if block["heading"]
+             and re.search(r"(?im)^\s*" + re.escape(block["heading"]) + r"\b", page_text)]
+    # Include the previous block if it continued onto this page and any trailing prose
+    # before the next formal heading. A standalone bibliography contains no body blocks.
+    first = max(0, found[0] - 1) if found else 0
+    last = next((i for i in range(found[-1] + 1, len(blocks)) if blocks[i]["heading"]),
+                len(blocks)) if found else len(blocks)
+    if re.search(r"(?im)^\s*References\s*$", page_text) and not found:
+        last = 0
+    for i, block in enumerate(blocks):
+        field, heading, text = block["id"], block["heading"], block["text"]
+        group = field.rsplit(".", 1)[0]
+        if field.endswith(".theorem"):
+            printed_theorems.add(group)
+        if not first <= i < last:
+            continue
+        field_index[field] = heading or text[:90]
+        if field.endswith(".paragraph"):
+            positions[field] = "after" if group in printed_theorems else "before"
+        if i in found:
+            draft_blocks[field] = text
+        # A display can continue onto a page without the block heading. The short environment
+        # list identifies it without resending the full text of off-page statements.
+        environments = re.findall(r"\\begin\s*\{(conditions|relations)\}", text)
+        if environments:
+            displays[field] = environments
+    return {"field_index": field_index, "draft_blocks": draft_blocks,
+            "paragraph_positions": positions, "display_environments": displays}
 
 
 def reader_draft_view(draft):

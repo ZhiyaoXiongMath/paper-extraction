@@ -52,6 +52,29 @@ def test_token_count_and_separate_input_output_and_context_limits(monkeypatch):
     assert measure([{"id": "p", "text": " "}], OPENAI)["reason"] == "empty_span"
 
 
+def test_grounded_request_preserves_verbatim_math_and_matches_budget(monkeypatch):
+    import json
+    from paper_extraction.profile_inputs import (
+        TARGETED_WORKFLOW, new_batch_profile, uses_grounded_revision, uses_targeted_revision,
+    )
+
+    monkeypatch.setattr(request_budget, "_local_encoding", lambda _: None)
+    latest = {**OPENAI, **new_batch_profile()}
+    prior = {**latest, "workflow_revision": TARGETED_WORKFLOW}
+    assert uses_grounded_revision(latest) and not uses_grounded_revision(prior)
+    assert uses_targeted_revision(prior)
+    text = "Données  et hypothèses\n" + r"\forall x\in K,\quad \Phi(x)\leq 0."
+    rows = [{"id": "section-7", "text": text}]
+    packet = {"passages": rows}
+    old = structured_request_text(DirectResult, "rules", packet)
+    new = structured_request_text(DirectResult, "rules", packet, compact=True)
+    assert json.loads(old[1]) == json.loads(new[1]) == packet
+    assert json.loads(old[0].split("\n")[-1]) == json.loads(new[0].split("\n")[-1])
+    assert measure(rows, latest)["input_estimate"] == sum(len(s.encode("utf8")) for s in new)
+    assert measure(rows, prior)["input_estimate"] == sum(len(s.encode("utf8")) for s in old)
+    assert len(new[0]) + len(new[1]) < len(old[0]) + len(old[1])
+
+
 class ProviderError(Exception):
     def __init__(self, status, code):
         super().__init__(code)

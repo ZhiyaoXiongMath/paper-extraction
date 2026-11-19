@@ -32,12 +32,13 @@ class Fixed:
         return schema.model_validate(answer, context=packet)
 
 
-def read(model, passages=("s1",), ledger=None, resolve=None):
+def read(model, passages=("s1",), ledger=None, resolve=None, *, strict_types=False):
     def no_lookup(*args):
         raise AssertionError("A local answer should not trigger a lookup.")
     return read_segment(model, "Math rules", {"passages": [PAPER[k] for k in passages]},
                         {"authors": ["Author"], "title": "Paper"}, indexed_labels(PAPER),
-                        ledger if ledger is not None else {}, [], resolve or no_lookup, lambda *_: None)
+                        ledger if ledger is not None else {}, [], resolve or no_lookup, lambda *_: None,
+                        strict_types=strict_types)
 
 
 def test_metadata_and_real_tex_label_are_closed_locally():
@@ -114,3 +115,33 @@ def test_resolved_answer_requires_available_original():
     with pytest.raises(ValidationError):
         ReadingAnswers.model_validate({"answers": [{"question_id": "q1", "status":"resolved",
                                                      "finding":"All flags.", "evidence_ids":["missing"]}]}, context=packet)
+
+
+def test_out_of_scope_question_and_closure_do_not_discard_supported_leads():
+    question = {"source_id": "s3", "candidate_index": 2, "field": "assumptions", "subject": "flag qualifier",
+                "target_id": "s3", "question": "Is the final qualification necessary?"}
+    value = {
+        "candidates": [LEAD, {**SECOND, "evidence_ids": ["missing"]}, SECOND],
+        "questions": [question, {"source_id": "s1", "field": "paper_authors", "subject": "author",
+                                 "question": "Who wrote this paper?"}],
+        "closed_readings": [{"question_id": "prior1", "status": "resolved",
+                             "finding": "The answer was not available in this packet.", "evidence_ids": ["s3"]}],
+    }
+    ledger = {"earlier": {"source_id": "s1", "target_id": "s1", "status": "unresolved",
+                          "field": "claim", "subject": "previous extent", "source_number": "Theorem A",
+                          "finding": "The previous question is still open."}}
+    model = Fixed([(SegmentLeads, value)])
+    result = read(model, ledger=ledger, strict_types=True)
+    assert len(model.packets) == 1
+    assert [r.source_number for r in result.candidates] == ["Theorem A", "Theorem B"]
+    assert [r.decision for r in result.candidates] == ["admitted", "unresolved"]
+    assert all(r.evidence_ids == ["s1"] for r in result.candidates)
+    assert question["question"] in result.uncertainties
+    assert ledger["earlier"]["status"] == "unresolved"
+    assert any(row["field"] == "paper_authors" and row["status"] == "resolved" for row in ledger.values())
+    pending = next(row for row in ledger.values() if row.get("field") == "source_location")
+    assert pending["source_id"] == "s1" and "target_id" not in pending
+    assert pending["owner"][1] == "Theorem B" and pending["status"] == "unresolved"
+
+    with pytest.raises(ValidationError):
+        read(Fixed([(SegmentLeads, value)]), ledger={"earlier": dict(ledger["earlier"])})

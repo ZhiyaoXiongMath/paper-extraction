@@ -13,6 +13,8 @@ from .models import SourceCheck
 from .scope_reconciliation import reconcile_scope
 from .profile_variants import COUNT_OVERRIDE
 from .lean_workflow import IndependentRole, ScreeningNote, independent_role_supported
+from .admission import admission_source, constrain_current_results, current_statement
+from .request_budget import whole_source_budget
 
 SELECTION_VERSION = "v13-whole-paper-3"
 
@@ -53,6 +55,7 @@ class WholePaperSelection(BaseModel):
 
 class LeanCoreChoice(CoreChoice):
     independent_role: IndependentRole | None = None
+    source_statement_id: str | None = Field(default=None, description="Exact formal statement ID from the source heading directory, when listed")
 
 
 class LeanChoice(WholePaperSelection):
@@ -92,6 +95,24 @@ class SourceSelection(LeanChoice):
         return self
 
 
+class PrintedCoverage(BaseModel):
+    candidate_id: str
+    printed_candidate_id: str
+    printed_excerpt: str = Field(min_length=1, description="Exact manuscript wording covering the nominated claim.")
+    reason: str = Field(min_length=1, description="Explain the match, including the essential hypotheses and scope.")
+
+
+class CoreSupersession(BaseModel):
+    retained_id: str
+    selected_id: str
+    reason: str = Field(min_length=1, description="Explain why the new selected core subsumes the still-valid printed result.")
+
+
+class NominationChoice(LeanChoice):
+    covered: list[PrintedCoverage] = Field(default_factory=list)
+    supersessions: list[CoreSupersession] = Field(default_factory=list)
+
+
 SELECTION_FIELDS = """candidate_id, definition_ids, variant_ids and metadata_ids refer to candidate_register IDs.
 evidence_ids identify the source locations for the assertion. b2_source_facts records B2(iii)
 as pairs of fact and source_id, using source_locations IDs. For an exclusion group, c7..c23 denotes the inclusive ID range.
@@ -105,15 +126,19 @@ def _source_row(row):
                                  "dependencies", "local_kind", "local_evidence_ids") if k in row}
 
 
-def candidate_register(candidates):
+def candidate_register(candidates, *, preserve_ids=False):
     """Preserve source-qualified variants and pool only exact repeated observations."""
     rows, by_signature = [], {}
+    next_id = max((int(row["candidate_id"][1:]) for row in candidates
+                   if preserve_ids and re.fullmatch(r"c[1-9]\d*", row.get("candidate_id") or "")),
+                  default=0) + 1
     for c in candidates:
         role = c.get("local_kind", c["kind"])
         signature = tuple(" ".join(str(v or "").split()) for v in
                           (role, c.get("source_number"), c["claim"], c["assumptions"]))
         existing = by_signature.get(signature)
-        if existing is not None:
+        prior_id = c.get("candidate_id") if preserve_ids else None
+        if existing is not None and (not prior_id or existing["candidate_id"] == prior_id):
             original_ids = c.get("local_evidence_ids", c["evidence_ids"])
             existing["evidence_ids"] = list(dict.fromkeys(existing["evidence_ids"] + original_ids))
             existing["local_evidence_ids"] = list(existing["evidence_ids"])
@@ -123,12 +148,15 @@ def candidate_register(candidates):
                 existing["source_readings"] = old + [r for r in c["source_readings"] if r not in old]
             continue
         original_ids = c.get("local_evidence_ids", c["evidence_ids"])
-        row = {**c, "candidate_id": f"c{len(rows) + 1}", "local_kind": role, "kind": role,
+        if prior_id is None:
+            prior_id = f"c{next_id}"
+            next_id += 1
+        row = {**c, "candidate_id": prior_id, "local_kind": role, "kind": role,
                "local_decision": c.get("local_decision", c["decision"]),
                "local_reason": c.get("local_reason", c["decision_reason"]),
                "evidence_ids": list(original_ids), "local_evidence_ids": list(original_ids),
                "dependencies": list(c.get("dependencies", []))}
-        for prior in ("represented_by", "independent_question", "b2_source_facts", "selection_evidence_ids", "needed_by", "context_for",
+        for prior in ("represented_by", "superseded_by", "nomination_coverage", "independent_question", "b2_source_facts", "selection_evidence_ids", "needed_by", "context_for",
                       "scope_evidence_id", "scope_excerpt", "scope_role", "scope_group_id", "scope_central_open",
                       "scope_evidence_version", "scope_reason_type"):
             row.pop(prior, None)
@@ -314,7 +342,7 @@ def apply_selection(register, choice: WholePaperSelection, catalog):
             interval = re.fullmatch(r"c(\d+)\s*(?:\.\.|[-–—])\s*c(\d+)", item)
             if interval:
                 first, last = map(int, interval.groups())
-                keys = (f"c{n}" for n in range(max(1, first), min(last, len(rows)) + 1))
+                keys = (key for key in rows if first <= int(key[1:]) <= last)
             else:
                 keys = [item]
             for key in keys:
@@ -360,10 +388,49 @@ def _repair_choice(conflict, choice, register, catalog, models, rubric, fields):
     return choice.model_copy(update={"selected": retained + replacements})
 
 
+def _restore_verified_variants(rows, records, selected_rationales):
+    """Retain a quoted equivalent when the selected wording has no verifiable heading."""
+    by_id = {row["candidate_id"]: row for row in rows}
+    replacements = {}
+    for variant in rows:
+        previous = variant.get("represented_by")
+        owner = by_id.get(previous)
+        if (previous not in selected_rationales or previous in replacements or owner["decision"] != "unresolved"
+                or not owner.get("scope_central_open") or variant["decision"] != "excluded"
+                or variant["kind"] not in {"current", "application"}):
+            continue
+        heading = current_statement(variant, records)
+        if not heading or heading["kind"] not in {"theorem", "corollary"}:
+            continue
+        variant_id = variant["candidate_id"]
+        variant.update(
+            kind=owner["kind"], decision="admitted", source_statement_id=heading["id"],
+            source_statement_kind=heading["kind"], independent_question=owner["independent_question"],
+            selection_evidence_ids=variant["evidence_ids"],
+            b2_source_facts=owner["b2_source_facts"],
+            decision_reason=(
+                f"Use the source-verifiable formulation of {previous}. State only the "
+                f"claim and hypotheses of this cited statement. {selected_rationales[previous]}"
+            ),
+        )
+        variant.pop("represented_by")
+        owner.update(decision="excluded", represented_by=variant_id, scope_central_open=False,
+                     decision_reason=f"Retained the verified source formulation {variant_id}.")
+        replacements[previous] = variant_id
+    if replacements:
+        for row in rows:
+            if row.get("needed_by"):
+                row["needed_by"] = list(dict.fromkeys(replacements.get(k, k) for k in row["needed_by"]))
+            if row.get("represented_by") in replacements:
+                row["represented_by"] = replacements[row["represented_by"]]
+
+
 def select_contributions(catalog, candidates, models, previous_failure=None, rules=None, *, unlimited_current=False,
                          current=False, lean=False, optimized=False, nominations=(), nomination_sources=(), uncertainties=(),
-                         resolve_central=None, only_ids=(), checked_images=()):
-    register = candidate_register(candidates)
+                         resolve_central=None, only_ids=(), checked_images=(), strict_types=False,
+                         prefer_verified_variants=False, selection_settings=None, verify_ocr_headings=False,
+                         printed_cores=None):
+    register = candidate_register(candidates, preserve_ids=strict_types and bool(nomination_sources))
     if not register and not lean:
         return []
     preserved = {}
@@ -375,13 +442,23 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
         affected = {d.get("core_id") for d in nominations}
         for row in register:
             key = row["candidate_id"]
-            if not only_ids and (key not in previous or (previous[key]["decision"] != "admitted" and
+            if printed_cores is not None and key not in previous:
+                affected.add(key)
+            elif printed_cores is None and not only_ids and (key not in previous or (previous[key]["decision"] != "admitted" and
                                         origins.intersection(row["local_evidence_ids"]))):
                 affected.add(key)
         affected.update(only_ids)
-        preserved = {key: row for key, row in previous.items() if key not in affected}
+        preserved = {key: dict(row) for key, row in previous.items() if key not in affected}
         register = [r for r in register if r["candidate_id"] not in preserved]
     packet = selection_packet(catalog, register, optimized=optimized)
+    if strict_types:
+        source_options = {r["id"]: admission_source(r).get("formal_statement_options") for r in catalog}
+
+        def show_source(row):
+            options = source_options[row["id"]]
+            return {**row, "formal_statement_options": options} if options else row
+
+        packet["passages"] = [show_source(row) for row in packet["passages"]]
     readings = {(r["source_id"], r["transcription"]): r for c in register for r in c.get("source_readings", [])}
     readings.update(((r["source_id"], r["transcription"]), r) for r in checked_images)
     if lean and readings:
@@ -391,18 +468,42 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
     if lean and nomination_sources:
         located = set(nomination_sources)
         located.update(loc for row in register for loc in row["local_evidence_ids"])
-        packet["passages"] = [r for r in catalog if r["id"] in located]
+        packet["passages"] = [admission_source(r) if strict_types else r for r in catalog if r["id"] in located]
         packet.update(nominations=list(nominations),
-                      retained_cores=[{"candidate_id": k, "source_number": row.get("source_number"), "kind": row["kind"], "claim": row["claim"]}
+                      retained_cores=[{"candidate_id": k, "source_number": row.get("source_number"),
+                                       "kind": row["kind"], "claim": row["claim"],
+                                       **({"source_statement_id": row["source_statement_id"]}
+                                          if strict_types and row.get("source_statement_id") else {})}
                                       for k, row in preserved.items() if row["decision"] == "admitted" and
                                       row["kind"] in {"current", "historical", "application"}])
+        if printed_cores is not None:
+            # The full paper has already been read. Every proposed change now
+            # sees the printed alternatives, not the whole discovery ledger.
+            for item in packet["retained_cores"]:
+                printed = printed_cores.get(item["candidate_id"])
+                if printed:
+                    item.pop("claim", None)
+                    item.update(printed_field=printed[0], printed_text=printed[1])
+            source_ids = {row["id"] for row in packet["passages"]}
+            packet["source_locations"] = [r for r in packet["source_locations"] if r["id"] in source_ids]
+            packet.pop("unresolved_readings", None)
+            if "checked_source_images" in packet:
+                packet["checked_source_images"] = [r for r in packet["checked_source_images"]
+                                                   if r["source_id"] in source_ids]
     if previous_failure:
         from .retry_context import attach_previous_failure
         attach_previous_failure(packet, previous_failure, catalog)
     if current:
         from .profile_inputs import current_rules, node_prompt
-        rubric = current_rules()
+        rubric = current_rules() if printed_cores is None else current_rules("B", "C")
         fields, correction = node_prompt("select"), node_prompt("correct_selection")
+        if printed_cores is not None:
+            fields += ("\nAssess each nominated candidate ID against B1/B2 or C1 and the retained printed results. "
+                       "Give it a selected, unresolved or source-reasoned exclusion decision. If an already printed "
+                       "claim covers it, return covered with an exact printed excerpt and explain the scope. A related "
+                       "theorem, a cited number or a weaker consequence does not establish coverage. For a stronger "
+                       "newly selected core fully subsuming a still-valid retained one, use supersessions. Preserve "
+                       "distinct applications. For the fifth or later current result state what would be lost.")
     else:
         rubric = rules or files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8")
         if unlimited_current:
@@ -410,20 +511,41 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
         fields, correction = SELECTION_FIELDS, CORRECTION_FIELDS
     instructions = rubric + "\n" + fields
     missing = {r["id"] for r in catalog} - {r["id"] for r in packet["passages"] if not r.get("abridged")}
+    if selection_settings and optimized and strict_types and missing and not nomination_sources:
+        # The second selection call resends the register, rules and previously shown
+        # evidence. Allow up to half the first request's size for the missing text
+        # when candidate evidence itself is still abridged or absent.
+        primary = {loc for row in register for loc in row["local_evidence_ids"]}
+        if primary & missing:
+            full_rows = projected_sources(catalog, {r["id"] for r in catalog})
+            full_packet = {**packet, "passages": [show_source(row) for row in full_rows]}
+            model_profile = getattr(getattr(models, "text", None), "profile", None)
+            full = whole_source_budget(catalog, LeanChoice, instructions, full_packet, selection_settings, model_profile)
+            if full["route"] == "direct":
+                preview = whole_source_budget(catalog, SourceSelection, instructions, packet, selection_settings, model_profile)
+                if full["input_estimate"] * 2 <= preview["input_estimate"] * 3:
+                    packet, missing = full_packet, set()
     if optimized and missing and not nomination_sources:
         choice = models.structured(SourceSelection, instructions + "\nread_source_ids retrieves the exact full text of any registered location. "
                                    "Request all originals needed to resolve missing conditions, an application or a comparison together before choosing.", packet)
         if choice.read_source_ids:
             requested = set(choice.read_source_ids)
-            full = {r["id"]: r for r in projected_sources(catalog, requested)}
+            full = {r["id"]: show_source(r) if strict_types else r for r in projected_sources(catalog, requested)}
             shown = {r["id"]: r for r in packet["passages"]}
             shown.update(full)
             packet = {**packet, "passages": [shown[r["id"]] for r in catalog if r["id"] in shown]}
             choice = models.structured(LeanChoice, instructions, packet)
     else:
-        choice = models.structured(LeanChoice if lean else WholePaperSelection, instructions, packet)
+        schema = NominationChoice if printed_cores is not None else LeanChoice if lean else WholePaperSelection
+        choice = models.structured(schema, instructions, packet)
     for attempt in range(3):
         try:
+            if strict_types and preserved:
+                # The scoped selector sometimes echoes a retained row as a
+                # selection. Its original decision lives outside this scope.
+                choice = choice.model_copy(update={"selected": [
+                    item for item in choice.selected if item.candidate_id not in preserved
+                ]})
             if lean:
                 invalid = [item.candidate_id for item in choice.selected
                            if (item.role or next((r["kind"] for r in register if r["candidate_id"] == item.candidate_id), None))
@@ -438,7 +560,14 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
             choice = _repair_choice(exc, choice, register, catalog, models, rubric, correction)
     if lean:
         records = {r["id"]: r for r in catalog}
-        for reading in readings.values():
+        verified_readings = dict(readings)
+        if strict_types:
+            # An unchanged retained result may owe its heading to an earlier
+            # page reading. Keep that evidence when checking the combined set.
+            for row in preserved.values():
+                for reading in row.get("source_readings", []):
+                    verified_readings.setdefault((reading["source_id"], reading["transcription"]), reading)
+        for reading in verified_readings.values():
             key = reading["source_id"]
             if key in records:
                 records[key] = {**records[key], "text": records[key]["text"] + "\n" + reading["transcription"]}
@@ -447,13 +576,66 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
             if row["decision"] != "admitted" or row["kind"] not in {"current", "historical", "application"}:
                 continue
             selected_row = selected_rows[row["candidate_id"]]
+            if row.get("nomination_statement_id"):
+                row["source_statement_id"] = row["nomination_statement_id"]
+            elif strict_types and selected_row.source_statement_id:
+                row["source_statement_id"] = selected_row.source_statement_id
             role = selected_row.independent_role
+            if strict_types and row["kind"] in {"current", "application"}:
+                # Apply source type checks after combining with the prior
+                # selection in a scoped nomination.
+                continue
             if independent_role_supported(row["kind"], row.get("source_number"), row["claim"],
                                           row.get("local_evidence_ids") or row["evidence_ids"], role, records):
                 if role:
                     row["independent_role"] = role.model_dump()
             else:
                 row.update(decision="excluded", decision_reason="The supplied source supports the assertion or its proof use, but does not establish its independent role in this paper.")
+        if strict_types:
+            if verify_ocr_headings and resolve_central:
+                from .admission import verify_damaged_headings
+                # Selection already supplied a positive B1/B2 judgment. Only
+                # the damaged source caption needs a reading, not a new vote.
+                extra = verify_damaged_headings(rows, records, resolve_central)
+                for reading in extra:
+                    loc = reading["source_id"]
+                    records[loc] = {**records[loc], "text": records[loc]["text"] + "\n" + reading["transcription"]}
+                    for row in rows:
+                        if loc in row.get("selection_evidence_ids", ()) or loc in row["evidence_ids"]:
+                            row.setdefault("source_readings", []).append(reading)
+            chosen = [*preserved.values(), *rows]
+            repairable = {
+                row["candidate_id"]: selected_rows[row["candidate_id"]].source_reason
+                for row in rows if prefer_verified_variants and row["candidate_id"] in selected_rows
+                and row["decision"] == "admitted" and row["kind"] in {"current", "application"}
+            }
+            constrain_current_results(chosen, records)
+            if repairable:
+                _restore_verified_variants(chosen, records, repairable)
+            if printed_cores is not None:
+                changed = {row["candidate_id"]: row for row in rows}
+                for replacement in getattr(choice, "supersessions", ()):
+                    kept, new = preserved.get(replacement.retained_id), changed.get(replacement.selected_id)
+                    if not kept or not new or replacement.retained_id not in printed_cores:
+                        continue
+                    if (new["decision"] == "admitted" and kept["decision"] == "admitted"
+                            and (kept["kind"] == "historical") == (new["kind"] == "historical")
+                            and new["kind"] in {"current", "historical", "application"}):
+                        kept.update(decision="excluded", decision_reason=replacement.reason,
+                                    superseded_by=replacement.selected_id)
+                for coverage in getattr(choice, "covered", ()):
+                    row = changed.get(coverage.candidate_id)
+                    owner = coverage.printed_candidate_id
+                    printed = printed_cores.get(owner)
+                    if not row or row["decision"] == "admitted" or preserved.get(owner, {}).get("decision") != "admitted":
+                        continue
+                    if printed and coverage.printed_excerpt in printed[1]:
+                        row.update(decision="excluded", represented_by=owner, decision_reason=coverage.reason,
+                                   nomination_coverage={"represented_by": owner, "covered_excerpt": coverage.printed_excerpt,
+                                                        "reason": coverage.reason})
+                    else:
+                        row.update(decision="unresolved",
+                                   decision_reason="Proposed coverage could not be located in the retained manuscript.")
         rows = sorted([*preserved.values(), *rows], key=lambda row: int(row["candidate_id"][1:]))
         admitted_ids = {r["candidate_id"] for r in rows if r["decision"] == "admitted" and r["kind"] in {"current", "application", "historical"}}
         for row in rows:
@@ -488,7 +670,8 @@ def select_contributions(catalog, candidates, models, previous_failure=None, rul
                 locs = list(dict.fromkeys([*origins, *(q.target_id for q in checks if q.target_id)]))
                 return select_contributions(catalog, rows, models, current=True, lean=True, optimized=optimized, only_ids=checked_ids,
                     nominations=[{"candidate_id": key, "source_question": q.question} for key, q in zip(checked_ids, checks)],
-                    nomination_sources=locs, checked_images=extra["source_images"])
+                    nomination_sources=locs, checked_images=extra["source_images"], strict_types=strict_types,
+                    prefer_verified_variants=prefer_verified_variants)
         note = choice.summary
         if not note and not any(r["decision"] == "admitted" and r["kind"] in {"current", "application"} for r in rows):
             open_cores = [r for r in rows if r.get("scope_central_open") and r["decision"] == "unresolved"]

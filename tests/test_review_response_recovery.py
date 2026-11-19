@@ -2,13 +2,17 @@
 import json
 from pathlib import Path
 import shutil
+import time
 
 import pytest
+from fastapi.testclient import TestClient
 
-from paper_extraction import agent
+from paper_extraction import agent, worker
+from paper_extraction.api import create_app
 from paper_extraction.lean_workflow import EvidenceReview
 from paper_extraction.models import AdmissionReview
 from paper_extraction.profile_inputs import new_batch_profile
+from paper_extraction.profile_variants import TOKEN_PROFILE
 from test_agent_json import adapter
 from test_lean_workflow import APPLICATION, MAIN, Replay
 
@@ -59,7 +63,7 @@ def test_saved_source_bound_draft_review_failure_paths(failure, tmp_path, monkey
     replay.structured = reply
     monkeypatch.setattr(agent, "Models", lambda _: replay)
     def run():
-        return agent.run_paper(work, source, source.parent, new_batch_profile(), lambda *_: None)
+        return agent.run_paper(work, source, source.parent, new_batch_profile(TOKEN_PROFILE), lambda *_: None)
     result = run()
     if failure in {"checkpoint", "transport"}:
         assert result["status"] == "failed" and result["draft_round"] == 1
@@ -85,3 +89,63 @@ def test_saved_source_bound_draft_review_failure_paths(failure, tmp_path, monkey
     assert preflight["engineering_accepted"] and preflight["tex_sha256"] == receipt["hashes"]["introduction.tex"]
     assert preflight["compiled_pdf_sha256"] == receipt["hashes"]["introduction.pdf"]
     assert (case / "introduction.pdf").read_bytes().startswith(b"%PDF")
+
+
+@pytest.mark.skipif(not shutil.which("pdflatex"), reason="requires local compiler")
+def test_review_transport_failure_delivers_saved_formal_draft(tmp_path, monkeypatch):
+    source = r"""\documentclass{article}
+\usepackage{amsthm}
+\newtheorem{maintheorem}{Theorem}[section]
+\newtheorem{consequence}[maintheorem]{Corollary}
+\begin{document}
+\section{Main results}
+\begin{maintheorem}\label{thm:main}
+""" + MAIN + r"""
+\end{maintheorem}
+\begin{consequence}\label{cor:application}
+""" + APPLICATION + r"""
+\end{consequence}
+\end{document}
+"""
+    replay = Replay("first")
+    original = replay.structured
+    attempts = []
+
+    def reply(schema, instructions, packet, image=None):
+        if schema is EvidenceReview:
+            attempts.append(schema)
+            raise ConnectionError("fixture connection interrupted during review")
+        return original(schema, instructions, packet, image)
+
+    replay.structured = reply
+    monkeypatch.setattr(agent, "Models", lambda _: replay)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "offline-fixture-key")
+    with TestClient(create_app(tmp_path, runner=worker.process)) as client:
+        response = client.post("/api/imports", data={"paths": json.dumps(["352.tex"])},
+                               files={"files": ("352.tex", source.encode("utf-8"), "application/x-tex")})
+        assert response.status_code == 200, response.text
+        imported = response.json()
+        response = client.post("/api/batches", json={
+            "import_id": imported["id"], "provider": "deepseek",
+            "papers": [{"id": paper["id"], "entry": paper["entry"]} for paper in imported["papers"]],
+        })
+        assert response.status_code == 201, response.text
+        batch = response.json()["id"]
+        deadline = time.monotonic() + 30
+        while True:
+            paper, = client.get(f"/api/batches/{batch}").json()["papers"]
+            if paper["status"] in {"completed", "failed"}:
+                break
+            assert time.monotonic() < deadline, paper
+            time.sleep(0.05)
+        assert paper["status"] == "completed", paper["reason"]
+        assert paper["delivery"]["status"] == "delivered"
+        assert paper["delivery"]["draft_round"] == 1
+        assert len(paper["draft"]["groups"]) == 2
+        assert attempts == [EvidenceReview]
+        path = f"/api/papers/{paper['id']}/artifacts"
+        tex = client.get(f"{path}/introduction.tex")
+        pdf = client.get(f"{path}/introduction.pdf")
+        assert tex.status_code == 200 and b"\\input{preamble-v13.tex}" not in tex.content
+        assert APPLICATION.encode("utf-8") in tex.content
+        assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF")

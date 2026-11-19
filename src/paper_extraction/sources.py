@@ -1,4 +1,5 @@
 """Read-only location index for one immutable paper snapshot."""
+from codecs import BOM_UTF8
 import io
 import json
 import re
@@ -7,7 +8,7 @@ from pathlib import Path
 
 import pypdfium2 as pdfium
 
-from .tex_citations import arxiv_id, bind_tex_locations
+from .tex_citations import arxiv_id, bind_tex_locations, tex_syntax, top_level_tex_commands
 
 _PDF_LOCK = threading.RLock()
 _RESOURCE = re.compile(
@@ -25,25 +26,75 @@ _EXTENSIONS = {
     "documentclass": (".cls",), "LoadClass": (".cls",),
 }
 _INCLUDE = {"input", "include", "subfile"}
+_DEPENDENCY_FILES = {".tex", ".sty", ".cls", ".def"}
+_INDEXED_FILES = {".tex", ".bib", ".bbl"}
+_INPUT_ENCODING = re.compile(
+    r"\\(?:usepackage|RequirePackage)\s*\[([^\[\]{}]+)\]\s*\{\s*inputenc\s*\}"
+)
+_DOCUMENT_START = re.compile(r"\\begin\s*\{\s*document\s*\}")
+_TEX_ENCODINGS = {
+    "utf8": "utf-8-sig", "utf8x": "utf-8-sig",
+    "latin1": "iso8859_1", "latin2": "iso8859_2", "latin9": "iso8859_15",
+    "ansinew": "cp1252", "applemac": "mac_roman", "cp1250": "cp1250",
+    "cp1252": "cp1252",
+}
 
 
 def uncomment(text):
     return re.sub(r"(?<!\\)%[^\n]*", "", text)
 
 
-def paper_files(source: Path, root: Path, *, strict: bool):
-    """Resolve declared local source dependencies without scanning neighboring papers."""
+def _decode_tex(path: Path, use_declared_encoding: bool,
+                inherited_encoding: str | None = None) -> tuple[str, str | None]:
+    data = path.read_bytes()
+    declared = None
+    if use_declared_encoding:
+        if data.startswith(BOM_UTF8):
+            declared = "utf-8-sig"
+        elif b"inputenc" in data:
+            # Latin-1 preserves each byte, so ASCII TeX syntax can identify the
+            # encoding before any manuscript text is decoded.
+            syntax = tex_syntax(data.decode("latin-1"))
+            active = set(top_level_tex_commands(syntax))
+            body = next((m for m in _DOCUMENT_START.finditer(syntax) if m.start() in active), None)
+            limit = body.start() if body else len(syntax)
+            for match in _INPUT_ENCODING.finditer(syntax, 0, limit):
+                if match.start() not in active:
+                    continue
+                for option in match[1].split(","):
+                    if encoding := _TEX_ENCODINGS.get(option.strip().lower()):
+                        declared = encoding
+    for encoding in dict.fromkeys((declared, inherited_encoding, "utf-8-sig", "gb18030", "cp1252")):
+        if not encoding:
+            continue
+        try:
+            return data.decode(encoding), encoding if encoding in (declared, inherited_encoding) else None
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"无法识别 TeX 文件编码：{path.name}")
+
+
+def _paper_sources(source: Path, root: Path, *, strict: bool, use_declared_encoding: bool):
+    """Read only the textual inputs of the dependency closure, in source order."""
     source, root = Path(source).resolve(), Path(root).resolve()
     ordered = {}
     graphics_dirs = []
 
-    def visit(path):
+    def visit(path, inherited_encoding=None):
         if path in ordered:
             return
         ordered[path] = None
-        if path.suffix.lower() not in {".tex", ".sty", ".cls", ".def"}:
+        suffix = path.suffix.lower()
+        if suffix not in _DEPENDENCY_FILES | _INDEXED_FILES:
             return
-        contents = uncomment(read_tex(path))
+        # Preview only needs the names of external bibliographies.
+        if suffix not in _DEPENDENCY_FILES and not strict:
+            return
+        text, inherited = _decode_tex(path, use_declared_encoding, inherited_encoding)
+        ordered[path] = text
+        if suffix not in _DEPENDENCY_FILES:
+            return
+        contents = tex_syntax(text) if use_declared_encoding else uncomment(text)
         for dirs in _GRAPHICSPATH.finditer(contents):
             for name in re.findall(r"\{([^{}]+)\}", dirs[1]):
                 graphics_dirs.extend([source.parent / name, path.parent / name])
@@ -70,33 +121,34 @@ def paper_files(source: Path, root: Path, *, strict: bool):
                     if found is not None:
                         break
                 if found is not None:
-                    visit(found)
+                    visit(found, inherited)
                 elif cmd in _INCLUDE and strict:
                     raise ValueError(f"{path.relative_to(root)} 缺少引用文件 {name}")
         # Some source archives supply the generated bibliography as the only record.
         default_bbl = source.with_suffix(".bbl")
         if path == source and default_bbl.is_file():
-            visit(default_bbl)
+            visit(default_bbl, inherited)
 
     visit(source)
-    return list(ordered)
+    return ordered
 
 
-def read_tex(path: Path) -> str:
-    data = path.read_bytes()
-    for encoding in ("utf-8-sig", "gb18030", "cp1252"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    raise ValueError(f"无法识别 TeX 文件编码：{path.name}")
+def paper_files(source: Path, root: Path, *, strict: bool, use_declared_encoding=False):
+    """Resolve declared local source dependencies without scanning neighboring papers."""
+    return list(_paper_sources(source, root, strict=strict, use_declared_encoding=use_declared_encoding))
 
 
-def tex_documents(source: Path, root: Path):
+def read_tex(path: Path, *, use_declared_encoding=False, inherited_encoding=None) -> str:
+    return _decode_tex(path, use_declared_encoding, inherited_encoding)[0]
+
+
+def tex_documents(source: Path, root: Path, *, use_declared_encoding=False):
     """Read the main paper and its declared support files in dependency order."""
-    for path in paper_files(source, root, strict=True):
+    for path, text in _paper_sources(
+        source, root, strict=True, use_declared_encoding=use_declared_encoding,
+    ).items():
         if path.suffix.lower() in {".tex", ".bbl"}:
-            yield path, read_tex(path)
+            yield path, text
 
 
 def page_png(path: Path, page: int, region=None) -> bytes:
@@ -127,11 +179,17 @@ def page_png(path: Path, page: int, region=None) -> bytes:
 
 
 class SourceIndex:
-    def __init__(self, source: Path, source_root: Path | None, work: Path):
+    def __init__(self, source: Path, source_root: Path | None, work: Path, *, admission_statements=False,
+                 improved_tex=None):
         self.source = Path(source).resolve()
         self.root = Path(source_root or self.source.parent).resolve()
-        self.cache = Path(work) / "source-index.json"
+        improved_cache = Path(work) / "source-index-v2.json"
+        self.improved_tex = self.source.suffix.lower() == ".tex" and (
+            improved_cache.is_file() if improved_tex is None else improved_tex)
+        self.cache = improved_cache if self.improved_tex else Path(work) / "source-index.json"
         self._items = None
+        self._source_files = None
+        self.admission_statements = admission_statements or self.improved_tex
         self.citation_metadata = {}
 
     def _pdf_entries(self):
@@ -149,8 +207,16 @@ class SourceIndex:
                     yield {"id": f"p{n}-{k}", "page": n, "label": f"p. {n}", "text": chunk,
                            "section": "", "file": self.source.name}
 
+    def _tex_sources(self):
+        if self._source_files is None:
+            self._source_files = _paper_sources(self.source, self.root, strict=True,
+                                                use_declared_encoding=self.improved_tex)
+        return self._source_files
+
     def _tex_entries(self):
-        for number, (path, contents) in enumerate(tex_documents(self.source, self.root), 1):
+        files = self._tex_sources()
+        documents = ((path, text) for path, text in files.items() if path.suffix.lower() in {".tex", ".bbl"})
+        for number, (path, contents) in enumerate(documents, 1):
             rel = path.relative_to(self.root).as_posix()
             section = ""
             part, start, size, seq = [], 1, 0, 0
@@ -167,9 +233,10 @@ class SourceIndex:
             if part:
                 yield self._tex_item(number, seq+1, rel, start, start+len(part)-1, part, section)
         # External bibliography entries are useful evidence for historical attributions.
-        for i, bib in enumerate((p for p in paper_files(self.source, self.root, strict=True) if p.suffix.lower() == ".bib"), 1):
+        bibliographies = ((path, text) for path, text in files.items() if path.suffix.lower() == ".bib")
+        for i, (bib, contents) in enumerate(bibliographies, 1):
             rel = bib.relative_to(self.root).as_posix()
-            lines = read_tex(bib).splitlines()
+            lines = contents.splitlines()
             for start in range(0, len(lines), 25):
                 yield self._tex_item(f"bib{i}", start+1, rel, start+1,
                                      min(start+25, len(lines)), lines[start:start+25], "Bibliography")
@@ -201,8 +268,15 @@ class SourceIndex:
                         if reading.get("page") == item["page"] and reading.get("transcribed_from_image"):
                             item.update(reading)
             if self.source.suffix.lower() == ".tex":
-                sources = ((path, uncomment(text)) for path, text in tex_documents(self.source, self.root))
-                self.citation_metadata = bind_tex_locations(self._items, self.source, self.root, sources)
+                files = self._tex_sources()
+                sources = ((path, text if self.improved_tex else uncomment(text)) for path, text in files.items()
+                           if path.suffix.lower() in {".tex", ".bbl"})
+                declarations = (text if self.improved_tex else uncomment(text) for path, text in files.items()
+                                if path.suffix.lower() in {".sty", ".cls", ".def"}) if self.admission_statements else ()
+                self.citation_metadata = bind_tex_locations(self._items, self.source, self.root, sources,
+                                                             admission_statements=self.admission_statements,
+                                                             declaration_files=declarations,
+                                                             environment_aliases=self.improved_tex)
             elif identifier := arxiv_id(self.source.name):
                 self.citation_metadata = {"arxiv": identifier}
         return self._items

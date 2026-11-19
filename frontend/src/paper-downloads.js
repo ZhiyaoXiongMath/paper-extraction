@@ -1,7 +1,10 @@
-import { tone } from "./format.js";
+import { deliveryLabel, tone } from "./format.js";
 import { reviewDetails, reviewField } from "./review-format.js";
 
 export function paperDownloads(paper, prefix) {
+  if (paper.delivery?.kind === "run_report" && paper.status === "failed") {
+    return { label: "处理未完成 · 可重试", markdown: prefix + "/artifacts/run-report.md" };
+  }
   if (tone(paper.status) === "good") {
     if (paper.delivery?.kind === "summary") {
       return { label: "已交付 · 筛选说明", markdown: prefix + "/artifacts/summary.md" };
@@ -13,7 +16,7 @@ export function paperDownloads(paper, prefix) {
       label = round ? `已交付 · 第 ${round} 稿` : "已交付 · 成品";
     }
     return {
-      label, tex: prefix + "/artifacts/introduction.tex",
+      label: deliveryLabel(paper.delivery) || label, tex: prefix + "/artifacts/introduction.tex",
       pdf: prefix + "/artifacts/introduction.pdf", restored: false, recompiled: false, missingPdf: "",
     };
   }

@@ -45,8 +45,22 @@ const stages = {
 };
 export const label = (status) => statuses[status]?.[0] ?? status ?? "—";
 export const tone = (status) => statuses[status]?.[1] ?? "neutral";
+export const paperTone = (paper) =>
+  paper.delivery?.checks && paper.delivery.status === "delivered" ? "neutral" : tone(paper.status);
 export const terminal = (status) => ["bad", "good"].includes(tone(status));
 export const stageName = (stage) => stages[stage] ?? stage ?? "—";
+export function deliveryLabel(delivery) {
+  if (!delivery?.checks) return "";
+  const round = delivery.draft_round ? `第 ${delivery.draft_round} 稿` : "交付稿";
+  if (delivery.status === "reviewed") return `已交付 · ${round}全检查通过`;
+  return "已交付";
+}
+
+export function batchPaperLabel(paper) {
+  if (paper.status === "completed" && paperTone(paper) === "neutral") return "已交付";
+  return paperOutcome(paper).title;
+}
+
 export function canDeleteBatch({ counts, total }, allowPaused = true) {
   const finished = (counts.completed ?? 0) + (counts.failed ?? 0) + (counts.cancelled ?? 0);
   return finished + (allowPaused ? counts.paused ?? 0 : 0) === total;
@@ -74,7 +88,7 @@ export function paperOutcome(paper) {
       return { ...base, title: "已交付 · 筛选说明", initialTab: "summary", summary: paper.delivery.note };
     }
     const reviewed = paper.delivery.status === "reviewed";
-    return { ...base, title: reviewed ? "已交付 · 已通过检查" : "已交付" };
+    return { ...base, title: deliveryLabel(paper.delivery) || (reviewed ? "已交付 · 已通过检查" : "已交付") };
   }
   if (!failed) return base;
   const lastStage = [...(paper.events || [])]

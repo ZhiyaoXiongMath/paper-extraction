@@ -12,10 +12,35 @@ test-results/
 playwright-report/
 .paper-extraction/
 *.sqlite*
-/论文提取质量与Token消耗复盘.md
-/论文提取工作台修改与验收方案.md
-/论文提取优化实施方案.md
-/论文提取规则（草案）.md
-/长篇与四件套直给的Token成本分析.md
-/论文提取工作台Token优化指南.md
-/1008长篇Token优化实测.md
+
+# Local development notes, experiment plans and private acceptance reports.
+/dev-notes/
+/local-reports/
+/acceptance-results/
+/*方案.md
+/*优化细则.md
+/*优化指南.md
+/*成本分析.md
+/*问题分析.md
+/*交付分析.md
+/*消耗复盘.md
+/*实测.md
+/*（草案）.md
+/*主定理提取要求.md
+
+# Outputs from local builds, tests and editor sessions.
+/build/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.playwright-cli/
+*.log
+*.tmp
+*.swp
+
+# Superseded Vite bundles left in older workspaces. Current wheel assets stay tracked.
+/src/paper_extraction/static/assets/index-CmkkVQxy.js
+/src/paper_extraction/static/assets/index-KmKuHuuA.css

@@ -20,15 +20,21 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
-from .models import AdmissionReview, AuthoritativeDraft, CurrentDraft, Draft, DraftPatch, Findings, Models, Review, StructuredResponseError, TextFindings, json_text
+from .models import (AdmissionReview, AuthoritativeDraft, CurrentDraft, Draft, Findings, Models,
+                     Review, SourceCheck, StructuredResponseError, TextFindings, json_text)
 from .editorial import DRAFT_GUIDANCE, EDIT_CONTRACT_VERSION, EXTRACTION_GUIDANCE, REVIEW_GUIDANCE, evidence_packet
+from .citation_layout import SOURCE_ROLE_GUIDANCE, reading_blocks, visual_page_context
 from .profile import BuildFailure, bind_formal_citations, bind_source_reference, build_case, renderer_context, saved_build_targets
-from .profile_inputs import current_rules, installed_profile, is_optimized_workflow, node_prompt, using_profile
+from .profile_inputs import (current_rules, installed_profile, is_optimized_workflow, is_reliable_workflow,
+                             node_prompt, uses_block_workflow, uses_evidence_link_patch, uses_local_preflight,
+                             uses_grounded_revision, uses_targeted_revision, using_profile)
 from .request_budget import context_limit_error, whole_source_budget
-from .lean_workflow import (AddedCores, DirectResult, EvidenceReview, FindingsDelta, approved_cores, direct_admission,
-                            fits_direct, project_cores, selection_change, verify_bindings)
-from .summary_delivery import FORMAL_NAMES as _DOCUMENTS, artifact_names, write_summary
-from .profile_variants import CURRENT_PROFILE, READER_PROFILE, reader_guidance, release_for_draft
+from .lean_workflow import (AddedCores, AddedCoresWithComparisons, DirectResult, EvidenceReview, FindingsDelta,
+                            approved_cores, comparison_targets, direct_admission, fits_direct,
+                            project_cores, selection_change, verify_bindings)
+from .block_response import BlockDirectResult, expand_direct_blocks
+from .summary_delivery import FORMAL_NAMES as _DOCUMENTS, artifact_names, write_run_report, write_summary
+from .profile_variants import CURRENT_PROFILE, READER_PROFILE, is_core_release, reader_guidance, release_for_draft
 from .usage import invoke_tracked, record_cache_hit, usage_stage
 from .editorial import reversed_edit_requests
 from .pdfops import page_count, read_pages, render_page
@@ -38,13 +44,18 @@ from .focused_evidence import projected_sources, repair_context, writer_candidat
 from .selection import SELECTION_VERSION, review_navigator, select_contributions
 from .scope_reconciliation import saved_count_exception, scope_failure_reason
 from .source_image_cache import cached_transcription
+from .direct_response import normalize_direct_shape
 from .segment_evidence import attach_closed_readings, indexed_labels, label_sources, open_readings, read_segment
-from .delivery import deliver_case
+from .delivery import deliver_case, local_layout_diagnostics, normalize_alignment
 from .repair_progress import approved_legacy_layout_targets, block_at, legacy_quota_stop, record_progress, stalled_saved_repair
 from .store import (CONTENT_REVIEW_VERSION, legacy_confirmation_failure, legacy_content_failure,
                     repairable_citation_draft, resolved_renderer_failure, saved_writer_targets, stale_selection_failure)
-from .writer_patch import PATCH_GUIDANCE, WRITER_VERSION, apply_patch, repair_targets
+from .writer_patch import PATCH_GUIDANCE, WRITER_VERSION, apply_patch, narrow_reviewed_citation, repair_targets, write_block_patch
 from .visual_findings import actionable_page_review
+from .exact_revision import write_targeted_patch
+from .grounded_writing import ADDITION_GUIDANCE, REVIEW_SCOPE, AdditionRequest, definition_uses
+from .reference_patch import clean_comparison_locators
+from .nomination_ledger import delivered_nominations, printed_cores, register_nominations, selector_nominations, settle_nominations
 
 Notify = Callable[[str, dict], None]
 _BUDGET = 18000
@@ -60,6 +71,10 @@ class EvidenceState(TypedDict):
 class PaperState(TypedDict, total=False):
     cursor: int
     direct_context_rejected: bool
+    direct_checks: list[dict]
+    direct_provisional: dict
+    direct_invalid_checks: list[dict]
+    direct_evidence_packet: dict
     previous_failure: dict
     candidates: list[dict]
     uncertainties: list[str]
@@ -67,6 +82,7 @@ class PaperState(TypedDict, total=False):
     selection_version: str
     writer_version: str
     pending_writer_review: dict
+    unmerged_additions: dict
     repair_progress: dict
     repair_policy: str
     repair_stalled: bool
@@ -97,9 +113,13 @@ class PaperState(TypedDict, total=False):
     pending_direct: dict
     nomination_sources: list[str]
     nominations: list[dict]
+    nomination_ledger: dict
+    nomination_keys: list[str]
+    nomination_unresolved: bool
     deferred_edits: dict
     selection_confirmed: bool
     local_build: dict
+    layout_measurements: list[dict]
 
 
 def _rules() -> str:
@@ -239,7 +259,7 @@ def _evidence_agent(index, models, allowed_ids, notify, keys, work, settings, cu
         if not locations:
             return "No PDF image for this page. For TeX, use read_span on a source location."
         with _private_model_errors(keys), usage_stage("source_image_lookup"):
-            if question and settings.get("extraction_profile") == CURRENT_PROFILE:
+            if question and is_core_release(settings.get("extraction_profile")):
                 transcription, reused = cached_transcription(work, settings, index.image(page, region), page,
                                                             models.read_source_region, question=question)
             else:
@@ -321,7 +341,13 @@ def _needs_legacy_b2_review(s, last=None):
 
 
 def _record(s, stage, passed, issues, **other):
+    if stage == "review" and s.get("draft"):
+        other["draft_sha256"] = _draft_hash(s["draft"])
     return {"stage": stage, "attempt": s["attempt"], "passed": passed, "issues": issues, **other}
+
+
+def _draft_hash(draft):
+    return hashlib.sha256(json.dumps(draft, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
 def _incomplete_review(state, diagnostic, notify):
@@ -377,6 +403,19 @@ def _public(s):
 def _publish_result(work, state, notify, delivery):
     case = Path(state["result_dir"])
     hashes = {name: _hash_file(case / name) for name in artifact_names(delivery)}
+    if state.get("nomination_ledger"):
+        manuscript = state.get("delivered_draft") or state.get("draft") or {}
+        coverage = delivered_nominations(state["nomination_ledger"], manuscript)
+        delivery = {**delivery, "nomination_outcomes": list(coverage.values())}
+        gaps = []
+        for status, label in (("unprinted", "已选未入稿"), ("unresolved", "仍待核实")):
+            affected = [row for row in coverage.values() if row["publication_state"] == status]
+            titles = list(dict.fromkeys(row["source_heading"] for row in affected))
+            if titles:
+                gaps.append(f"{label} {len(affected)} 项（{'、'.join(titles)}）")
+        if gaps:
+            delivery["status"] = "delivered"
+            delivery["note"] = " ".join(filter(None, (delivery.get("note"), "补选记录：" + "；".join(gaps) + "。")))
     update = {"status": "completed", "hashes": hashes, "delivery": delivery, "reason": ""}
     receipt = work / "published.json"
     temporary = receipt.with_suffix(".tmp")
@@ -396,17 +435,68 @@ def _delivery_draft(state, index, source):
             "candidates": state.get("candidates", []), "arxiv": metadata.get("arxiv", "")}
 
 
-def _deliver_current(work, source, source_root, state, index, notify, *, current=False):
+def _completed_checks(case, draft, reviews):
+    digest = _draft_hash(draft)
+    content = next((check for check in reversed(reviews) if check.get("stage") == "review"
+                    and check.get("draft_sha256") == digest), None)
+    content_status = "not_checked" if not content or content.get("review_status") == "unavailable" else (
+        "passed" if content["passed"] else "failed")
+    failures = {}
+    if content_status == "failed" and content.get("issues"):
+        failures["content"] = content["issues"][:8]
+    visual_status = "not_checked"
+    if case.kind != "readable":
+        saved = {(r.get("page"), r.get("page_sha256")): r
+                 for r in reviews if r.get("stage") == "visual" and r.get("page_sha256")}
+        if saved:
+            try:
+                matches = [saved.get((page, hashlib.sha256(image).hexdigest()))
+                           for page, image in _render_pages(case.path / "introduction.pdf")]
+                rejected = [row for row in matches if row and row.get("passed") is False]
+                if rejected:
+                    visual_status = "failed"
+                    failures["visual"] = [f"第 {row['page']} 页 · {issue}"
+                                          for row in rejected for issue in row.get("issues", [])][:8]
+                elif matches and all(row and row.get("passed") is True for row in matches):
+                    visual_status = "passed"
+            except (OSError, RuntimeError, ValueError):
+                pass
+    if case.layout_issues:
+        failures["layout"] = list(case.layout_issues)
+    return {"content": content_status, "layout": case.layout_check, "visual": visual_status}, failures
+
+
+def _deliver_current(work, source, source_root, state, index, notify, *, current=False, strict=False):
     round_no = state.get("attempt", 0)
     draft = _delivery_draft(state, index, source)
     if current and not state.get("draft"):
-        if isinstance(current, str) and current == CURRENT_PROFILE:
+        if isinstance(current, str) and is_core_release(current):
             raise ValueError("尚未形成经过准入的稿件，不能发布 TeX")
         draft["editorial_profile"] = current if isinstance(current, str) else CURRENT_PROFILE
     previous_case, previous_draft = state.get("last_compiled_case"), state.get("last_compiled_draft")
-    if current == CURRENT_PROFILE:
+    not_yet_written = set()
+    withdrawn = set()
+    if isinstance(current, str) and is_core_release(current):
         expected = approved_cores(state.get("candidates", []))
         registered = {r["id"] for r in index.catalog()}
+        if strict:
+            original_bindings = set(draft["core_bindings"].values())
+            # A still-valid printed theorem may be replaced by a stronger
+            # selection only once its replacement is actually available.
+            for row in state.get("candidates", ()):
+                replacement = row.get("superseded_by")
+                key = row.get("candidate_id")
+                if replacement in expected and replacement not in original_bindings and key in original_bindings:
+                    expected[key] = {"kind": row["kind"], "evidence_ids": row.get("selection_evidence_ids") or row["evidence_ids"]}
+            # Selection can change before the next writer succeeds. Keep only
+            # complete, still-approved blocks and rebind their local references.
+            draft = project_cores(draft, expected)
+            if not draft["groups"]:
+                raise ValueError("已保存稿中没有仍符合本轮筛选的当前定理")
+            printed = set(draft["core_bindings"].values())
+            withdrawn = original_bindings - printed
+            not_yet_written = expected.keys() - printed
+            expected = {key: expected[key] for key in printed}
         verify_bindings(draft, expected, registered)
         if previous_draft:
             try:
@@ -417,19 +507,36 @@ def _deliver_current(work, source, source_root, state, index, notify, *, current
                 previous_case, previous_draft = None, None
     notify("compile", {"attempt": round_no, "message": "编译交付版本"})
     case = deliver_case(work, source, source_root, draft, previous_case=previous_case,
-                        previous_draft=previous_draft, candidates=state.get("candidates", ()))
+                        previous_draft=previous_draft, candidates=state.get("candidates", ()), strict=strict)
     delivered_round = state.get("last_compiled_round", round_no) if case.kind == "prior" else round_no
     delivered_draft = state.get("last_compiled_draft", draft) if case.kind == "prior" else case.draft or draft
     message = {"final": "已完成定稿编译。", "repaired": "已用原文依据一致的上一稿段落修复编译错误。",
                "prior": "交付此前已成功编译的版本。",
                "readable": "已有内容按简明版式编译，无法确定的公式保留为可编辑源码。"}[case.kind]
+    if strict and case.layout_check == "failed" and case.kind == "final":
+        message = "定稿已编译，仍有排版问题。"
     if not case.compiler_verified:
         message = "本机 TeX 编译环境不可用，已生成同内容的可读 PDF，并附可编辑 TeX。"
     if any(r.get("review_status") == "unavailable" and r.get("attempt") == round_no
            for r in state.get("reviews", [])):
         message += " 内容复核未能取得有效意见。"
+    if not_yet_written:
+        message += f" 已保留可用原稿，另有 {len(not_yet_written)} 条新选中的结果尚未写入。"
+    if withdrawn:
+        message += f" 已从保存稿撤下 {len(withdrawn)} 条当前筛选不再保留的陈述并重新编译。"
     delivery = {"status": "delivered", "note": message, "draft_round": delivered_round,
                 "kind": case.kind, "compiler_verified": case.compiler_verified}
+    if not_yet_written and state.get("unmerged_additions"):
+        delivery["unmerged_additions"] = state["unmerged_additions"]
+    if strict:
+        checks, failures = _completed_checks(case, delivered_draft, state.get("reviews", []))
+        delivery["checks"] = checks
+        delivery["status"] = "reviewed" if not (not_yet_written or withdrawn) and all(
+            check == "passed" for check in checks.values()) else "delivered"
+        if case.layout_issues:
+            delivery["layout_issues"] = list(case.layout_issues)
+        if failures:
+            delivery["check_issues"] = failures
     if case.diagnostic:
         delivery["diagnostic"] = case.diagnostic[:1200]
     output = {"result_dir": str(case.path), "delivered_draft": delivered_draft}
@@ -437,13 +544,18 @@ def _deliver_current(work, source, source_root, state, index, notify, *, current
 
 
 def _make_graph(work, source, source_root, settings, notify, checkpointer, rules, index, read_api_key, save_draft,
-                drafts_started, current=False):
+                drafts_started, current=False, snapshot=""):
     release = settings.get("extraction_profile")
-    lean = release == CURRENT_PROFILE
+    lean = is_core_release(release)
+    strict_types = is_reliable_workflow(settings)
     optimized = lean and is_optimized_workflow(settings)
+    improve_layout = uses_local_preflight(settings)
+    grounded = uses_grounded_revision(settings)
     if current:
         rubric = current_rules("A", "B", "C")
         writing_rules = current_rules("budget", "A", "C", "D", "E")
+        if uses_grounded_revision(settings):
+            writing_rules += "\n" + SOURCE_ROLE_GUIDANCE
     else:
         reader_settings = reader_guidance()
         rubric = files("paper_extraction").joinpath("profile_assets", "intro-rules-v13.txt").read_text(encoding="utf-8") + "\n" + reader_settings
@@ -545,7 +657,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         """A second request returns only the affected rows on the lean profile."""
         if optimized and ledger is not None:
             return read_segment(models, rubric, packet, index.citation_metadata, labels,
-                                ledger, readings, resolve_questions, notify)
+                                ledger, readings, resolve_questions, notify, strict_types=strict_types)
         instructions = rubric + "\n" + node_prompt("extract")
         findings = models.structured(TextFindings, instructions, packet)
         if not findings.source_checks:
@@ -590,6 +702,14 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                 passages.append(r)
         packet = {"passages": passages, "targeted_issue": s.get("issues", []) if pending else []}
         readings = []
+        if strict_types and s.get("direct_evidence_packet"):
+            stored = s["direct_evidence_packet"]
+            visible = {r["id"] for r in passages}
+            readings.extend(row for row in stored["source_images"] if row["source_id"] in visible)
+            questions = [q for q in stored["source_questions"]
+                         if visible.intersection([q["source_id"], q.get("target_id"), *q.get("search_hits", [])])]
+            if readings or questions:
+                packet.update(source_questions=questions, source_images=list(readings))
         ledger = {key: dict(item) for key, item in s.get("reading_ledger", {}).items()}
         if current:
             res = read_findings(packet, readings if lean else None, ledger)
@@ -703,10 +823,22 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         previous = s.get("previous_failure") or {}
         revisit = previous.get("stage") == "select" or any(
             issue.get("kind") in {"improper_selection", "missing_required_content"} for issue in previous.get("issues", []))
-        selected = select_contributions(index.catalog(), s["candidates"], models,
+        keys = s.get("nomination_keys") or []
+        ledger = s.get("nomination_ledger", {})
+        printed = printed_cores(s["draft"]) if keys else None
+        proposals = selector_nominations(ledger, keys)
+        selector_inputs = [*s.get("nominations", []), *proposals]
+        if keys and not selector_inputs:
+            selected = s["candidates"], None
+        else:
+            selected = select_contributions(index.catalog(), s["candidates"], models,
                                         previous if revisit else None, rules if revisit else None,
                                         unlimited_current=True, current=current,
-                                        **({"lean": True, "optimized": optimized, "nominations": s.get("nominations", []),
+                                        **({"lean": True, "optimized": optimized, "strict_types": strict_types,
+                                            "prefer_verified_variants": uses_local_preflight(settings),
+                                            "verify_ocr_headings": uses_targeted_revision(settings),
+                                            "selection_settings": settings if uses_block_workflow(settings) else None,
+                                            "nominations": selector_inputs, "printed_cores": printed,
                                             "resolve_central": resolve_questions,
                                             "uncertainties": s.get("uncertainties", []),
                                             "nomination_sources": s.get("nomination_sources", [])} if lean else {}))
@@ -716,6 +848,10 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         missing = _missing_categories(candidates, require_history=not current)
         if lean:
             update.update(nominations=[], nomination_sources=[], selection_confirmed=False)
+            if keys:
+                ledger = settle_nominations(ledger, keys, candidates)
+                update.update(nomination_keys=[], nomination_ledger=ledger, nomination_unresolved=any(
+                    ledger[key]["decision"] in {"pending", "unresolved"} for key in keys))
             if missing:
                 if note is None:
                     raise ValueError("No current theorem was selected and the screening note is missing")
@@ -731,12 +867,16 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                 if unchanged:
                     deferred = s.get("deferred_edits") or {}
                     if not deferred.get("issues"):
-                        update.update(issues=[], pending_writer_review={}, selection_confirmed=True)
+                        update.update(issues=[], pending_writer_review={},
+                                      selection_confirmed=not update.get("nomination_unresolved"))
                     else:
                         update.update(issues=deferred["issues"], pending_writer_review=deferred)
                 else:
+                    deferred = s.get("deferred_edits") or {}
                     update["pending_writer_review"] = {"stage": "select", "issues": s.get("issues", []),
-                                                       "defects": s.get("deferred_edits", {}).get("defects", [])}
+                                                       "defects": deferred.get("defects", [])}
+                    if strict_types and deferred.get("checks"):
+                        update["pending_writer_review"]["checks"] = deferred["checks"]
             return update
         scope_reason = scope_failure_reason(candidates, unlimited_current=True)
         gap = source_gap(missing) if missing and set(missing).issubset(s.get("prerequisites_checked", [])) else ""
@@ -791,27 +931,70 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
     def finalize_draft(raw, candidates):
         draft = raw.model_dump()
         draft["editorial_profile"] = release if current else READER_PROFILE
+        if uses_grounded_revision(settings):
+            draft["workflow_revision"] = settings["workflow_revision"]
         if lean:
             verify_bindings(draft, approved_cores(candidates), set(records))
         draft = bind_formal_citations(draft, records)
-        return bind_source_reference(draft, index.citation_metadata)
+        draft = bind_source_reference(draft, index.citation_metadata)
+        if uses_targeted_revision(settings):
+            draft = clean_comparison_locators(draft, records, structured=uses_grounded_revision(settings))
+        return normalize_alignment(draft, improve_layout=improve_layout) if strict_types else draft
 
     def ask_whole_source(packet):
         request_size = budget if optimized else None
         if optimized and packet is not direct_packet:
-            request_size = whole_source_budget(catalog, DirectResult, direct_instructions, packet, settings, model_profile)
+            request_size = whole_source_budget(catalog, direct_wire, direct_instructions, packet, settings, model_profile)
             if request_size["route"] == "extract":
                 notify("extract", {"message": "补充证据后整篇请求超出输入预算，改为分段读取同一原文",
                                    "request_budget": request_size})
                 return None
         try:
             return models.structured(DirectResult, direct_instructions, packet)
+        except StructuredResponseError:
+            if strict_types:
+                notify("extract", {"message": "整篇答复仍无法通过格式校验，沿用同一原文改为分段提取",
+                                   "route": "extract", "reason": "whole_source_protocol"})
+                return None
+            raise
         except Exception as exc:
             if optimized and context_limit_error(exc):
                 notify("extract", {"message": "模型报告整篇输入超出上下文，改为分段读取同一原文",
                                    "request_budget": {**request_size, "route": "extract", "reason": "provider_context_limit"}})
                 return None
             raise
+
+    def record_direct_decision(result, packet):
+        if result is None:
+            # No draft was accepted. Resume the segmented graph with the same
+            # source IDs when the whole-paper request can't produce a decision.
+            return {"direct_context_rejected": True}
+        result = DirectResult.model_validate(result.model_dump(), context=packet)
+        evidence_records = dict(records)
+        for reading in packet.get("source_images", []):
+            key = reading["source_id"]
+            evidence_records[key] = {**evidence_records[key], "text": evidence_records[key]["text"] + "\n" + reading["transcription"]}
+        candidates, selected_draft, note = direct_admission(result, evidence_records, strict_types=strict_types)
+        images = list(packet.get("source_images", ()))
+        if uses_targeted_revision(settings) and result.draft and any(row["decision"] == "unresolved" for row in candidates):
+            from .admission import verify_damaged_headings
+            extra = verify_damaged_headings([core.register_row() for core in result.cores], evidence_records, resolve_questions)
+            for image in extra:
+                loc = image["source_id"]
+                evidence_records[loc] = {**evidence_records[loc], "text": evidence_records[loc]["text"] + "\n" + image["transcription"]}
+            if extra:
+                images.extend(extra)
+                candidates, selected_draft, note = direct_admission(result, evidence_records, strict_types=strict_types)
+        for row in candidates:
+            readings = [r for r in images if r["source_id"] in row["evidence_ids"]]
+            if readings:
+                row["source_readings"] = readings
+        update = {"cursor": len(batches), "selection_version": SELECTION_VERSION, "candidates": candidates}
+        if strict_types:
+            update.update(direct_checks=[], direct_provisional={}, direct_invalid_checks=[])
+        if note:
+            return {**update, "screening_note": note}
+        return {**update, "pending_direct": finalize_draft(selected_draft, candidates)}
 
     def direct(s):
         notice = {"mode": "whole_source", "locations": list(records), "message": "通读完整论文，筛选核心成果"}
@@ -821,30 +1004,65 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         packet = direct_packet
         result = ask_whole_source(packet)
         if result is not None and result.source_checks:
+            if strict_types:
+                return {"direct_checks": [check.model_dump() for check in result.source_checks],
+                        "direct_provisional": result._provisional,
+                        "direct_invalid_checks": result._invalid_checks}
             requested = {item.source_id for item in result.source_checks}
             if not requested <= records.keys():
                 raise ValueError("The direct reader requested an unknown original location")
             evidence = resolve_questions(result.source_checks, {key: records[key] for key in requested})
             packet = {**direct_packet, "source_questions": evidence["source_questions"], "source_images": evidence["source_images"]}
             result = ask_whole_source(packet)
-        if result is None:
-            # No draft was accepted. Resume the segmented graph with the same
-            # source IDs instead of retrying the oversized direct input.
-            return {"direct_context_rejected": True}
-        result = DirectResult.model_validate(result.model_dump(), context=packet)
-        evidence_records = dict(records)
-        for reading in packet.get("source_images", []):
-            key = reading["source_id"]
-            evidence_records[key] = {**evidence_records[key], "text": evidence_records[key]["text"] + "\n" + reading["transcription"]}
-        candidates, selected_draft, note = direct_admission(result, evidence_records)
-        for row in candidates:
-            readings = [r for r in packet.get("source_images", []) if r["source_id"] in row["evidence_ids"]]
-            if readings:
-                row["source_readings"] = readings
-        update = {"cursor": len(batches), "selection_version": SELECTION_VERSION, "candidates": candidates}
-        if note:
-            return {**update, "screening_note": note}
-        return {**update, "pending_direct": finalize_draft(selected_draft, candidates)}
+        return record_direct_decision(result, packet)
+
+    def direct_evidence(s):
+        checks = [SourceCheck.model_validate(row) for row in s["direct_checks"]]
+        evidence = resolve_questions(checks, {q.source_id: records[q.source_id] for q in checks})
+        return {"direct_evidence_packet": {
+            "source_questions": evidence["source_questions"],
+            "source_images": evidence["source_images"],
+            "passage_ids": [row["id"] for row in evidence["passages"]],
+        }}
+
+    def direct_finish(s):
+        evidence = s["direct_evidence_packet"]
+        packet = {**direct_packet, "source_questions": evidence["source_questions"],
+                  "source_images": evidence["source_images"]}
+        if invalid := s.get("direct_invalid_checks"):
+            packet["invalid_source_checks"] = invalid
+        if provisional := s.get("direct_provisional"):
+            provisional = normalize_direct_shape(provisional)
+            packet["provisional_response"] = provisional
+            try:
+                decision = expand_direct_blocks(provisional) if block_workflow else provisional
+                previous = DirectResult.model_validate(decision, context=direct_packet)
+            except ValueError:
+                pass
+            else:
+                # Keep the source behind every provisional statement as well as
+                # the newly requested evidence. The response is still revalidated.
+                ids = set(evidence["passage_ids"])
+                for core in previous.cores:
+                    ids.update(core.evidence_ids)
+                    ids.add(core.significance_source_id)
+                if previous.draft:
+                    for row in previous.draft.evidence_links:
+                        ids.update(row.evidence_ids)
+                if previous.summary:
+                    ids.update(previous.summary.evidence_ids)
+                packet["passages"] = [row for row in direct_packet["passages"] if row["id"] in ids]
+                packet["source_locations"] = [
+                    {key: row[key] for key in ("id", "label", "section", "page", "file", "line") if key in row}
+                    for row in catalog
+                ]
+        result = ask_whole_source(packet)
+        if result is not None and result.source_checks:
+            # Segmented reading retains the checked locations and page readings.
+            notify("extract", {"message": "整篇补证后仍需查证，沿用已查证据进入分段提取",
+                               "route": "extract", "reason": "remaining_source_questions"})
+            result = None
+        return record_direct_decision(result, packet)
 
     def accept_direct(s):
         # The paid response is checkpointed by the direct node first. A paper
@@ -877,14 +1095,40 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         previous = s.get("draft")
         prior_check = s.get("pending_writer_review") or (s["reviews"][-1] if previous and s.get("reviews") else {})
         defects = prior_check.get("defects", [])
-        targets = repair_targets(previous, prior_check, records.keys())
+        grounded = uses_grounded_revision(settings)
+        targets = repair_targets(previous, prior_check, records.keys(), allow_collection_edits=uses_block_workflow(settings),
+                                 resolve_fields=grounded)
         approved = approved_cores(s["candidates"]) if lean else {}
-        # A newly admitted result alone does not invalidate the already-verified
-        # text of its neighbours. When independent wording changes are pending,
-        # use the complete writer packet so no outstanding correction is lost.
-        structural = bool(lean and previous and prior_check.get("stage") == "select" and not defects)
-        notify("draft", {"attempt": attempt, "mode": "patch" if targets or structural else "full",
-                         "blocks": [item["block_id"] for item in targets]})
+        structural = bool(lean and previous and prior_check.get("stage") == "select")
+        if structural and (defects or prior_check.get("checks")):
+            if strict_types:
+                if prior_check.get("checks"):
+                    local_review = {**prior_check, "stage": "combined"}
+                else:
+                    # These are the original review's non-selection defects.
+                    # Locate them on the saved manuscript before its groups move.
+                    try:
+                        check = AdmissionReview.model_validate({"route": "draft", "issues": defects, "evidence_ids": []})
+                    except ValueError:
+                        local_review = {}
+                    else:
+                        local_review = {"stage": "review", "passed": False, "route": "draft", "defects": defects,
+                                        "issues": check.repair_issues(), "evidence_ids": []}
+                targets = repair_targets(previous, local_review, records.keys(), allow_collection_edits=uses_block_workflow(settings),
+                                         resolve_fields=grounded)
+                structural = bool(targets)
+            else:
+                structural = False
+        local_citation = None
+        if (uses_evidence_link_patch(settings) and previous and prior_check.get("stage") == "review"
+                and prior_check.get("attempt") == s["attempt"] and prior_check.get("issues") == s.get("issues")
+                and prior_check.get("draft_sha256") == _draft_hash(previous)):
+            local_citation = narrow_reviewed_citation(previous, prior_check, s["candidates"], records)
+        if local_citation is not None:
+            notify("draft", {"attempt": attempt, "mode": "local_citation", "message": "按复核意见缩短定理出处"})
+        else:
+            notify("draft", {"attempt": attempt, "mode": "patch" if targets or structural else "full",
+                             "blocks": [item["block_id"] for item in targets]})
         instructions = writing_rules
         if drafts_started() >= MAX_DRAFT_ROUNDS:
             instructions += ("\nThis is the final writing round. Resolve the outstanding findings with the supplied "
@@ -905,26 +1149,8 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         if reversals:
             packet["opposing_previous_edit_requests"] = reversals
             packet["disputed_edit_guidance"] = "Resolve the conflicting requests using the cited original passage and the applicable rule."
-        if structural:
-            draft = project_cores(previous, approved)
-            needed = {key: row for key, row in approved.items() if key not in draft["core_bindings"].values()}
-            if needed:
-                asserted = [{k: v for k, v in c.items() if k != "source_readings"} for c in s["candidates"]
-                            if c.get("candidate_id") in needed]
-                locations = {key for c in asserted for key in c["evidence_ids"]}
-                locations.update(id_ for c in s["candidates"] if set(c.get("needed_by", [])) & needed.keys()
-                                 for id_ in c["evidence_ids"])
-                add_packet = {"requested_cores": needed, "candidates": asserted, "references": draft["references"],
-                              "shared_definitions": draft["shared_definitions"], "retained_core_ids": list(draft["core_bindings"].values()),
-                              "passages": [r for k, r in records.items() if k in locations]}
-                add_source_readings(add_packet, s)
-                additions = models.structured(AddedCores, instructions + "\n" + node_prompt("draft")
-                    + "\nSupply just the requested new cores under their approved IDs, plus any new bibliography entries.",
-                    add_packet)
-                additions = AddedCores.model_validate(additions.model_dump(), context=add_packet)
-                draft = additions.merge(draft, approved)
-            normalized = AuthoritativeDraft.model_validate(draft, context={"approved_cores": approved})
-            draft = finalize_draft(normalized, s["candidates"])
+        if local_citation is not None:
+            draft = local_citation
         elif targets:
             packet["repair_targets"] = targets
             if current:
@@ -946,10 +1172,55 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                           "opposing_previous_edit_requests": reversals}
                 if optimized:
                     packet["context_blocks"], packet["passages"] = repair_context(targets, context, records)
+                if grounded and (uses := definition_uses(previous, targets, packet["renderer_context"]["visible_headings"])):
+                    packet["definition_uses"] = uses
+                    for use in uses.values():
+                        for key in use["explicit_users"]:
+                            if key not in scope:
+                                packet["context_blocks"][key] = block_at(previous, key)
+                if improve_layout and attempt > 2:
+                    owners = previous.get("core_bindings", {})
+                    evidence = {row["block_id"]: sorted(row["evidence_ids"]) for row in previous["evidence_links"]}
+                    prior_layout = []
+                    for reading in s.get("layout_measurements", []):
+                        field = reading["block_id"]
+                        group = ".".join(field.split(".")[:2])
+                        if (field in scope and reading["draft_round"] < attempt - 1
+                                and reading["evidence_ids"] == evidence.get(field)
+                                and reading["owner"] == owners.get(group + ".theorem")):
+                            prior_layout.append({key: reading[key] for key in
+                                                 ("draft_round", "block_id", "height_units", "limit_units")})
+                    if prior_layout:
+                        packet["earlier_layout_measurements"] = prior_layout[:8]
+                elif strict_types and attempt > 2:
+                    prior_layout = [
+                        {"draft_round": record["attempt"], "block_id": row["draft_field"],
+                         "diagnostics": row["diagnostics"]}
+                        for record in s["reviews"] if record["stage"] == "compile"
+                        and record["attempt"] < attempt - 1
+                        for row in record.get("repair_targets", []) if row["draft_field"] in scope
+                    ]
+                    if prior_layout:
+                        packet["earlier_layout_measurements"] = prior_layout
             if lean:
                 add_source_readings(packet, s)
-            patch = models.structured(DraftPatch, instructions + "\n" + (node_prompt("patch") if current else PATCH_GUIDANCE), packet)
+            patch_prompt = instructions + "\n" + (node_prompt("patch") if current else PATCH_GUIDANCE)
+            if grounded and any(t.get("attribution_fields") for t in targets):
+                patch_prompt += ("\nFor an attribution_fields target, update those fields in formal_source, "
+                                 "preserving its other roles. Keep the body verbatim unless a body edit is also requested.")
+            if grounded and packet.get("definition_uses"):
+                patch_prompt += ("\nPreserve the meaning of each definition for retained users. Shared definitions "
+                                 "may also have implicit users. Coordinate changes to their requested dependent blocks "
+                                 "in this patch. Never remove a necessary condition to make space.")
+            if uses_targeted_revision(settings):
+                patch = write_targeted_patch(models, patch_prompt, packet, records, on_exact=lambda ids:
+                    notify("draft", {"attempt": attempt, "mode": "exact_replacements", "blocks": ids,
+                                     "message": "采用复核给出的原句替换"}))
+            else:
+                patch = write_block_patch(models, patch_prompt, packet)
             draft = apply_patch(previous, patch, packet, records)
+        elif structural:
+            draft = previous
         else:
             packet["identified_defects"] = defects
             if lean:
@@ -957,8 +1228,68 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
             schema = AuthoritativeDraft if lean else CurrentDraft if current else Draft
             written = models.structured(schema, instructions + "\n" + (node_prompt("draft") if current else DRAFT_GUIDANCE), packet)
             draft = finalize_draft(written, s["candidates"])
+        if structural:
+            draft = project_cores(draft, approved)
+            needed = {key: row for key, row in approved.items() if key not in draft["core_bindings"].values()}
+            if needed:
+                asserted = [{k: v for k, v in c.items() if k != "source_readings"} for c in s["candidates"]
+                            if c.get("candidate_id") in needed]
+                locations = {key for c in asserted for key in c["evidence_ids"]}
+                locations.update(id_ for c in s["candidates"] if set(c.get("needed_by", [])) & needed.keys()
+                                 for id_ in c["evidence_ids"])
+                add_packet = {"requested_cores": needed, "candidates": asserted, "references": draft["references"],
+                              "shared_definitions": draft["shared_definitions"], "retained_core_ids": list(draft["core_bindings"].values()),
+                              "passages": [r for k, r in records.items() if k in locations]}
+                add_source_readings(add_packet, s)
+                schema = AddedCores
+                guidance = "\nSupply just the requested new cores under their approved IDs, plus any new bibliography entries."
+                if uses_targeted_revision(settings) and (comparisons := comparison_targets(draft, needed)):
+                    schema = AddedCoresWithComparisons
+                    add_packet["relative_comparisons"] = comparisons
+                    guidance += (" Where a retained paragraph's quoted relative phrase actually refers to a new result,"
+                                 " bind its paragraph, exact phrase and core_id. Omit uncertain bindings.")
+                if grounded:
+                    from .profile import render_tex
+                    def validate_merge(combined):
+                        valid = AuthoritativeDraft.model_validate(combined, context={"approved_cores": approved})
+                        render_tex(finalize_draft(valid, s["candidates"]))
+                    add_packet = AdditionRequest(add_packet, draft, approved, validate_merge)
+                    guidance += ADDITION_GUIDANCE
+                try:
+                    additions = models.structured(schema, instructions + "\n" + node_prompt("draft") + guidance, add_packet)
+                    additions = schema.model_validate(additions.model_dump(), context=add_packet)
+                except ValueError as exc:
+                    if not grounded or not draft["groups"]:
+                        raise
+                    # Local corrections already applied to retained blocks can still stand together.
+                    # Keep them only if the projected manuscript is independently valid and renderable.
+                    retained = {key: approved[key] for key in draft["core_bindings"].values()}
+                    AuthoritativeDraft.model_validate(draft, context={"approved_cores": retained})
+                    verify_bindings(draft, retained, set(records))
+                    render_tex(draft)
+                    changed = draft != previous
+                    delivered_round = attempt if changed else s["attempt"]
+                    if changed and save_draft:
+                        save_draft(attempt, draft)
+                    from pydantic import ValidationError
+                    reason = (" | ".join(error["msg"] for error in exc.errors(include_input=False)[:4])
+                              if isinstance(exc, ValidationError) else str(exc))
+                    failure = {"candidate_ids": list(needed), "reason": reason[:600]}
+                    notify("draft", {"attempt": attempt, "mode": "unmerged_additions",
+                                     "message": "已保存可独立使用的修改", **failure})
+                    return {"attempt": delivered_round, "draft": draft, "unmerged_additions": failure,
+                            "pending_writer_review": {}, "issues": []}
+                draft = additions.merge(draft, approved)
+            normalized = AuthoritativeDraft.model_validate(draft, context={"approved_cores": approved})
+            draft = finalize_draft(normalized, s["candidates"])
         # Leave saved drafts reproducible. A new draft receives the current reader settings.
         draft["editorial_profile"] = (release or CURRENT_PROFILE) if current else READER_PROFILE
+        if uses_grounded_revision(settings):
+            draft["workflow_revision"] = settings["workflow_revision"]
+        if uses_targeted_revision(settings):
+            draft = clean_comparison_locators(draft, records, structured=uses_grounded_revision(settings))
+        if strict_types:
+            draft = normalize_alignment(draft, improve_layout=improve_layout)
         if lean:
             verify_bindings(draft, approved_cores(s["candidates"]), set(records))
         unknown = sorted({k for l in draft["evidence_links"] for k in l["evidence_ids"] if k not in records})
@@ -966,13 +1297,15 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         if save_draft:
             save_draft(attempt, draft)
         renumbered = {}
-        if targets and any("definitions." in row["block_id"] and (not row["current_text"] or row.get("remove")) for row in targets):
+        if not structural and targets and any("definitions." in row["block_id"] and (not row["current_text"] or row.get("remove")) for row in targets):
             before = renderer_context(previous)["visible_headings"]
             after = renderer_context(draft)["visible_headings"]
             renumbered = {block: [label, after[block]] for block, label in before.items()
                           if block in after and label != after[block]}
-        review_targets = targets
-        if lean and any(row.get("remove") for row in targets):
+        # A changed membership may renumber existing blocks and introduce new
+        # dependencies, so review the merged draft in its final coordinates.
+        review_targets = [] if structural else targets
+        if lean and not structural and any(row.get("remove") for row in targets):
             # After a deletion use current coordinates. A shared definition may
             # be cited by any result; do not silently skip those dependencies.
             review_targets = [] if any(row["block_id"].startswith("shared_definitions.") for row in targets if row.get("remove")) else [
@@ -983,6 +1316,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
             if any(not row["block_id"].startswith("groups.") for row in targets):
                 review_targets = []
         return {"attempt": attempt, "draft": draft, "issues": issues, "writer_version": WRITER_VERSION,
+                **({"unmerged_additions": {}} if grounded else {}),
                 "renumbered_definitions": renumbered, "pending_writer_review": {}, "legacy_b2_pending": _needs_legacy_b2_review(s, prior_check),
                 "review_blocks": [{"draft_field": row["block_id"], "previous_text": row["current_text"],
                                    **({"previous_paragraph_position": row["paragraph_position"]} if "paragraph_position" in row else {}),
@@ -996,6 +1330,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         issues = list(s["issues"])
         targets = []
         defects = []
+        typed_proposals = []
         legacy_full = not issues and _needs_legacy_b2_review(s)
         if not issues:
             changed = [] if legacy_full else s.get("review_blocks") or []
@@ -1075,11 +1410,19 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                 else:
                     observation = _inspect(reader, read_prompt, packet)
             read_prompt += "\n" + (node_prompt("review") if current else REVIEW_GUIDANCE)
+            if grounded:
+                read_prompt += REVIEW_SCOPE
+                read_prompt += ("\nFor a missing result, use nominations with its original heading and a verbatim "
+                                "quotation of the missing mathematical clause in its source language, preserving its "
+                                "range and notation. Name the loss relative to the nearest printed result. Request "
+                                "a source check if the statement is unavailable.")
             if optimized:
                 read_prompt += ("\nOriginal locations are addressable under source_locations. When an omitted proof, "
                                 "bibliography or other passage could change a substantive decision, request its ID "
                                 "as source_id and target_id in source_checks to read it in full.")
             if lean:
+                if uses_targeted_revision(settings):
+                    models.review_source_index = records
                 choice = models.structured(EvidenceReview, read_prompt + "\nSupply either a complete verdict under "
                                            "verdict or a concrete source_checks request. A source question defers the verdict.", packet)
                 if choice.source_checks:
@@ -1097,6 +1440,8 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                 verdict = models.structured(AdmissionReview, read_prompt, {**packet, "source_observations": observation})
             issues = verdict.repair_issues()
             defects = [item.model_dump() for item in verdict.issues]
+            if grounded:
+                typed_proposals = getattr(verdict, "_source_nominations", [])
             if any(item.evidence_id not in records for item in verdict.issues):
                 raise ValueError("The reviewer cited an unregistered original evidence location")
             if verdict.route == "extract":
@@ -1105,14 +1450,23 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                     raise ValueError("The reviewer returned an unknown original evidence location")
         nominations = []
         deferred = {}
+        typed_state = {}
+        reads = None
         if lean:
             bindings = s["draft"]["core_bindings"]
-            for defect in defects:
+            # The wire adapter appends one editorial issue per typed nomination.
+            # Its structured counterpart drives the new route, while saved
+            # verdicts without such a counterpart keep the legacy behavior.
+            editorial = defects[:len(defects) - len(typed_proposals)]
+            for defect in editorial:
                 field = defect["draft_field"]
                 match = re.match(r"groups\.(\d+)", field)
                 owner = bindings.get(field) or (bindings.get(f"groups.{match[1]}.theorem") if match else None)
-                selection_defect = selection_change(defect, s["draft"])
-                if owner and not (selection_defect and defect["operation"] == "insert"):
+                targeted = uses_targeted_revision(settings)
+                selection_defect = selection_change(defect, s["draft"], targeted=targeted)
+                new_nomination = selection_defect and (defect["operation"] == "insert" or
+                                                        (targeted and defect["operation"] == "recover"))
+                if owner and not new_nomination:
                     defect["core_id"] = owner
                 if selection_defect:
                     nominations.append(defect)
@@ -1121,12 +1475,24 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
             if targets:
                 # Missing evidence may concern only wording. Keep remaining
                 # source-bound edits intact across a selection detour.
-                others = [d for d in defects if d not in nominations]
+                others = [d for d in editorial if d not in nominations]
                 if others:
                     remaining = AdmissionReview.model_validate({"route": "extract" if any(
                         d["operation"] == "recover" for d in others) else "draft", "issues": others, "evidence_ids": targets})
                     deferred = _record(s, "review", False, remaining.repair_issues(), route="draft",
                                        defects=others, evidence_ids=[])
+            if typed_proposals:
+                ledger, keys, registered = register_nominations(snapshot, typed_proposals, records,
+                                                               s.get("nomination_ledger", {}), s["candidates"], s["draft"])
+                typed_state = {"nomination_ledger": ledger, "nomination_keys": keys, "candidates": registered,
+                               "nomination_unresolved": False}
+                must_read = {ledger[key]["evidence_id"] for key in keys if not (
+                    ledger[key]["source_verified"] or ledger[key].get("reused"))}
+                must_read.update(d["evidence_id"] for d in editorial if d["operation"] == "recover" or d in nominations)
+                # All requested passages reach scoped selection, including
+                # neighboring context. Only unresolved evidence needs another
+                # extraction call when its statement and quotation already match.
+                reads = [loc for loc in targets if loc in must_read]
         route = "extract" if targets else ("draft" if issues else "pass")
         if issues:
             notify("review", {"attempt": s["attempt"], "route": route, "issues": issues,
@@ -1148,12 +1514,12 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
             issues = list(dict.fromkeys([*issues, *layout["issues"]]))
         if legacy_full:
             check["legacy_b2_reviewed"] = True
-        return {"issues": issues, "target_ids": targets, "reviews": s["reviews"] + [check],
+        return {"issues": issues, "target_ids": targets if reads is None else reads, "reviews": s["reviews"] + [check],
                 "pending_writer_review": pending,
                 "nomination_sources": targets, "nominations": nominations, "deferred_edits": deferred,
                 "legacy_b2_pending": bool(s.get("legacy_b2_pending") and not legacy_full),
                 "legacy_b2_reviewed": bool(s.get("legacy_b2_reviewed") or legacy_full),
-                **record_progress(s, "review", [check], issues)}
+                **record_progress(s, "review", [check], issues), **typed_state}
 
     def compile_pdf(s):
         saved = s.get("local_build", {})
@@ -1164,6 +1530,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         notify("compile", {"attempt": s["attempt"]})
         payload = {k: v for k, v in s["draft"].items() if k != "evidence_links"}
         repair_targets = []
+        measured = []
         technical = False
         try:
             location = build_case(work, source, source_root, payload)
@@ -1175,6 +1542,15 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
             technical = isinstance(exc, OSError) or bool(getattr(exc, "technical", False))
             if not technical:
                 repair_targets = exc.repair_targets if isinstance(exc, BuildFailure) else saved_build_targets(payload, [str(exc)])
+                if improve_layout:
+                    try:
+                        repair_targets, measured, additional = local_layout_diagnostics(
+                            work, payload, artifact_case, repair_targets, rendered=artifact_case is not None
+                        )
+                    except (OSError, ValueError, KeyError, TypeError):
+                        pass
+                    else:
+                        issues.extend(additional[:12])
             notify("compile", {"attempt": s["attempt"], "issues": issues, "message": issues[0]})
         if save_draft:
             save_draft(s["attempt"], s["draft"], artifact_case)
@@ -1188,6 +1564,19 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                 pass
         compiled = {"last_compiled_case": str(artifact_case), "last_compiled_draft": s["draft"],
                     "last_compiled_round": s["attempt"]} if has_compiled else {}
+        if measured:
+            owners = payload.get("core_bindings", {})
+            evidence = {row["block_id"]: sorted(row["evidence_ids"]) for row in s["draft"]["evidence_links"]}
+            history = [row for row in s.get("layout_measurements", []) if row["draft_round"] != s["attempt"]]
+            for reading in measured:
+                field = reading["draft_field"]
+                if not evidence.get(field):
+                    continue
+                group = ".".join(field.split(".")[:2])
+                history.append({"draft_round": s["attempt"], "block_id": field, "evidence_ids": evidence[field],
+                                "owner": owners.get(group + ".theorem"), "height_units": reading["height_units"],
+                                "limit_units": reading["limit_units"]})
+            compiled["layout_measurements"] = history
         return {**compiled, "result_dir": str(location) if location else "", "issues": issues, "target_ids": [],
                 "technical_build_failure": technical,
                 "reviews": s["reviews"] + [check], **record_progress(s, "compile", [check], issues)}
@@ -1198,7 +1587,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         # transition; only substantive writer changes require a new build.
         built = compile_pdf({**s, "local_build": {}})
         check = built["reviews"][-1]
-        carried = {k: built[k] for k in ("last_compiled_case", "last_compiled_round", "last_compiled_draft")
+        carried = {k: built[k] for k in ("last_compiled_case", "last_compiled_round", "last_compiled_draft", "layout_measurements")
                    if k in built}
         result = {k: built[k] for k in ("result_dir", "issues", "technical_build_failure", "target_ids")}
         return {**carried, "local_build": {"round": s["attempt"], "result": result, "check": check}}
@@ -1213,6 +1602,7 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         headings = renderer_context(s["draft"])["visible_headings"]
         pdf = Path(s["result_dir"]) / "introduction.pdf"
         pages = read_pages(pdf) if current else []
+        printed = reading_blocks(s["draft"]) if uses_grounded_revision(settings) else None
         # Every field remains addressable when text extraction cannot locate a
         # formula. Include full text only for headings printed on the visible page.
         field_index = {field: headings.get(field, text[:100]) for field, text in blocks.items()} if current else {}
@@ -1236,7 +1626,18 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                 packet = {"page": page, "title": s["draft"]["title"], "draft_blocks": blocks,
                           "paragraph_positions": {f"groups.{i}.paragraph": group.get("paragraph_position", "after")
                                                   for i, group in enumerate(s["draft"]["groups"]) if group.get("paragraph")}}
-                if current:
+                if printed is not None:
+                    packet = {"page": page, "title": s["draft"]["title"],
+                              **visual_page_context(printed, pages[page - 1])}
+                    if packet["display_environments"]:
+                        d6 = next(line for line in current_rules("D").splitlines() if line.startswith("**D6.**"))
+                        instructions += "\n" + d6
+                    instructions += ("\nfield_index follows actual printed order. paragraph_positions are relative "
+                                     "to the corresponding theorem in this rendering. For a display, check its "
+                                     "mathematical role against the image: independent conditions align at their "
+                                     "left edges; only a calculation chain needs a common relation column. "
+                                     "Report actual semantic misgrouping, overflow, clipping or broken alignment.")
+                elif current:
                     text = pages[page - 1]
                     packet["draft_blocks"] = {field: blocks[field] for field, heading in headings.items()
                                               if re.search(r"(?im)^\s*" + re.escape(heading) + r"\b", text)}
@@ -1272,10 +1673,15 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
     def publish(s):
         if lean:
             verify_bindings(s["draft"], approved_cores(s["candidates"]), set(records))
-        return _publish_result(work, s, notify, {"status": "reviewed", "draft_round": s["attempt"]})
+        delivery = {"status": "reviewed", "draft_round": s["attempt"]}
+        if strict_types:
+            delivery["compiler_verified"] = True
+            delivery["checks"] = {"content": "passed", "layout": "passed", "visual": "passed"}
+        return _publish_result(work, s, notify, delivery)
 
     def final_delivery(s):
-        return _deliver_current(work, source, source_root, s, index, notify, current=release or current)
+        return _deliver_current(work, source, source_root, s, index, notify, current=release or current,
+                                strict=strict_types)
 
     def review_with_fallback(s):
         try:
@@ -1295,7 +1701,9 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                     or drafts_started() >= MAX_DRAFT_ROUNDS or s.get("repair_stalled") or s.get("technical_build_failure")
                     or s.get("pending_writer_review", {}).get("unlocated")):
                 return "final_delivery"
-            return "extract" if s.get("target_ids") else "draft"
+            if s.get("target_ids"):
+                return "extract"
+            return "select" if s.get("nomination_keys") else "draft"
         return route
 
     graph = StateGraph(PaperState)
@@ -1308,12 +1716,32 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         graph.add_node(name, node)
     if lean:
         direct_packet = {"passages": catalog, "source_metadata": index.citation_metadata}
-        direct_instructions = current_rules() + "\n" + node_prompt("direct")
+        if strict_types:
+            from .admission import admission_source
+            direct_packet["passages"] = [admission_source(row) for row in catalog]
+        block_workflow = uses_block_workflow(settings)
+        direct_wire = BlockDirectResult if block_workflow else DirectResult
+        direct_prompt = node_prompt("direct")
+        if block_workflow:
+            direct_prompt = direct_prompt.replace(
+                "(core_bindings, formal_sources, evidence_links)",
+                "with evidence_ids inside each body block, formal_source inside every theorem/definition, "
+                "and candidate_id inside every printed theorem (including historical comparisons)",
+            )
+        direct_instructions = current_rules() + "\n" + direct_prompt
+        if uses_grounded_revision(settings):
+            direct_instructions += "\n" + SOURCE_ROLE_GUIDANCE
+        if not block_workflow and uses_evidence_link_patch(settings):
+            direct_instructions += (
+                "\nFor a draft, evidence_links must contain exactly one row for each existing body block: "
+                "paragraph, history.i, shared_definitions.i, groups.i.theorem, groups.i.definitions.j, "
+                "and each nonempty groups.i.paragraph. Use zero-based indices and registered passage IDs."
+            )
         # Route before the first request. The direct packet contains the complete
         # source or is discarded in favour of the segmented workflow.
         model_profile = getattr(getattr(models, "text", None), "profile", None) or {}
         if optimized:
-            budget = whole_source_budget(catalog, DirectResult, direct_instructions, direct_packet, settings, model_profile)
+            budget = whole_source_budget(catalog, direct_wire, direct_instructions, direct_packet, settings, model_profile)
             direct_ok = budget["route"] == "direct"
         else:
             declared_window = settings.get("context_window") or model_profile.get("max_input_tokens")
@@ -1324,8 +1752,19 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
         graph.add_node("summary", summary)
         graph.add_node("preflight", preflight)
         graph.add_edge(START, "summary" if unreadable else "direct" if direct_ok else "extract")
-        graph.add_conditional_edges("direct", lambda s: "extract" if s.get("direct_context_rejected") else
-                                    "summary" if s.get("screening_note") else "accept_direct")
+        def direct_route(s):
+            if s.get("direct_context_rejected"):
+                return "extract"
+            return "summary" if s.get("screening_note") else "accept_direct"
+
+        if strict_types:
+            graph.add_node("direct_evidence", at_model_boundary(direct_evidence))
+            graph.add_node("direct_finish", at_model_boundary(direct_finish))
+            graph.add_conditional_edges("direct", lambda s: "direct_evidence" if s.get("direct_checks") else direct_route(s))
+            graph.add_edge("direct_evidence", "direct_finish")
+            graph.add_conditional_edges("direct_finish", direct_route)
+        else:
+            graph.add_conditional_edges("direct", direct_route)
         graph.add_edge("accept_direct", "preflight")
         graph.add_edge("preflight", "review")
         graph.add_edge("summary", END)
@@ -1347,12 +1786,14 @@ def _make_graph(work, source, source_root, settings, notify, checkpointer, rules
                 return "summary"
             if s.get("selection_confirmed"):
                 return "compile"
+            if s.get("nomination_unresolved") and not s.get("issues") and s.get("draft"):
+                return "final_delivery"
         if s.get("status") == "failed":
             return "final_delivery" if s.get("draft") else END
         return "prerequisites" if _missing_categories(s["candidates"], require_history=not current) else "draft"
 
     def after_draft(s):
-        if drafts_started() >= MAX_DRAFT_ROUNDS:
+        if s.get("unmerged_additions") or drafts_started() >= MAX_DRAFT_ROUNDS:
             return "final_delivery"
         return ("preflight" if lean else "review") if _selection_ready(s) else "select"
 
@@ -1392,6 +1833,7 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
     index = None
     delivering = False
     local_starts = 0
+    reliable = is_reliable_workflow(settings)
 
     def drafts_started():
         return count_draft_starts() if count_draft_starts is not None else local_starts
@@ -1414,7 +1856,7 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
             rules = current_rules()
             identity_rules = settings["extraction_profile"] + ":" + settings["profile_fingerprint"]
             if settings.get("workflow_revision"):
-                if not is_optimized_workflow(settings) or settings["extraction_profile"] != CURRENT_PROFILE:
+                if not is_optimized_workflow(settings):
                     raise ValueError("此批次绑定的执行流程版本与已安装版本不一致")
                 identity_rules += ":" + settings["workflow_revision"]
         else:
@@ -1431,9 +1873,10 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
         if receipt.is_file():
             return _public(json.loads(receipt.read_text("utf-8")))
         with SqliteSaver.from_conn_string(os.fspath(work / "checkpoint.sqlite")) as saver:
-            index = SourceIndex(source, source_root, work)
+            index = SourceIndex(source, source_root, work, admission_statements=reliable,
+                                improved_tex=uses_local_preflight(settings))
             graph, batch_count = _make_graph(work, source, source_root, settings, notify_with_budget, saver, rules, index,
-                                             read_api_key, save_draft, drafts_started, current=current)
+                                             read_api_key, save_draft, drafts_started, current=current, snapshot=thread)
             config = {"configurable": {"thread_id": thread}}
             prior = graph.get_state(config)
             state = prior.values
@@ -1465,7 +1908,7 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
             if prior.next:
                 if pause_requested is not None and pause_requested():
                     return _public({**state, "status": "paused", "reason": "已暂停，可从当前检查点继续。"})
-                if settings.get("extraction_profile") == CURRENT_PROFILE and prior.next == ("review",) and state.get("draft"):
+                if is_core_release(settings.get("extraction_profile")) and prior.next == ("review",) and state.get("draft"):
                     # Previously the adapter stored this exact exception after three
                     # normal replies. Upgrading a resumable checkpoint must not repeat them.
                     exhausted = next((str(task.error) for task in prior.tasks if task.name == "review" and
@@ -1476,7 +1919,9 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
                         state = {**state, **update}
                 if drafts_started() >= MAX_DRAFT_ROUNDS:
                     delivering = True
-                    return _public({**state, **_deliver_current(work, source, source_root, state, index, notify, current=settings.get("extraction_profile") or current)})
+                    return _public({**state, **_deliver_current(
+                        work, source, source_root, state, index, notify,
+                        current=settings.get("extraction_profile") or current, strict=reliable)})
             if prior.created_at and not prior.next and state.get("status") and not (
                     count_exception or explicit_upgrade or repeat_review or saved_edits or legacy_stop or recompile or local_layout or stalled_retry):
                 return _public(state)
@@ -1567,7 +2012,9 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
                     # A saved third draft from an older checkpoint also goes straight to delivery.
                     if drafts_started() >= MAX_DRAFT_ROUNDS and pending != ("final_delivery",):
                         delivering = True
-                        return _public({**state, **_deliver_current(work, source, source_root, state, index, notify, current=settings.get("extraction_profile") or current)})
+                        return _public({**state, **_deliver_current(
+                            work, source, source_root, state, index, notify,
+                            current=settings.get("extraction_profile") or current, strict=reliable)})
                     delivering = pending in {("final_delivery",), ("failed",), ("publish",)}
                     state = graph.invoke(initial, config, interrupt_after="*")
                     pending = graph.get_state(config).next
@@ -1581,17 +2028,30 @@ def _run_locked(work: Path, source: Path, source_root: Path | None, settings: di
                 raise
         return _public(state)
     except Exception as exc:
-        if index is not None and not delivering and drafts_started() >= MAX_DRAFT_ROUNDS:
+        if reliable and state.get("pending_direct") and not state.get("draft"):
+            # This draft was already validated and saved by the direct node.
+            state = {**state, "draft": state["pending_direct"], "attempt": 1}
+        if (index is not None and not delivering and
+                (drafts_started() >= MAX_DRAFT_ROUNDS or reliable and state.get("draft"))):
             if pause_requested is not None and pause_requested():
                 return _public({**state, "status": "paused", "reason": "已暂停，可从当前检查点继续。"})
             try:
-                return _public({**state, **_deliver_current(work, source, source_root, state, index, notify, current=settings.get("extraction_profile") or current)})
+                return _public({**state, **_deliver_current(
+                    work, source, source_root, state, index, notify,
+                    current=settings.get("extraction_profile") or current, strict=reliable)})
             except Exception as delivery_error:
                 exc = delivery_error
         detail = str(exc)
         key = settings.get("api_key")
         if key:
             detail = detail.replace(str(key), "[redacted]")
-        return _public({**state, "status": "failed", "resumable": resumable,
-                        "reason": f"{type(exc).__name__}: {detail[:3000]}"})
+        failure = _public({**state, "status": "failed", "resumable": resumable,
+                           "reason": f"{type(exc).__name__}: {detail[:3000]}"})
+        if reliable:
+            positions = [loc for item in state.get("candidates", []) for loc in item.get("evidence_ids", [])]
+            try:
+                return write_run_report(work, source, failure, source_ids=list(dict.fromkeys(positions))[:15])
+            except OSError:
+                pass  # Preserve the recorded failure when the storage itself is unavailable.
+        return failure
 

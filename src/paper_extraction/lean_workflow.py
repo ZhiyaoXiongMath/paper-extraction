@@ -7,10 +7,11 @@ import unicodedata
 from copy import deepcopy
 from typing import ClassVar, Literal
 
-from pydantic import BaseModel, Field, ValidationInfo, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, model_validator
 
+from .admission import constrain_current_results
 from .citation_types import FormalSource
-from .models import AdmissionReview, AuthoritativeDraft, Candidate, Reference, SourceCheck, json_text
+from .models import MAX_GROUP_DEFINITIONS, AdmissionReview, AuthoritativeDraft, Candidate, Reference, SourceCheck, json_text
 
 
 class ScreeningNote(BaseModel):
@@ -121,6 +122,7 @@ class DirectCore(BaseModel):
     evidence_ids: list[str] = Field(min_length=1)
     significance_source_id: str | None = Field(default=None, description="Passage supporting the gain if it differs from the primary assertion's first location")
     independent_role: IndependentRole | None = None
+    source_statement_id: str | None = Field(default=None, description="Exact formal statement ID from the source heading directory, when listed")
 
     def register_row(self):
         return {**self.model_dump(), "decision": "admitted", "decision_reason": self.source_reason,
@@ -130,11 +132,20 @@ class DirectCore(BaseModel):
                 "b2_source_facts": [{"source_id": self.significance_source_id or self.evidence_ids[0], "fact": self.source_reason}]}
 
 
-def direct_admission(result, records):
+def direct_admission(result, records, *, strict_types=False):
     """Apply the same source-role contract as segmented selection before a draft
     can be checkpointed. Keep excluded entries in the source register."""
     candidates = [c.register_row() for c in result.cores]
+    if strict_types:
+        # The original heading and the draft citation agree on a number.
+        # In a shared passage the citation may resolve its type unambiguously.
+        heading_citations = {candidate: result.draft.formal_sources[field].source
+                             for field, candidate in result.draft.core_bindings.items()
+                             if field in result.draft.formal_sources} if result.draft else {}
+        constrain_current_results(candidates, records, heading_citations=heading_citations)
     for row, core in zip(candidates, result.cores):
+        if row["decision"] != "admitted":
+            continue
         if not independent_role_supported(core.kind, core.source_number, core.claim, core.evidence_ids,
                                           core.independent_role, records):
             row.update(decision="excluded", decision_reason="The paper did not establish this result's independent comparative or contribution role.")
@@ -142,10 +153,13 @@ def direct_admission(result, records):
     if result.summary:
         return candidates, None, result.summary.model_dump()
     if not any(c["kind"] in {"current", "application"} for c in approved.values()):
-        labels = "、".join(c.source_number or c.candidate_id for c in result.cores)
-        return candidates, None, {"kind": "no_qualifying_result", "question": f"《{result.draft.title}》给出了哪些独立的主要成果？",
-            "reason": f"候选 {labels} 可以从原文定位，但现有依据只支持其陈述、背景或证明用途，未能确立其独立贡献地位。",
-            "evidence_ids": list(dict.fromkeys(i for core in result.cores for i in core.evidence_ids))}
+        unresolved = [r for r in candidates if r["kind"] in {"current", "application"} and r["decision"] == "unresolved"]
+        labels = "、".join((r.get("source_number") or r["candidate_id"]) for r in (unresolved or candidates))
+        return candidates, None, {"kind": "insufficient_evidence" if unresolved else "no_qualifying_result",
+            "question": f"《{result.draft.title}》给出了哪些独立的主要成果？",
+            "reason": (f"候选 {labels} 缺少足以确认其原文正式类型或定位的依据。" if unresolved else
+                       f"候选 {labels} 可以从原文定位，但现有依据只支持其陈述、背景或证明用途，未能确立合格的独立贡献。"),
+            "evidence_ids": list(dict.fromkeys(i for row in unresolved or candidates for i in row["evidence_ids"]))}
     draft = project_cores(result.draft.model_dump(), approved)
     return candidates, AuthoritativeDraft.model_validate(draft, context={"approved_cores": approved}), None
 
@@ -244,7 +258,7 @@ class NewStatement(BaseModel):
 
 class NewCore(NewStatement):
     candidate_id: str
-    definitions: list[NewStatement] = Field(default_factory=list, max_length=2)
+    definitions: list[NewStatement] = Field(default_factory=list, max_length=MAX_GROUP_DEFINITIONS)
     paragraph: str = ""
     paragraph_evidence_ids: list[str] = Field(default_factory=list)
 
@@ -273,9 +287,18 @@ class AddedCores(BaseModel):
             ids = [*core.evidence_ids, *core.paragraph_evidence_ids, *(i for d in core.definitions for i in d.evidence_ids)]
             if not set(ids) <= registered:
                 raise ValueError("An addition cited an unknown location")
+        if budget := info.context.get("definition_budget"):
+            used = {core.candidate_id: len(core.definitions) for core in self.cores if core.definitions}
+            if sum(used.values()) > budget["remaining"]:
+                raise ValueError(f"New definitions per core {used} exceed the shared remaining allowance "
+                                 f"{budget['remaining']}. Revise those cores using retained definitions and "
+                                 "complete source-supported conditions within this allowance.")
+            if hasattr(info.context, "check_additions"):
+                info.context.check_additions(self)
         return self
 
     def merge(self, draft, approved):
+        draft = deepcopy(draft)
         def link(path, row):
             draft["formal_sources"][path] = row.formal_source.model_dump()
             draft["evidence_links"].append({"block_id": path, "evidence_ids": row.evidence_ids})
@@ -299,9 +322,56 @@ class AddedCores(BaseModel):
         return draft
 
 
+_RELATIVE_RESULT = re.compile(
+    r"\bthe (?:immediately )?(?:preceding|following|previous|next) (?:result|theorem|corollary)\b", re.I)
+
+
+def comparison_targets(draft, additions):
+    """Expose only existing order-dependent prose already linked to a newly selected source."""
+    links = {row["block_id"]: set(row["evidence_ids"]) for row in draft["evidence_links"]}
+    targets = {}
+    for i, group in enumerate(draft["groups"]):
+        path = f"groups.{i}.paragraph"
+        text = group.get("paragraph") or ""
+        phrases = {m[0] for m in _RELATIVE_RESULT.finditer(text) if text.count(m[0]) == 1}
+        ids = [key for key, row in additions.items() if links.get(path, set()).intersection(row["evidence_ids"])]
+        if phrases and ids:
+            targets[path] = {"text": text, "phrases": sorted(phrases), "possible_core_ids": ids}
+    return targets
+
+
+class ComparisonBinding(BaseModel):
+    paragraph: str
+    phrase: str
+    core_id: str
+
+
+class AddedCoresWithComparisons(AddedCores):
+    comparison_bindings: list[ComparisonBinding] = Field(default_factory=list)
+
+    def merge(self, draft, approved):
+        targets = comparison_targets(draft, {c.candidate_id: approved[c.candidate_id] for c in self.cores})
+        draft = super().merge(draft, approved)
+        from .profile import renderer_context
+        headings = renderer_context(draft)["visible_headings"]
+        fields = {owner: field for field, owner in draft["core_bindings"].items()}
+        for binding in self.comparison_bindings:
+            target = targets.get(binding.paragraph)
+            if not target or binding.core_id not in target["possible_core_ids"] or binding.phrase not in target["phrases"]:
+                continue
+            peers = [r for r in self.comparison_bindings if (r.paragraph, r.phrase) == (binding.paragraph, binding.phrase)]
+            if len(peers) != 1:
+                continue
+            label = headings[fields[binding.core_id]].replace(" ", "~")
+            group = draft["groups"][int(binding.paragraph.split(".")[1])]
+            group["paragraph"] = group["paragraph"].replace(binding.phrase, label, 1)
+        return draft
+
+
 def approved_cores(candidates):
     return {c["candidate_id"]: {"kind": c["kind"], "evidence_ids": c.get("selection_evidence_ids") or c["evidence_ids"]}
-            for c in candidates if c.get("decision") == "admitted" and c["kind"] in {"current", "historical", "application"}}
+            for c in candidates if c.get("candidate_id") and c.get("decision") == "admitted"
+            and c["kind"] in {"current", "historical", "application"}}
 
 
 def verify_bindings(draft, approved, registered):
@@ -325,6 +395,8 @@ class DirectResult(BaseModel):
     draft: AuthoritativeDraft | None = None
     summary: ScreeningNote | None = None
     source_checks: list[SourceCheck] = Field(default_factory=list, description="Only for a specific material uncertainty that the supplied paper cannot resolve as text")
+    _provisional: dict = PrivateAttr(default_factory=dict)
+    _invalid_checks: list[dict] = PrivateAttr(default_factory=list)
 
     @model_validator(mode="after")
     def validate_decision(self, info: ValidationInfo):
@@ -428,7 +500,7 @@ class EvidenceReview(BaseModel):
         return self
 
 
-def selection_change(defect, draft):
+def selection_change(defect, draft, *, targeted=False):
     """Only the selector may introduce, remove or reclassify a formal result."""
     field = defect["draft_field"]
     operation = defect["operation"]
@@ -437,6 +509,13 @@ def selection_change(defect, draft):
     formal = bool(re.fullmatch(r"history\.\d+|groups\.\d+\.theorem", field))
     if not formal:
         return False
+    # A reviewer may quote a neighboring retained theorem merely as the reason
+    # to nominate a *different* independent result. It is not a pending edit to
+    # that quoted theorem. Keep ordinary evidence recovery on the writing path.
+    if targeted and operation == "recover" and defect.get("kind") == "missing_required_content":
+        if re.search(r"\b(?:nominate|reopen|re-nominate)\b|\bfor (?:re)?selection\b",
+                     defect.get("required_change", ""), re.I):
+            return True
     return (field not in draft["core_bindings"] or
             (operation == "insert" and not defect["current_excerpt"].strip()) or
             (operation == "remove" and defect["current_excerpt"].strip() == block_text(draft, field).strip()))
