@@ -13,21 +13,8 @@ playwright-report/
 .paper-extraction/
 *.sqlite*
 
-# Local development notes, experiment plans and private acceptance reports.
+# Private development documents.
 /dev-notes/
-/local-reports/
-/acceptance-results/
-/acceptance/
-/*方案.md
-/*优化细则.md
-/*优化指南.md
-/*成本分析.md
-/*问题分析.md
-/*交付分析.md
-/*消耗复盘.md
-/*实测.md
-/*（草案）.md
-/*主定理提取要求.md
 
 # Outputs from local builds, tests and editor sessions.
 /build/
